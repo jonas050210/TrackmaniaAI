@@ -54,7 +54,7 @@ Three categories are used throughout:
 | Evaluation reports (per-track, per-split, gap) | **Verified** | 38 tests against artefacts from a real training run. |
 | Status/compare CLI and dashboard API | **Verified** | 25 + 38 tests. |
 | Simplified track visualisation | **Verified** | Headless PNG + `.obj`. |
-| **Total** | | **541 tests, `ruff` clean, 93% statement coverage** |
+| **Total** | | **543 tests, `ruff` clean, 93% statement coverage** |
 
 Measured with `pytest --cov=tmai --cov-report=term-missing`. Coverage is high everywhere except
 one file, deliberately:
@@ -99,6 +99,7 @@ several are the kind that produce *plausible-looking but wrong* results rather t
 | `tmai eval` evaluated only the first train track | Silently reported a single map for a multi-track run, discarding the per-track comparison. Found by an end-to-end CLI run; fixed to iterate every split with `--split`. |
 | **`train.seed` did not reproduce a run** | Two entropy sources escaped the seed: gymnasium spaces own a private generator that `np.random.seed` cannot reach (so warm-up actions varied), and `ReplayBuffer` owns a `default_rng` seeded from `replay.seed`, which every shipped config leaves `null` — i.e. fresh OS entropy. Found by measuring, not by reading code; fixed with `seed_everything()` and a derived buffer stream. |
 | Checkpoint docstring claimed resume was "exact" | It is not: the buffer *contents* are not stored, so a resumed run refills and diverges. The docstring and `TRAINING.md` now state the trade-off explicitly, and a test pins it. |
+| `tmai compare` always printed `--` in the `gap` column | It read `generalization_gap` off the *training* report, but training and held-out runs are logged as separate reports that each carry only their own split — so the value was always `None`. The one column that shows overfitting was silently blank; the gap is now computed across both reports. |
 | Nested dicts were stringified in `events.jsonl` | Evaluation reports were written as the *string* `"{'a': 1}"`, breaking machine readability. |
 | Episode events did not record which track they ran on | Per-track episode analysis was impossible for a multi-track run; a bad track looked like a bad policy. |
 | `Any` used but not imported in `tmai/cli.py` | A `NameError` waiting on the `compare` code path; caught by `ruff`. |

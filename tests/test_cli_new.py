@@ -215,6 +215,47 @@ class TestCompareCommand:
         assert len(payload) == 2
         assert {row["name"] for row in payload} == {"run-a", "run-b"}
 
+    def test_gap_is_computed_across_the_two_reports(self, two_runs, capsys):
+        """Training and held-out runs are logged as separate reports, each carrying only its own
+        split, so neither can produce the gap alone. Reading it off the training report yielded
+        None and `compare` silently printed `--` for the one column that shows overfitting.
+        """
+        assert main(["compare", *two_runs, "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        row = payload[0]
+        assert row["progress"] is not None, "precondition: a training evaluation exists"
+        assert row["held_progress"] is not None, "precondition: a held-out evaluation exists"
+        assert row["gap"] is not None, "the gap must be computed, not left null"
+        assert row["gap"] == round(row["progress"] - row["held_progress"], 4)
+
+    def test_gap_is_absent_when_there_is_no_held_out_side(self, tmp_path, capsys):
+        """Without a held-out evaluation the honest answer is None, not 0."""
+        from tmai.config import RunConfig
+        from tmai.training.trainer import train_from_config
+
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        config.track.synthetic = "straight"
+        config.train.output_dir = str(tmp_path)
+        config.train.run_name = "no-heldout"
+        config.train.total_steps = 40
+        config.train.warmup_steps = 10
+        config.train.batch_size = 8
+        config.train.log_interval = 20
+        config.train.eval_interval = 40
+        config.train.eval_episodes = 1
+        config.train.held_out_eval_interval = 0
+        config.train.checkpoint_interval = 40
+        config.sac.network.hidden_sizes = (16,)
+        run = train_from_config(config).run_dir
+
+        assert main(["compare", str(run), "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload[0]["held_progress"] is None
+        assert payload[0]["gap"] is None
+
     def test_warns_about_the_simulated_driver(self, two_runs, capsys):
         main(["compare", *two_runs])
         assert "SIMULATED" in capsys.readouterr().out

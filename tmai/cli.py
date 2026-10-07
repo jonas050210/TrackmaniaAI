@@ -604,6 +604,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         held = [e for e in evaluations if e["kind"] == "held_out"]
         last_train = training[-1]["report"] if training else {}
         last_held = held[-1]["report"] if held else {}
+
+        # The training and held-out runs are logged as *separate* reports, each carrying only
+        # its own split, so neither one can produce the gap on its own. Reading it off the
+        # training report alone always yielded None; it has to be computed across the two.
+        gap = last_train.get("generalization_gap")
+        train_progress = last_train.get("mean_progress_fraction")
+        held_progress = last_held.get("mean_progress_fraction")
+        if gap is None and train_progress is not None and held_progress is not None:
+            gap = round(float(train_progress) - float(held_progress), 4)
+
         rows.append(
             {
                 # The manifest's run_name, not the timestamped directory name: the directory
@@ -612,11 +622,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
                 "run_dir": str(Path(target)),
                 "step": status.step,
                 "driver": status.driver or "?",
-                "progress": last_train.get("mean_progress_fraction"),
+                "progress": train_progress,
                 "finish": last_train.get("finish_rate"),
                 "crash": last_train.get("crash_rate"),
-                "held_progress": last_held.get("mean_progress_fraction"),
-                "gap": last_train.get("generalization_gap"),
+                "held_progress": held_progress,
+                "gap": gap,
                 "best_lap": last_train.get("best_race_time"),
                 "evals": len(training),
             }
