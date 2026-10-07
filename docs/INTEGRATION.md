@@ -170,7 +170,7 @@ Apply the result with `--set driver.position_scale=0.01`.
 4. `pip install "trackmania-ai[game,learn]"`.
 5. `tmai doctor --calibrate` and confirm every check passes.
 6. `tmai record-track --out data/tracks/my_map.json --name my_map` — drive one clean lap.
-7. `tmai train --set track.path=data/tracks/my_map.json --set driver.speed_ratio=8`.
+7. `tmai validate-config -c tmai/configs/default.yaml`, then `tmai train -c tmai/configs/default.yaml --set driver.speed_ratio=8`.
 
 ## Adding a different backend
 

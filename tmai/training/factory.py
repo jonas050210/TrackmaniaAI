@@ -21,6 +21,7 @@ from tmai.env.tm_env import TrackmaniaEnv
 from tmai.game.protocol import GameDriver
 from tmai.game.simulated import SIMULATED_DRIVER_BANNER, SimulatedGameDriver
 from tmai.tracks.centerline import CenterlineTrack
+from tmai.tracks.library import TrackLibrary
 from tmai.tracks.synthetic import build_synthetic
 
 logger = logging.getLogger(__name__)
@@ -30,13 +31,46 @@ class ConfigError(ValueError):
     """The configuration cannot be turned into working objects."""
 
 
-def build_track(config: RunConfig) -> CenterlineTrack:
-    """Load a recorded centreline, or generate a synthetic one if asked."""
+def build_library(config: RunConfig) -> TrackLibrary:
+    """Build the track library described by ``config.track``.
+
+    Single-track configurations produce a one-track library rather than a special case, so
+    everything downstream (sampling, evaluation, manifests) has exactly one code path.
+    """
     spec = config.track
+    weights = dict(spec.split_weights)
+
+    if spec.directory:
+        library = TrackLibrary.from_directory(
+            spec.directory,
+            split_weights=weights,
+            pattern=spec.pattern,
+            explicit_splits=spec.explicit_splits,
+            recursive=spec.recursive,
+        )
+        logger.info("track library: %s", library.summary())
+        return library
+
+    library = TrackLibrary(split_weights=weights)
     if spec.path:
         track = CenterlineTrack.load(spec.path)
-        logger.info("loaded track %r (%d points, %.1f m)", track.name, track.num_points, track.length)
-        return track
+        logger.info(
+            "loaded track %r (%d points, %.1f m)", track.name, track.num_points, track.length
+        )
+        library.add(track, split="train", source=str(spec.path))
+        return library
+
+    if spec.synthetic_suite:
+        for entry in spec.synthetic_suite:
+            name = entry.get("name") if isinstance(entry, dict) else str(entry)
+            kwargs = entry.get("kwargs", {}) if isinstance(entry, dict) else {}
+            track = build_synthetic(name, **kwargs)
+            library.add(track)
+        logger.warning(
+            "using %d SYNTHETIC tracks; these are not real Trackmania maps", len(library)
+        )
+        return library
+
     if spec.synthetic:
         track = build_synthetic(spec.synthetic, **spec.synthetic_kwargs)
         logger.warning(
@@ -44,11 +78,30 @@ def build_track(config: RunConfig) -> CenterlineTrack:
             track.name,
             track.length,
         )
-        return track
+        library.add(track, split="train")
+        return library
+
     raise ConfigError(
-        "no track configured: set track.path to a centreline recorded with "
-        "'tmai record-track', or track.synthetic for a generated test track"
+        "no track configured: set track.path, track.directory, track.synthetic or "
+        "track.synthetic_suite"
     )
+
+
+def build_track(config: RunConfig) -> CenterlineTrack:
+    """Load the single track a run is configured for.
+
+    Kept for the single-track paths (``tmai eval``, ``tmai show-track``). Multi-track
+    training goes through :func:`build_library`.
+    """
+    library = build_library(config)
+    train = library.train
+    if train:
+        return train[0]
+    # A library built purely from a directory can legitimately have no train split when the
+    # weights put everything elsewhere; fall back to whatever is present.
+    if library.entries:
+        return library.entries[0].track
+    raise ConfigError("the track library is empty")
 
 
 def build_driver(config: RunConfig, track: CenterlineTrack) -> GameDriver:
@@ -115,6 +168,25 @@ def build_learner(env: TrackmaniaEnv, config: RunConfig) -> Learner:
         learner.describe()["model"]["num_parameters"],
         learner.describe()["device"],
     )
+
+    if config.normalize.enabled:
+        from tmai.agents.normalize import NormalizingLearner
+        from tmai.env.normalization import RunningNormalizer
+
+        learner = NormalizingLearner(
+            learner,
+            RunningNormalizer(
+                int(learner.observation_dim),
+                clip=config.normalize.clip,
+                epsilon=config.normalize.epsilon,
+                warmup_steps=config.normalize.warmup_steps,
+            ),
+        )
+        logger.info(
+            "observation normalisation enabled (clip=%.1f, warmup=%d steps)",
+            config.normalize.clip,
+            config.normalize.warmup_steps,
+        )
     return learner
 
 
@@ -123,6 +195,49 @@ def build_buffer(env: TrackmaniaEnv, config: RunConfig) -> ReplayBuffer:
         observation_dim=env.observation_dim,
         action_dim=int(env.action_space.shape[0]),
         config=config.replay,
+    )
+
+
+def build_multi_track_env(
+    config: RunConfig,
+    library: TrackLibrary,
+    *,
+    split: str = "train",
+    seed: int | None = None,
+):
+    """Build a :class:`MultiTrackEnv` over one split of ``library``.
+
+    Falls back to a plain :class:`TrackmaniaEnv` when the split holds a single track, so a
+    one-map run does not pay for machinery it cannot use.
+    """
+    from tmai.env.multi_track import MultiTrackConfig, MultiTrackEnv
+
+    entries = library.by_split(split)
+    if not entries:
+        raise ConfigError(
+            f"the {split!r} split is empty (library has {library.counts()}); check "
+            "track.split_weights and track.explicit_splits"
+        )
+    if len(entries) == 1:
+        track = entries[0].track
+        logger.info("single track in %r split: %s", split, track.name)
+        return TrackmaniaEnv(build_driver(config, track), track, config.env)
+
+    spec = config.multi
+    return MultiTrackEnv(
+        library.sampler(split, seed=seed),
+        lambda track: build_driver(config, track),
+        config.env,
+        MultiTrackConfig(
+            sample_tracks=spec.sample_tracks,
+            random_start_station=spec.random_start_station,
+            start_station_fraction=spec.start_station_fraction,
+            start_lateral_std=spec.start_lateral_std,
+            start_edge_margin=spec.start_edge_margin,
+        ),
+        seed=seed,
+        split=split,
+        track_identities={e.track.name: e.identity for e in entries},
     )
 
 
@@ -143,5 +258,7 @@ __all__ = [
     "build_driver",
     "build_env",
     "build_learner",
+    "build_library",
+    "build_multi_track_env",
     "build_track",
 ]

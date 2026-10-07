@@ -45,11 +45,24 @@ class UnsupportedPlatformError(GameError):
         self.remedy = remedy
 
 
+class UnsupportedFeatureError(GameError):
+    """The driver does not implement an optional capability.
+
+    Raised rather than silently ignored: a caller that asked for a randomised start and got
+    the start line instead would believe its data was randomised when it was not.
+    """
+
+    def __init__(self, message: str, *, remedy: str | None = None) -> None:
+        super().__init__(message if remedy is None else f"{message}\n  -> {remedy}")
+        self.remedy = remedy
+
+
 __all__ = [
     "GameConnectionError",
     "GameError",
     "GameNotInstalledError",
     "GameProtocolError",
     "GameTimeoutError",
+    "UnsupportedFeatureError",
     "UnsupportedPlatformError",
 ]

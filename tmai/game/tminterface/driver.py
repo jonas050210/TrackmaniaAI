@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from tmai.game.errors import GameConnectionError, GameTimeoutError
+from tmai.game.errors import GameConnectionError, GameTimeoutError, UnsupportedFeatureError
 from tmai.game.protocol import (
     Action,
     DriverCapabilities,
@@ -165,6 +165,25 @@ class TMInterfaceDriver:
                     return frame
             else:
                 settled = 0
+
+    def reposition(self, station: float, lateral: float = 0.0) -> GameFrame:
+        """Not supported by the real game integration.
+
+        Trackmania respawns the car to the last checkpoint; it cannot be placed at an
+        arbitrary point on the centreline without a recorded ``CheckpointData`` state for that
+        point. Reporting ``supports_start_repositioning=False`` and raising here is
+        deliberate: a caller that asked for a randomised start must find out, rather than
+        quietly training on start-line episodes it believes were randomised.
+
+        Recording checkpoint states per map would make this possible; see docs/ROADMAP.md.
+        """
+        raise UnsupportedFeatureError(
+            "the TMInterface driver cannot place the car at an arbitrary track station",
+            remedy=(
+                "Disable env start randomisation for real-game runs "
+                "(multi.random_start_station=false), or record per-map checkpoint states."
+            ),
+        )
 
     def step(self, action: Action) -> GameFrame:
         """Send ``action`` to the game and return the frame produced by it.

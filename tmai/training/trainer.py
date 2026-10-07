@@ -109,12 +109,17 @@ class Trainer:
         learner: Learner,
         buffer: ReplayBuffer,
         run_logger: RunLogger,
+        held_out_env: Any | None = None,
     ) -> None:
         self.config = config
         self.env = env
         self.learner = learner
         self.buffer = buffer
         self.log = run_logger
+        #: Separate environment over tracks the policy never trains on. Optional: a run with
+        #: no held-out split simply never reports a generalisation gap.
+        self.held_out_env = held_out_env
+        self._held_out_env = held_out_env
         self._episode = 0
         self._best_score = float("-inf")
         self._accumulator = EpisodeAccumulator()
@@ -269,6 +274,10 @@ class Trainer:
             race_time=float(info.get("race_time", 0.0)),
             steps_per_second=self._accumulator.steps / elapsed,
             driver=str(info.get("driver", "")),
+            # Which map this episode ran on. Without it, per-track episode analysis is
+            # impossible for a multi-track run, and a bad track looks like a bad policy.
+            track=str(info.get("track", getattr(self.env, "track", None)
+                                 and self.env.track.name or "")),
         )
         logger.info(
             "episode %d ended (%s): %d steps, return %.2f, progress %.1f m",
@@ -325,10 +334,17 @@ class Trainer:
             max_steps=self.config.env.termination.max_steps,
             deterministic=True,
             seed=self.config.train.seed,
+            label="training",
+            step=step,
+            split="train",
         )
         self.log.log_metrics(step, report.metrics())
-        self.log.log_event("evaluation", step=step, **report.as_dict())
+        # The report carries its own "step" field; nest it rather than colliding with the
+        # event's step argument.
+        self.log.log_event("evaluation", step=step, report=report.as_dict())
         logger.info("evaluation at step %d: %s", step, report.summary())
+
+        self._maybe_evaluate_held_out(step)
 
         if report.score > self._best_score:
             self._best_score = report.score
@@ -341,6 +357,41 @@ class Trainer:
                 config=self.config.to_dict(),
             )
             self.log.log_event("new_best", step=step, score=round(report.score, 4))
+        return report
+
+    def _maybe_evaluate_held_out(self, step: int) -> EvaluationReport | None:
+        """Evaluate on tracks the policy never trained on.
+
+        This is the number that says whether the agent is learning to *drive* rather than
+        learning one map. It runs on a separate environment so the training episode and the
+        training driver are untouched, and it is skipped entirely when there is no held-out
+        split -- reported as such rather than silently scoring zero.
+        """
+        if self._held_out_env is None:
+            return None
+        cfg = self.config.train
+        if cfg.held_out_eval_interval <= 0 or step % cfg.held_out_eval_interval != 0:
+            return None
+        try:
+            report = evaluate_policy(
+                self._held_out_env,
+                self.learner,
+                episodes=cfg.held_out_eval_episodes,
+                max_steps=self.config.env.termination.max_steps,
+                deterministic=True,
+                seed=(cfg.seed or 0) + 90000,
+                label="held_out",
+                step=step,
+                split="validation",
+            )
+        except Exception:  # noqa: BLE001 - held-out eval must never kill a long run
+            logger.exception("held-out evaluation failed; continuing training")
+            self.log.log_event("held_out_eval_error", step=step)
+            return None
+
+        self.log.log_metrics(step, report.metrics(prefix="heldout"))
+        self.log.log_event("held_out_evaluation", step=step, report=report.as_dict())
+        logger.info("HELD-OUT evaluation at step %d: %s", step, report.summary())
         return report
 
     def _save(self, step: int, *, note: str | None = None) -> None:
@@ -387,21 +438,46 @@ class Trainer:
 
 def train_from_config(config: RunConfig) -> TrainerResult:
     """Build everything from ``config`` and run training. The ``tmai train`` entry point."""
-    from tmai.training.factory import build_all
+    from tmai.training.factory import (
+        build_buffer,
+        build_learner,
+        build_library,
+        build_multi_track_env,
+    )
 
-    env, learner, buffer, _track = build_all(config)
+    config.validate_or_raise()
+
+    library = build_library(config)
+    env = build_multi_track_env(config, library, split="train", seed=config.train.seed)
+    learner = build_learner(env, config)
+    buffer = build_buffer(env, config)
+
+    # A held-out environment is built only when there is something to hold out and the run
+    # asked for it. Building one unconditionally would open game connections for nothing.
+    held_out_env = None
+    if config.train.held_out_eval_interval > 0 and library.by_split("validation"):
+        held_out_env = build_multi_track_env(
+            config,
+            library,
+            split="validation",
+            seed=(config.train.seed or 0) + 500,
+        )
+
     run_dir = make_run_dir(config.train.output_dir, config.train.run_name)
     with RunLogger(
         run_dir,
         run_name=config.train.run_name,
         config=config.to_dict(),
         seed=config.train.seed,
+        extra_manifest={"tracks": library.report()},
     ) as run_logger:
-        trainer = Trainer(config, env, learner, buffer, run_logger)
+        trainer = Trainer(config, env, learner, buffer, run_logger, held_out_env=held_out_env)
         try:
             return trainer.train()
         finally:
             env.close()
+            if held_out_env is not None:
+                held_out_env.close()
 
 
 __all__ = ["EpisodeAccumulator", "Trainer", "TrainerResult", "train_from_config"]

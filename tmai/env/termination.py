@@ -92,7 +92,10 @@ class TerminationTracker:
         if frame.race.finished:
             return TerminationResult(True, False, EndReason.FINISHED)
 
-        half_width = float(self.track.corridor_half_width[projection.index])
+        # Interpolated by arc length, matching the reward and the observation's edge
+        # distances. Indexing by sample instead would make a car near a segment boundary
+        # off-track for the reward but on-track for termination.
+        half_width = self.track.corridor_half_width_at(projection.progress)
         outside = abs(projection.lateral_offset) > half_width + cfg.off_track_margin
         self._off_track_streak = self._off_track_streak + 1 if outside else 0
         if self._off_track_streak >= cfg.off_track_limit:

@@ -133,7 +133,7 @@ The obvious exploits are closed explicitly:
 
 | Exploit | Countermeasure |
 |---|---|
-| Cut across the map and rejoin far ahead | `max_progress_per_step` clamps credited progress |
+| Cut across the map and rejoin far ahead | Credited progress is capped by what is physically achievable in one step (`max_speed_for_progress × dt × cut_margin`) |
 | Oscillate across one station | backwards progress is credited negatively, bounded |
 | Shortcut across grass | per-metre penalty outside the drivable corridor |
 | Finish by an invalid route | the game's checkpoint counter is authoritative; `invalid_finish` is flagged |

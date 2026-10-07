@@ -91,6 +91,9 @@ class SimulatedGameDriver:
             reports_finish=True,
             reports_sliding=False,
             headless_capable=True,
+            # True here because this driver owns the car's pose. The real game does not, and
+            # reports False -- see the capability docstring in tmai.game.protocol.
+            supports_start_repositioning=True,
             max_speed_ratio=1000.0,
             notes=(
                 "TOY MODEL - not Trackmania. Used for pipeline tests and CI only.",
@@ -128,6 +131,31 @@ class SimulatedGameDriver:
     def reset(self) -> GameFrame:
         self._require_open()
         self._reset_state()
+        return self._frame()
+
+    def reposition(self, station: float, lateral: float = 0.0) -> GameFrame:
+        """Place the car at ``station`` metres along the track, ``lateral`` metres off centre.
+
+        Used for randomised episode starts. The car is placed stationary and aligned with the
+        centreline, which is the honest analogue of a respawn at a checkpoint: no artificial
+        speed is granted, so the policy still has to accelerate out of it.
+        """
+        self._require_open()
+        self._reset_state()
+
+        station = float(np.clip(station, 0.0, self.track.length))
+        centre = self.track.point_at(station)
+        tangent = self.track.heading_at(station)
+
+        right = np.cross(np.array([0.0, 1.0, 0.0]), tangent)
+        norm = float(np.linalg.norm(right))
+        right = np.zeros(3) if norm < 1e-9 else right / norm
+
+        self._position = centre + right * float(lateral)
+        self._yaw = float(math.atan2(tangent[0], tangent[2]))
+        self._speed = 0.0
+        self._yaw_rate = 0.0
+        self._update_progress()
         return self._frame()
 
     def step(self, action: Action) -> GameFrame:

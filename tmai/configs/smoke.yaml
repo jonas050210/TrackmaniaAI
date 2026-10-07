@@ -11,9 +11,29 @@ driver:
   allow_simulated: true
 track:
   path: null
+  directory: null
+  pattern: '*.json'
+  recursive: false
   synthetic: s_curve
   synthetic_kwargs:
     length: 300.0
+  synthetic_suite: []
+  split_weights:
+    train: 0.7
+    validation: 0.15
+    test: 0.15
+  explicit_splits: {}
+multi:
+  sample_tracks: true
+  random_start_station: true
+  start_station_fraction: 1.0
+  start_lateral_std: 1.5
+  start_edge_margin: 1.0
+normalize:
+  enabled: true
+  clip: 10.0
+  epsilon: 0.0001
+  warmup_steps: 100
 env:
   control_dt: 0.05
   action_repeat: 1
@@ -44,16 +64,19 @@ env:
       progress_delta: 3.5
   reward:
     progress_weight: 1.0
-    speed_weight: 0.05
-    off_track_weight: 0.3
-    heading_weight: 0.02
-    slip_weight: 0.02
+    speed_weight: 1.0
+    speed_ref: 70.0
+    off_track_weight: 6.0
+    heading_weight: 0.4
+    slip_weight: 0.4
     slide_penalty: 0.0
     step_penalty: 0.0
+    idle_penalty: 0.5
+    idle_speed_threshold: 1.0
     finish_bonus: 20.0
-    max_progress_per_step: 6.0
-    max_backward_per_step: 2.0
-    speed_ref: 70.0
+    max_speed_for_progress: 95.0
+    cut_margin: 1.15
+    max_backward_speed: 30.0
     off_track_margin: 0.0
   termination:
     max_steps: 200
@@ -94,6 +117,8 @@ train:
   log_interval: 100
   eval_interval: 200
   eval_episodes: 1
+  held_out_eval_interval: 0
+  held_out_eval_episodes: 2
   checkpoint_interval: 200
   keep_checkpoints: 3
   seed: 0

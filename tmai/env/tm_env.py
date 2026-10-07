@@ -35,6 +35,7 @@ from tmai.env.termination import (
     TerminationConfig,
     TerminationTracker,
 )
+from tmai.game.errors import UnsupportedFeatureError
 from tmai.game.protocol import Action, GameDriver, GameFrame
 from tmai.tracks.centerline import CenterlineTrack, TrackProjection
 
@@ -165,6 +166,7 @@ class TrackmaniaEnv(gym.Env):
         self._open_driver_if_needed()
 
         frame = self.driver.reset()
+        frame = self._apply_start_options(frame, options)
         self._frame = frame
         projection = self.track.project(frame.vehicle.position)
         self._projection = projection
@@ -211,6 +213,7 @@ class TrackmaniaEnv(gym.Env):
                 projection=projection,
                 prev_progress=prev_progress,
                 finished=frame.race.finished,
+                dt=cfg.control_dt,
             )
             total_reward += breakdown.total
 
@@ -266,6 +269,32 @@ class TrackmaniaEnv(gym.Env):
     def _open_driver_if_needed(self) -> None:
         if not self.driver.is_connected():
             self.driver.open()
+
+    def _apply_start_options(
+        self, frame: GameFrame, options: dict[str, Any] | None
+    ) -> GameFrame:
+        """Honour ``start_station`` / ``start_lateral`` reset options, if the driver can.
+
+        A driver that cannot reposition the car raises :class:`UnsupportedFeatureError`, and
+        that is surfaced rather than swallowed: silently starting at the start line would
+        make a run report randomised starts that never happened.
+        """
+        if not options:
+            return frame
+        station = options.get("start_station")
+        lateral = float(options.get("start_lateral", 0.0))
+        if station is None and not lateral:
+            return frame
+        if not self.driver.capabilities.supports_start_repositioning:
+            raise UnsupportedFeatureError(
+                f"driver {self.driver.name!r} cannot place the car at an arbitrary track "
+                "station, but start randomisation was requested",
+                remedy=(
+                    "Set multi.random_start_station=false and multi.start_lateral_std=0, "
+                    "or use a driver that supports start repositioning."
+                ),
+            )
+        return self.driver.reposition(float(station or 0.0), lateral)
 
     def _coerce_action(self, action: np.ndarray | Action) -> Action:
         if isinstance(action, Action):

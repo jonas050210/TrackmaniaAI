@@ -167,6 +167,13 @@ class DriverCapabilities:
     reports_finish: bool = False
     reports_sliding: bool = False
     headless_capable: bool = False
+    #: Whether the driver can place the car at an arbitrary point on the track rather than
+    #: only at the start line. The real game cannot do this without recorded checkpoint
+    #: states, so start-position randomisation is honestly unavailable against Trackmania
+    #: until checkpoint states are recorded (see docs/LIMITATIONS.md). Callers must check
+    #: this rather than assume: silently ignoring the request would make a run report
+    #: "randomised starts" that never happened.
+    supports_start_repositioning: bool = False
     max_speed_ratio: float = 1.0
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -179,6 +186,7 @@ class DriverCapabilities:
             "reports_finish": self.reports_finish,
             "reports_sliding": self.reports_sliding,
             "headless_capable": self.headless_capable,
+            "supports_start_repositioning": self.supports_start_repositioning,
             "max_speed_ratio": self.max_speed_ratio,
             "notes": list(self.notes),
         }
@@ -217,6 +225,15 @@ class GameDriver(Protocol):
 
     def reset(self) -> GameFrame:
         """Start a fresh race attempt and return its first frame."""
+
+    def reposition(self, station: float, lateral: float = 0.0) -> GameFrame:
+        """Place the car at ``station`` metres along the track, ``lateral`` metres off centre.
+
+        Optional: only drivers reporting ``supports_start_repositioning`` implement this
+        meaningfully. Everyone else raises :class:`tmai.game.errors.UnsupportedFeatureError`.
+        The capability flag exists so callers can check *before* relying on it, instead of
+        discovering at runtime that their "randomised start" was silently the start line.
+        """
 
     def step(self, action: Action) -> GameFrame:
         """Apply ``action`` and advance the game by one control tick."""

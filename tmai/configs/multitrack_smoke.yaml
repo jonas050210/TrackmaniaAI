@@ -1,32 +1,38 @@
 driver:
-  kind: tminterface
+  kind: simulated
   server_name: TMInterface0
   position_scale: 1.0
-  speed_ratio: 8.0
+  speed_ratio: 1.0
   reset_strategy: respawn
   reset_command: respawn
   settle_ticks: 5
   connect_timeout_s: 20.0
   frame_timeout_s: 30.0
-  allow_simulated: false
+  allow_simulated: true
 track:
   path: null
-  directory: data/tracks
+  directory: null
   pattern: '*.json'
   recursive: false
   synthetic: null
   synthetic_kwargs: {}
-  synthetic_suite: []
+  synthetic_suite:
+  - name: straight
+    kwargs:
+      length: 200.0
+  - name: oval
+  - name: s_curve
+  - name: figure_eight
   split_weights:
-    train: 0.7
-    validation: 0.15
-    test: 0.15
+    train: 0.5
+    validation: 0.5
+    test: 0.0
   explicit_splits: {}
 multi:
   sample_tracks: true
-  random_start_station: false
+  random_start_station: true
   start_station_fraction: 1.0
-  start_lateral_std: 0.0
+  start_lateral_std: 1.5
   start_edge_margin: 1.0
 normalize:
   enabled: true
@@ -35,7 +41,7 @@ normalize:
   warmup_steps: 100
 env:
   control_dt: 0.05
-  action_repeat: 2
+  action_repeat: 1
   observation:
     curvature_lookahead:
     - 5.0
@@ -78,10 +84,10 @@ env:
     max_backward_speed: 30.0
     off_track_margin: 0.0
   termination:
-    max_steps: 3000
-    off_track_limit: 50
+    max_steps: 200
+    off_track_limit: 40
     off_track_margin: 1.5
-    stall_limit: 80
+    stall_limit: 60
     min_progress_per_step: 0.05
     min_steps_before_stall: 40
     no_ground_contact_limit: 25
@@ -98,31 +104,31 @@ sac:
   max_grad_norm: 0.0
   network:
     hidden_sizes:
-    - 256
-    - 256
+    - 64
+    - 64
     activation: relu
     layer_norm: false
     separate_encoders: true
     dropout: 0.0
 replay:
-  capacity: 1000000
+  capacity: 50000
   seed: null
 train:
-  total_steps: 2000000
-  warmup_steps: 5000
-  batch_size: 256
+  total_steps: 800
+  warmup_steps: 150
+  batch_size: 64
   updates_per_step: 1.0
   update_every: 1
-  log_interval: 200
-  eval_interval: 20000
-  eval_episodes: 3
-  held_out_eval_interval: 20000
+  log_interval: 100
+  eval_interval: 400
+  eval_episodes: 2
+  held_out_eval_interval: 400
   held_out_eval_episodes: 2
-  checkpoint_interval: 20000
+  checkpoint_interval: 400
   keep_checkpoints: 3
   seed: 0
   device: null
-  run_name: sac-multitrack
+  run_name: smoke-multitrack
   output_dir: runs
   resume: null
   max_wall_seconds: null

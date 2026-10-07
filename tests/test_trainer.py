@@ -306,26 +306,21 @@ class TestEvaluation:
         assert 0.0 <= report.mean_progress_fraction <= 1.0
 
     def test_score_rewards_finishing(self):
-        unfinished = EvaluationReport(
-            episodes=[EpisodeResult(progress_fraction=0.5, finished=False)]
+        unfinished = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=0.5, finished=False)]
         )
-        finished = EvaluationReport(
-            episodes=[EpisodeResult(progress_fraction=1.0, finished=True, race_time=30.0)]
+        finished = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=1.0, finished=True, race_time=30.0)]
         )
         assert finished.score > unfinished.score
 
     def test_score_prefers_faster_finishes(self):
-        slow = EvaluationReport(
-            episodes=[EpisodeResult(progress_fraction=1.0, finished=True, race_time=120.0)]
+        slow = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=1.0, finished=True, race_time=120.0)]
         )
-        fast = EvaluationReport(
-            episodes=[EpisodeResult(progress_fraction=1.0, finished=True, race_time=30.0)]
+        fast = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=1.0, finished=True, race_time=30.0)]
         )
         assert fast.score > slow.score
 
     def test_score_is_bounded(self):
-        report = EvaluationReport(
-            episodes=[EpisodeResult(progress_fraction=1.0, finished=True, race_time=0.001)]
+        report = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=1.0, finished=True, race_time=0.001)]
         )
         assert 0.0 <= report.score < 2.0
 
@@ -347,7 +342,7 @@ class TestEvaluation:
         assert all(np.isfinite(v) for v in metrics.values())
 
     def test_summary_string(self):
-        report = EvaluationReport(episodes=[EpisodeResult(progress_fraction=0.25)])
+        report = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=0.25)])
         assert "25.0%" in report.summary()
 
     def test_deterministic_evaluation_is_reproducible(self):

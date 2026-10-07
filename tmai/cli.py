@@ -22,8 +22,10 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from tmai import __version__
+from tmai.api.status import HEADLINE_METRICS
 from tmai.config import RunConfig, parse_overrides
 
 logger = logging.getLogger("tmai")
@@ -234,55 +236,108 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
-
     from tmai.training.checkpoint import latest_checkpoint, load_checkpoint
-    from tmai.training.evaluate import evaluate_policy
-    from tmai.training.factory import build_env, build_learner, build_track
+    from tmai.training.evaluate import evaluate_policy, evaluate_tracks
+    from tmai.training.factory import build_learner, build_library, build_multi_track_env
 
     config = _load_config(args)
-    track = build_track(config)
+    library = build_library(config)
 
-    from tmai.training.factory import build_driver
-
-    driver = build_driver(config, track)
-    env = build_env(driver, track, config)
-    learner = build_learner(env, config)
-
-    source = Path(args.checkpoint) if args.checkpoint else Path(config.train.output_dir)
-    path = source if source.is_file() else latest_checkpoint(source)
-    if path is None:
-        print(f"no checkpoint found at {source}", file=sys.stderr)
-        env.close()
-        return 1
-    payload = load_checkpoint(path)
-    learner.load_state_dict(payload["learner"])
-    print(f"loaded {path} (step {payload.get('step')})")
-
-    report = evaluate_policy(
-        env,
-        learner,
-        episodes=args.episodes,
-        max_steps=config.env.termination.max_steps,
-        deterministic=not args.stochastic,
+    # Evaluating a multi-track run on one map would throw away the only number that matters,
+    # so every split the operator asked for is covered. Default is "validation" when the run
+    # has one, because that is the honest measure; fall back to train otherwise.
+    splits = (
+        [s.strip() for s in args.split.split(",") if s.strip()]
+        if args.split
+        else (["validation"] if library.by_split("validation") else ["train"])
     )
-    env.close()
 
-    print(f"\n=== evaluation: {path.name} ===")
-    print(f"  episodes        {report.num_episodes}")
-    print(f"  finish rate     {report.finish_rate * 100:.1f}%")
-    print(f"  mean progress   {report.mean_progress_fraction * 100:.2f}%")
-    best = report.best_race_time
-    print(f"  best lap time   {best:.3f}s" if best is not None else "  best lap time   --")
-    for i, episode in enumerate(report.episodes, start=1):
-        print(
-            f"   #{i} {episode.end_reason:<16} progress {episode.progress_fraction * 100:5.1f}%  "
-            f"time {episode.race_time:7.2f}s  mean speed {episode.mean_speed:5.1f} m/s"
-            + ("  INVALID FINISH" if episode.invalid_finish else "")
-        )
+    env = None
+    reports: list[Any] = []
+    exit_code = 0
+    try:
+        for split in splits:
+            if not library.by_split(split):
+                print(
+                    f"split {split!r} is empty (library has {library.counts()}); skipping",
+                    file=sys.stderr,
+                )
+                continue
+            env = build_multi_track_env(config, library, split=split, seed=config.train.seed)
+            learner = build_learner(env, config)
+
+            source = Path(args.checkpoint) if args.checkpoint else Path(config.train.output_dir)
+            path = source if source.is_file() else latest_checkpoint(source)
+            if path is None:
+                print(f"no checkpoint found at {source}", file=sys.stderr)
+                return 1
+            payload = load_checkpoint(path)
+            learner.load_state_dict(payload["learner"])
+            print(
+                f"loaded {path.name} (step {payload.get('step')}, "
+                f"{payload.get('gradient_steps')} gradient steps) for split {split!r}"
+            )
+
+            if library.by_split(split) and len(library.by_split(split)) > 1:
+                # Exhaustive: every track in the split, so nothing is left to sampling luck.
+                report = evaluate_tracks(
+                    env,
+                    learner,
+                    tracks=[(e.track.name, split) for e in library.by_split(split)],
+                    episodes_per_track=args.episodes,
+                    max_steps=config.env.termination.max_steps,
+                    deterministic=not args.stochastic,
+                    seed=config.train.seed,
+                    label=f"eval:{split}",
+                    step=int(payload.get("step", 0)),
+                )
+            else:
+                report = evaluate_policy(
+                    env,
+                    learner,
+                    episodes=args.episodes,
+                    max_steps=config.env.termination.max_steps,
+                    deterministic=not args.stochastic,
+                    seed=config.train.seed,
+                    label=f"eval:{split}",
+                    step=int(payload.get("step", 0)),
+                    split=split,
+                )
+            reports.append(report)
+            env.close()
+            env = None
+    finally:
+        if env is not None:
+            env.close()
+
+    if not reports:
+        print("no split could be evaluated", file=sys.stderr)
+        return 1
+
+    for report in reports:
+        print(f"\n=== evaluation: {report.label} ({report.num_tracks} tracks) ===")
+        print(report.table())
+        print(f"\n  finish rate     {report.finish_rate * 100:.1f}%")
+        print(f"  mean progress   {report.mean_progress_fraction * 100:.2f}%")
+        print(f"  crash rate      {report.crash_rate * 100:.1f}%")
+        print(f"  consistency     ±{report.consistency * 100:.1f}%")
+        best = report.best_race_time
+        print(f"  best lap time   {best:.3f}s" if best is not None else "  best lap time   --")
+        invalid = [e for e in report.episodes if e.invalid_finish]
+        if invalid:
+            print(f"  !! {len(invalid)} INVALID finish(es): crossed the line without all checkpoints")
+
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(report.as_dict(), indent=2), encoding="utf-8")
+        payload_out = (
+            reports[0].as_dict()
+            if len(reports) == 1
+            else [r.as_dict() for r in reports]
+        )
+        Path(args.json_out).write_text(
+            json.dumps(payload_out, indent=2, default=str), encoding="utf-8"
+        )
         print(f"\nwrote {args.json_out}")
-    return 0
+    return exit_code
 
 
 # -- record-track ----------------------------------------------------------------------
@@ -367,6 +422,240 @@ def cmd_export_obj(args: argparse.Namespace) -> int:
 # -- parser ----------------------------------------------------------------------------
 
 
+# -- status / inspection -------------------------------------------------------------
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Print a dashboard-style status for one or all runs."""
+    from tmai.api.status import list_runs, run_snapshot, run_status
+
+    if args.list:
+        runs = list_runs(args.runs_dir or ".")
+        if not runs:
+            print(f"no runs found in {args.runs_dir or '.'}")
+            return 1
+        header = f"{'run':<44} {'step':>10} {'prog%':>6} {'ckpts':>6} {'driver':<12} state"
+        print(header)
+        print("-" * len(header))
+        for run in runs:
+            step = f"{run['step']}/{run['total_steps'] or '?'}"
+            state = "ended" if run["ended"] else ("stale?" if False else "running")
+            print(
+                f"{Path(run['run_dir']).name[:44]:<44} {step:>10} "
+                f"{(run['progress_fraction'] or 0) * 100:>6.1f} {run['checkpoints']:>6} "
+                f"{(run['driver'] or '?'):<12} {state}"
+            )
+        return 0
+
+    if not args.run:
+        print("give --run <run-dir>, or --list to see available runs", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(run_snapshot(args.run, max_points=args.max_points), default=str, indent=2))
+        return 0
+
+    status = run_status(args.run)
+    if not status.exists:
+        print(f"no such run directory: {status.run_dir}", file=sys.stderr)
+        return 1
+
+    rows: list[tuple[str, str, str]] = [
+        ("run", status.run_name or Path(status.run_dir).name, "ok"),
+        ("step", f"{status.step}" + (f" / {status.total_steps}" if status.total_steps else ""), "ok"),
+    ]
+    if status.progress_fraction is not None:
+        rows.append(("progress", f"{status.progress_fraction * 100:.1f}%", "ok"))
+    rows += [
+        ("episodes", str(status.episodes), "ok"),
+        ("evaluations", str(status.evaluations), "ok"),
+        ("checkpoints", str(status.checkpoints), "ok"),
+        ("driver", status.driver or "?", "warn" if status.simulated else "ok"),
+        (
+            "last update",
+            f"{status.seconds_since_update:.0f}s ago" if status.seconds_since_update is not None else "?",
+            "fail" if status.stale else "ok",
+        ),
+        ("state", status.end_reason or ("ended" if status.ended else "running"), "ok"),
+    ]
+    _print_report(f"run status: {Path(status.run_dir).name}", rows)
+
+    if status.simulated:
+        print("\n  !! this run used the SIMULATED driver (a toy model, not Trackmania)")
+
+    if status.latest:
+        print("\nlatest metrics")
+        print("-" * 60)
+        for key in HEADLINE_METRICS:
+            if key in status.latest:
+                print(f"  {key:<36} {status.latest[key]:.4f}")
+
+    from tmai.api.status import run_evaluations
+
+    evaluations = run_evaluations(args.run)
+    if evaluations:
+        print("\nevaluations")
+        print("-" * 74)
+        print(f"  {'step':>8} {'kind':<10} {'fin%':>5} {'prog%':>6} {'crash%':>7} {'gap':>8}")
+        for item in evaluations[-10:]:
+            report = item["report"]
+            gap = report.get("generalization_gap")
+            print(
+                f"  {item['step']:>8} {item['kind']:<10} "
+                f"{report.get('finish_rate', 0) * 100:>5.0f} "
+                f"{report.get('mean_progress_fraction', 0) * 100:>6.1f} "
+                f"{report.get('crash_rate', 0) * 100:>7.0f} "
+                f"{(f'{gap:+.3f}' if gap is not None else '--'):>8}"
+            )
+    return 0
+
+
+def cmd_list_tracks(args: argparse.Namespace) -> int:
+    """List the tracks in a directory with their geometry fingerprint and split."""
+    from tmai.tracks.library import TrackLibrary
+
+    library = TrackLibrary.from_directory(
+        args.directory, pattern=args.pattern, recursive=args.recursive
+    )
+    report = library.report()
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    header = (
+        f"{'track':<26} {'split':<11} {'length':>8} {'corners':>8} "
+        f"{'tightest':>9} {'straight%':>10} {'width':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+    for entry in report["tracks"]:
+        stats = entry.get("stats") or {}
+        radius = stats.get("min_corner_radius")
+        radius_text = "straight" if radius is None else f"{radius:.0f}m"
+        print(
+            f"{entry['name'][:26]:<26} {entry['split']:<11} "
+            f"{entry['length']:>7.0f}m {stats.get('corner_count', 0):>8} "
+            f"{radius_text:>9} {stats.get('straight_fraction', 0) * 100:>10.0f} "
+            f"{stats.get('corridor_mean', 0):>6.1f}m"
+        )
+    print("-" * len(header))
+    counts = report["counts"]
+    print(f"{report['num_tracks']} tracks: " + ", ".join(f"{v} {k}" for k, v in counts.items() if v))
+
+    geometry = report.get("geometry_by_split") or {}
+    if len(geometry) > 1:
+        print("\ngeometry coverage by split (are the held-out tracks comparable?)")
+        for split, data in geometry.items():
+            print(
+                f"  {split:<11} length {data['length_mean']:>7.1f}m "
+                f"(range {data['length_min']:.0f}-{data['length_max']:.0f}) "
+                f"corners {data['corners_mean']:.1f} curvature {data['curvature_mean']:.5f}"
+            )
+    return 0
+
+
+def cmd_validate_config(args: argparse.Namespace) -> int:
+    """Check a configuration file without running anything."""
+    config = _load_config(args)
+    problems = config.validate()
+
+    if args.json:
+        print(json.dumps({"valid": not problems, "problems": problems}, indent=2))
+        return 1 if problems else 0
+
+    if not problems:
+        print("configuration is valid")
+        print(f"  driver          {config.driver.kind}")
+        sources = [
+            name
+            for name, value in (
+                ("track.path", config.track.path),
+                ("track.directory", config.track.directory),
+                ("track.synthetic", config.track.synthetic),
+                ("track.synthetic_suite", config.track.synthetic_suite),
+            )
+            if value
+        ]
+        print(f"  track source    {sources[0] if sources else '(none)'}")
+        print(f"  total steps     {config.train.total_steps}")
+        print(f"  observation dim {config.env.observation.dim}")
+        print(f"  normalisation   {'on' if config.normalize.enabled else 'off'}")
+        return 0
+
+    print("configuration has problems:", file=sys.stderr)
+    for problem in problems:
+        print(f"  - {problem}", file=sys.stderr)
+    return 1
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Compare several runs or checkpoints side by side."""
+    from tmai.api.status import run_evaluations, run_status
+
+    rows: list[dict[str, Any]] = []
+    for target in args.targets:
+        status = run_status(target)
+        if not status.exists:
+            logger.warning("skipping %s: not a run directory", target)
+            continue
+        evaluations = run_evaluations(target)
+        training = [e for e in evaluations if e["kind"] == "training"]
+        held = [e for e in evaluations if e["kind"] == "held_out"]
+        last_train = training[-1]["report"] if training else {}
+        last_held = held[-1]["report"] if held else {}
+        rows.append(
+            {
+                # The manifest's run_name, not the timestamped directory name: the directory
+                # is what the operator typed, but the name is what identifies the experiment.
+                "name": status.run_name or Path(target).name,
+                "run_dir": str(Path(target)),
+                "step": status.step,
+                "driver": status.driver or "?",
+                "progress": last_train.get("mean_progress_fraction"),
+                "finish": last_train.get("finish_rate"),
+                "crash": last_train.get("crash_rate"),
+                "held_progress": last_held.get("mean_progress_fraction"),
+                "gap": last_train.get("generalization_gap"),
+                "best_lap": last_train.get("best_race_time"),
+                "evals": len(training),
+            }
+        )
+
+    if not rows:
+        print("nothing to compare: no valid run directories given", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+
+    def cell(value: Any, fmt: str = "{:.1f}", scale: float = 1.0) -> str:
+        if value is None:
+            return "--"
+        return fmt.format(value * scale)
+
+    header = (
+        f"{'run':<38} {'step':>8} {'prog%':>6} {'fin%':>5} {'crash%':>7} "
+        f"{'held%':>6} {'gap':>7} {'lap':>8} {'driver':<11}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{row['name'][:38]:<38} {row['step']:>8} "
+            f"{cell(row['progress'], '{:.1f}', 100):>6} "
+            f"{cell(row['finish'], '{:.0f}', 100):>5} "
+            f"{cell(row['crash'], '{:.0f}', 100):>7} "
+            f"{cell(row['held_progress'], '{:.1f}', 100):>6} "
+            f"{cell(row['gap'], '{:+.3f}'):>7} "
+            f"{cell(row['best_lap'], '{:.2f}s'):>8} {row['driver']:<11}"
+        )
+    if any(row["driver"] == "simulated" for row in rows):
+        print("\n  !! at least one of these runs used the SIMULATED driver (not Trackmania)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmai",
@@ -414,6 +703,11 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--episodes", type=int, default=3)
     ev.add_argument("--stochastic", action="store_true", help="sample actions instead of the mean")
     ev.add_argument("--json-out", help="write the evaluation report as JSON")
+    ev.add_argument(
+        "--split",
+        help="comma-separated library splits to evaluate, e.g. 'validation' or 'validation,test' "
+        "(default: validation when present, else train)",
+    )
     ev.set_defaults(func=cmd_eval)
 
     rec = sub.add_parser("record-track", help="record a track centreline from the real game")
@@ -438,6 +732,32 @@ def build_parser() -> argparse.ArgumentParser:
     obj.add_argument("--track", help="track JSON file")
     obj.add_argument("--out", default="track.obj")
     obj.set_defaults(func=cmd_export_obj)
+
+    status = sub.add_parser("status", help="inspect a training run (dashboard data)")
+    status.add_argument("--run", help="run directory")
+    status.add_argument("--runs-dir", help="directory to scan with --list")
+    status.add_argument("--list", action="store_true", help="list runs in --runs-dir")
+    status.add_argument("--json", action="store_true", help="emit the full snapshot as JSON")
+    status.add_argument("--max-points", type=int, default=400,
+                        help="max points per curve with --json")
+    status.set_defaults(func=cmd_status)
+
+    tracks = sub.add_parser("list-tracks", help="list tracks with geometry and split assignment")
+    tracks.add_argument("directory", help="directory of centreline JSON files")
+    tracks.add_argument("--pattern", default="*.json")
+    tracks.add_argument("--recursive", action="store_true")
+    tracks.add_argument("--json", action="store_true")
+    tracks.set_defaults(func=cmd_list_tracks)
+
+    check = sub.add_parser("validate-config", help="check a config without running anything")
+    add_config_args(check)
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=cmd_validate_config)
+
+    compare = sub.add_parser("compare", help="compare several runs side by side")
+    compare.add_argument("targets", nargs="+", help="run directories to compare")
+    compare.add_argument("--json", action="store_true")
+    compare.set_defaults(func=cmd_compare)
 
     return parser
 

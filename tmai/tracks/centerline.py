@@ -126,11 +126,20 @@ class CenterlineTrack:
                            0, len(self._segment_lengths) - 1))
 
     def point_at(self, s: float) -> np.ndarray:
-        """Centreline position at arc-length ``s``."""
+        """Centreline position at arc-length ``s``.
+
+        ``_tangents`` are *unit* vectors, so the offset has to be scaled by the segment
+        length. Multiplying by the bare fraction silently returns a point ``frac`` metres
+        along the segment instead of ``frac`` of the way down it -- correct only when every
+        segment happens to be exactly one metre, which is true of the default synthetic
+        tracks and of nothing recorded from a real map.
+        """
         s = float(np.clip(s, 0.0, self._length))
         i = self.index_at(s)
-        frac = (s - self._cum_lengths[i]) / self._segment_lengths[i]
-        return self.points[i] + self._tangents[i] * frac
+        # `_tangents` are unit vectors: the offset along the segment is already in metres,
+        # so it multiplies the unit tangent directly.
+        offset = s - self._cum_lengths[i]
+        return self.points[i] + self._tangents[i] * offset
 
     def heading_at(self, s: float) -> np.ndarray:
         """Unit tangent (direction of travel) at arc-length ``s``."""

@@ -164,14 +164,28 @@ class TestObservationEncoder:
 
 
 class TestReward:
+    """The reward is charged as rates integrated by dt, so tests must pass a dt.
+
+    ``DT`` is the nominal control period; every expected value below is expressed in terms of
+    it so the intent stays visible when a weight changes.
+    """
+
+    DT = 0.05
+
     def _reward(self, track, *, progress, prev_progress, lateral=0.0, speed=10.0,
-                finished=False, config=None):
+                finished=False, config=None, dt=None, is_sliding=False):
         fn = ProgressReward(track, config)
         position = track.point_at(progress) + np.array([lateral, 0.0, 0.0])
-        frame = make_frame(position=position, speed_forward=speed, finished=finished)
+        frame = make_frame(
+            position=position, speed_forward=speed, finished=finished, is_sliding=is_sliding
+        )
         projection = track.project(position)
         return fn.compute(
-            frame=frame, projection=projection, prev_progress=prev_progress, finished=finished
+            frame=frame,
+            projection=projection,
+            prev_progress=prev_progress,
+            finished=finished,
+            dt=self.DT if dt is None else dt,
         )
 
     def test_progress_is_the_dominant_term(self, straight_track):
@@ -180,20 +194,43 @@ class TestReward:
         assert breakdown.progress_metres == pytest.approx(1.0)
         assert breakdown.total > 0
 
-    def test_forward_clamp_blocks_cut_exploits(self, straight_track):
-        config = RewardConfig(max_progress_per_step=6.0)
+    def test_cut_detector_blocks_teleport_scale_jumps(self, straight_track):
+        """A jump far beyond what the car can physically cover is not credited."""
+        config = RewardConfig(max_speed_for_progress=95.0, cut_margin=1.15)
         breakdown = self._reward(
             straight_track, progress=200.0, prev_progress=0.0, config=config
         )
-        assert breakdown.progress_metres == pytest.approx(6.0)
+        # 95 * 0.05 * 1.15 = 5.4625
+        assert breakdown.progress_metres == pytest.approx(95.0 * self.DT * 1.15)
         assert breakdown.clamped is True
+        assert breakdown.raw_progress_metres == pytest.approx(200.0)
+
+    def test_fast_but_honest_driving_is_never_clamped(self, straight_track):
+        """The regression this design fixes: a fixed metre cap punished real speed.
+
+        At a 0.1 s control period a car at 70 m/s covers 7 m. The old fixed cap of 6 m
+        clamped that; the speed-derived threshold must not.
+        """
+        config = RewardConfig(max_speed_for_progress=95.0, cut_margin=1.15)
+        for dt in (0.05, 0.1, 0.2):
+            distance = 70.0 * dt
+            breakdown = self._reward(
+                straight_track,
+                progress=50.0 + distance,
+                prev_progress=50.0,
+                speed=70.0,
+                config=config,
+                dt=dt,
+            )
+            assert breakdown.clamped is False, f"clamped legitimate driving at dt={dt}"
+            assert breakdown.progress_metres == pytest.approx(distance)
 
     def test_backward_progress_is_negative_and_bounded(self, straight_track):
-        config = RewardConfig(max_backward_per_step=2.0)
+        config = RewardConfig(max_backward_speed=30.0)
         breakdown = self._reward(
             straight_track, progress=0.0, prev_progress=100.0, config=config
         )
-        assert breakdown.progress_metres == pytest.approx(-2.0)
+        assert breakdown.progress_metres == pytest.approx(-30.0 * self.DT)
         assert breakdown.progress < 0
 
     def test_off_track_penalty_starts_outside_the_corridor(self, straight_track):
@@ -204,6 +241,15 @@ class TestReward:
                                lateral=half + 3.0)
         assert inside.off_track == pytest.approx(0.0)
         assert outside.off_track < 0
+
+    def test_off_track_penalty_scales_with_dt(self, straight_track):
+        """Charged per second, so twice the control period costs twice as much."""
+        half = straight_track.corridor_half_width_at(60.0)
+        short = self._reward(straight_track, progress=60.0, prev_progress=59.0,
+                             lateral=half + 2.0, dt=0.05)
+        long = self._reward(straight_track, progress=60.0, prev_progress=59.0,
+                            lateral=half + 2.0, dt=0.10)
+        assert long.off_track == pytest.approx(2.0 * short.off_track)
 
     def test_off_track_margin_delays_the_penalty(self, straight_track):
         half = straight_track.corridor_half_width_at(60.0)
@@ -228,8 +274,9 @@ class TestReward:
                             speed=35.0, config=config)
         fast = self._reward(straight_track, progress=60.0, prev_progress=59.0,
                             speed=700.0, config=config)
-        assert slow.speed == pytest.approx(0.5)
-        assert fast.speed == pytest.approx(1.0)
+        # speed_weight * dt * normalised_speed
+        assert slow.speed == pytest.approx(0.5 * self.DT)
+        assert fast.speed == pytest.approx(1.0 * self.DT)
 
     def test_negative_speed_does_not_give_negative_speed_reward(self, straight_track):
         config = RewardConfig(speed_weight=1.0)
@@ -237,25 +284,68 @@ class TestReward:
                                  speed=-20.0, config=config)
         assert breakdown.speed == pytest.approx(0.0)
 
+    def test_idle_car_scores_worse_than_moving_car(self, straight_track):
+        """A stationary car must not be a stable optimum.
+
+        Without this, "do nothing" scores 0.0 while every attempt to drive scores negative,
+        so the optimal early policy is to sit still and learning never starts.
+        """
+        config = RewardConfig(idle_penalty=0.5, idle_speed_threshold=1.0)
+        idle = self._reward(straight_track, progress=60.0, prev_progress=60.0,
+                            speed=0.0, config=config)
+        moving = self._reward(straight_track, progress=60.0, prev_progress=59.0,
+                              speed=10.0, config=config)
+        assert idle.idle == pytest.approx(-0.5 * self.DT)
+        assert moving.idle == pytest.approx(0.0)
+        assert idle.total < moving.total
+
+    def test_idle_penalty_does_not_fire_on_finish(self, straight_track):
+        """The car is legitimately stationary once it has finished."""
+        config = RewardConfig(idle_penalty=0.5, idle_speed_threshold=1.0)
+        breakdown = self._reward(straight_track, progress=60.0, prev_progress=60.0,
+                                 speed=0.0, finished=True, config=config)
+        assert breakdown.idle == pytest.approx(0.0)
+
     def test_step_penalty_and_slip_penalty(self, straight_track):
         config = RewardConfig(step_penalty=0.1, slip_weight=1.0, speed_ref=10.0)
-        frame_maker = self._reward
-        breakdown = frame_maker(straight_track, progress=60.0, prev_progress=59.0,
-                                config=config)
-        assert breakdown.step == pytest.approx(-0.1)
+        breakdown = self._reward(straight_track, progress=60.0, prev_progress=59.0,
+                                 config=config)
+        assert breakdown.step == pytest.approx(-0.1 * self.DT)
 
     def test_slide_penalty_when_sliding(self, straight_track):
         config = RewardConfig(slide_penalty=0.5)
-        fn = ProgressReward(straight_track, config)
-        position = straight_track.point_at(60.0)
-        frame = make_frame(position=position, is_sliding=True)
-        breakdown = fn.compute(
-            frame=frame,
-            projection=straight_track.project(position),
-            prev_progress=59.0,
-            finished=False,
-        )
-        assert breakdown.slide == pytest.approx(-0.5)
+        breakdown = self._reward(straight_track, progress=60.0, prev_progress=59.0,
+                                 is_sliding=True, config=config)
+        assert breakdown.slide == pytest.approx(-0.5 * self.DT)
+
+    def test_total_return_is_invariant_to_control_rate(self, straight_track):
+        """Driving the same lap at half the control period must score the same.
+
+        This is the property the rate-based formulation buys: penalties integrate over time,
+        so the effective objective does not depend on how the control period was configured.
+        """
+        config = RewardConfig(off_track_weight=6.0, heading_weight=0.4, idle_penalty=0.0)
+        half = straight_track.corridor_half_width_at(60.0)
+
+        def lap(dt: float, steps: int) -> float:
+            total = 0.0
+            for i in range(steps):
+                progress = 60.0 + (i + 1) * (1.0 / steps) * 10.0
+                breakdown = self._reward(
+                    straight_track,
+                    progress=progress,
+                    prev_progress=progress - (1.0 / steps) * 10.0,
+                    lateral=half + 1.0,
+                    speed=50.0,
+                    config=config,
+                    dt=dt,
+                )
+                total += breakdown.off_track + breakdown.heading
+            return total
+
+        coarse = lap(0.1, 10)
+        fine = lap(0.05, 20)
+        assert fine == pytest.approx(coarse, rel=1e-6)
 
     def test_metrics_are_flat_floats(self, straight_track):
         breakdown = self._reward(straight_track, progress=60.0, prev_progress=59.0)
@@ -263,11 +353,31 @@ class TestReward:
         assert all(isinstance(v, float) for v in metrics.values())
         assert "reward/total" in metrics
         assert "reward/clamped" in metrics
+        assert "reward/idle" in metrics
 
     def test_config_roundtrips_to_dict(self):
         payload = RewardConfig().to_dict()
         assert payload["progress_weight"] == 1.0
         assert isinstance(payload, dict)
+
+    def test_config_validation_rejects_degenerate_settings(self):
+        with pytest.raises(ValueError, match="progress_weight"):
+            ProgressReward(straight_points_track(), RewardConfig(progress_weight=0.0))
+        with pytest.raises(ValueError, match="cut_margin"):
+            ProgressReward(straight_points_track(), RewardConfig(cut_margin=0.5))
+        with pytest.raises(ValueError, match="off_track_weight"):
+            ProgressReward(straight_points_track(), RewardConfig(off_track_weight=-1.0))
+
+    def test_rejects_non_positive_dt(self, straight_track):
+        with pytest.raises(ValueError, match="dt must be positive"):
+            self._reward(straight_track, progress=60.0, prev_progress=59.0, dt=0.0)
+
+
+def straight_points_track():
+    """A minimal track for config-validation tests that never drive it."""
+    from tmai.tracks.synthetic import straight
+
+    return straight(length=50.0)
 
 
 class TestTermination:

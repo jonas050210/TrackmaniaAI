@@ -3,6 +3,8 @@
 Ordered by what unblocks the most. Items 1–3 are verification, not features: until they are
 done, nothing here has been shown to control Trackmania.
 
+---
+
 ## 1. Verify the real integration (blocking)
 
 On a Windows host with Trackmania + TMInterface:
@@ -20,7 +22,8 @@ Everything else on this list is premature until this is done.
 
 ## 2. First real training run (blocking)
 
-- [ ] Record a centreline with `tmai record-track` and inspect it with `tmai show-track`.
+- [ ] Record a centreline with `tmai record-track`; inspect it with `tmai show-track`.
+- [ ] `tmai validate-config` on the real-game config.
 - [ ] A few thousand steps to confirm the loop runs against the real game and
       `reward/progress` increases.
 - [ ] Measure achievable `env_steps_per_second` at several `driver.speed_ratio` values and
@@ -29,34 +32,50 @@ Everything else on this list is premature until this is done.
 
 ## 3. Reward tuning against real physics (blocking)
 
-The shipped weights are reasoned defaults, never tuned. Expect to tune:
-`off_track_weight`, `max_progress_per_step`, `heading_weight`, and the corridor half-width.
-Keep `slip_weight`/`slide_penalty` at 0 until you have decided whether drifting is wanted.
+The shipped weights are reasoned defaults, never tuned. See
+[`REWARD.md`](REWARD.md#5-tuning-guidance) for the order to change things in. Expect to tune
+`off_track_weight`, `heading_weight`, `max_speed_for_progress` and the corridor half-width.
+Decide explicitly whether drifting is wanted before touching `slip_weight`/`slide_penalty`.
 
-## 4. Block-level track geometry
+## 4. Real maps, and more of them
 
-The centreline is the only map knowledge today; the drivable corridor is one constant
-half-width. This caps what the agent can learn.
+The generalisation machinery is built and tested, but only against four synthetic centrelines.
 
-- [ ] Parse `.Map.Gbx` (blocks, positions, orientations) — the `gbx` package on PyPI is a
-      starting point.
+- [ ] Record a set of real maps into `data/tracks/`.
+- [ ] `tmai list-tracks data/tracks` — check the geometry coverage per split is comparable.
+      A suite that trains on ovals and tests on a technical track measures a distribution
+      shift, not generalisation.
+- [ ] Pin a couple of maps to `test` via `track.explicit_splits` and never train on them.
+- [ ] Report the held-out number as the headline metric, not training-map performance.
+
+## 5. Block-level track geometry
+
+The centreline is the only map knowledge today; the corridor is one constant half-width. This
+caps what the agent can learn.
+
+The data model and the geometry conversion already exist and are tested
+(`tmai/tracks/gbx.py`: `MapBlock`, `MapGeometry`, `blocks_to_centerline`). What is missing is
+the parser itself, which was deliberately not written because it could not be verified — see
+[`LIMITATIONS.md`](LIMITATIONS.md#mapgbx-parsing-is-not-implemented-deliberately).
+
+- [ ] Obtain a real `.Map.Gbx` (Trackmania 2020, Stadium).
+- [ ] Verify a block extraction: name, position, orientation, size.
+- [ ] Build a block-name → surface table marking drivable blocks.
+- [ ] Cross-check the derived centreline against the same map driven manually.
 - [ ] Derive per-point corridor width from block geometry, replacing the constant.
-- [ ] Expose obstacle/wall distances to the observation behind the existing
-      `TrackGeometry`-style interface, so nothing above `tmai.tracks` changes.
-- [ ] Cross-check the parsed geometry against a recorded centreline as a validation step.
+- [ ] Expose obstacle/wall distances to the observation behind the existing interface.
 
-## 5. Generalisation to unseen maps
+## 6. Start-position randomisation against the real game
 
-Currently a policy is trained per map. To generalise:
+Currently honest but unavailable: the real game respawns to the last checkpoint and cannot be
+placed at an arbitrary station, so `supports_start_repositioning` is `False` and the
+environment raises rather than pretending.
 
-- [ ] Record a set of maps and split them into train / held-out.
-- [ ] Verify the observation is genuinely map-agnostic: no absolute coordinates, no
-      map-specific scaling. (`ObservationSpec` is designed for this; it has not been tested
-      across maps.)
-- [ ] Train across the set with map sampling at reset.
-- [ ] Report held-out map performance as the headline metric, not training-map performance.
+- [ ] Record per-map `CheckpointData` states and restore them with
+      `TMInterface.set_checkpoint_state()`.
+- [ ] Only then enable `multi.random_start_station` for real-game runs.
 
-## 6. Throughput: parallel rollout
+## 7. Throughput: parallel rollout
 
 One game instance caps everything.
 
@@ -67,26 +86,30 @@ One game instance caps everything.
 - [ ] Off-policy algorithms tolerate stale policy weights well, which is what makes this
       architecture viable for SAC.
 
-## 7. GUI and human-vs-AI evaluation
+## 8. GUI and human-vs-AI evaluation
 
-Explicitly out of scope for the foundation phase; the data foundations exist:
+Explicitly out of scope for the foundation phase. The data foundations exist:
+`tmai.api.status` reads a run directory into a single JSON snapshot (`run_snapshot`) covering
+status, downsampled curves, episodes, evaluations, checkpoints, manifest and log tail, and
+`tmai status --json` exposes it on the command line.
 
 - [ ] Switchable simplified 3D view showing track/block structure. `tmai.viz` already renders
       the centreline, corridor, curvature and car state to PNG and exports `.obj`; the GUI is a
-      viewer over the same geometry plus block meshes from item 4.
+      viewer over the same geometry plus block meshes from item 5.
+- [ ] Live dashboard over `tmai.api.status` (LearningView-inspired styling, subtle
+      hover/transition animation, professional training-dashboard feel).
 - [ ] Live overlay of the agent's observation and reward during a run.
 - [ ] Human-vs-AI: a real-time pacing wrapper on top of `GameDriver` (the environment is
       deliberately lock-step with the game, not the wall clock, so this is additive), plus
       ghost comparison against a recorded human lap.
 
-## 8. Algorithm work
+## 9. Algorithm work
 
 Only worth doing once the baseline is validated on the real game.
 
 - [ ] REDQ / DroQ to raise the update-to-data ratio without divergence — the natural next step
-      when samples are the bottleneck.
-- [ ] Running observation normalisation if the real game's ranges differ much from the assumed
-      `ObservationScales`.
+      when samples are the bottleneck. The `Learner` protocol and the `NormalizingLearner`
+      decorator show the seam works.
 - [ ] Recurrent policy when moving to vision (partial observability).
 - [ ] PPO behind the `Learner` protocol, for comparison only.
 - [ ] Vision observations: image term + CNN encoder; `GameDriver` would need a screenshot

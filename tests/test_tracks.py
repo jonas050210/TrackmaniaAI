@@ -332,3 +332,51 @@ class TestRecordTrackFromDriver:
         driver.close()
         assert track.num_points >= 2
         assert calls["n"] == 21
+
+
+class TestPointAtArcLength:
+    """Regression: point_at() once advanced by the bare fraction of a segment.
+
+    ``_tangents`` are unit vectors, so multiplying by ``frac`` moved the point ``frac``
+    metres along the segment instead of ``frac`` of the way down it. That is only correct
+    when every segment is exactly one metre -- true of the default synthetic tracks
+    (``spacing=1.0``) and of nothing recorded from a real map, which is why the bug survived.
+    """
+
+    @staticmethod
+    def _track(spacing: float, count: int = 5) -> CenterlineTrack:
+        pts = np.zeros((count, 3))
+        pts[:, 2] = np.arange(count) * spacing
+        return CenterlineTrack(pts, name=f"spacing{spacing}")
+
+    @pytest.mark.parametrize("spacing", [1.0, 2.0, 4.0, 7.5])
+    def test_point_at_roundtrips_through_projection(self, spacing):
+        track = self._track(spacing)
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            s = fraction * track.length
+            position = track.point_at(s)
+            assert track.project(position).progress == pytest.approx(s, abs=1e-9)
+
+    @pytest.mark.parametrize("spacing", [1.0, 3.0, 8.0])
+    def test_point_at_advances_by_metres_not_fractions(self, spacing):
+        track = self._track(spacing, count=4)
+        half = spacing / 2.0
+        position = track.point_at(half)
+        # Mid-way through the first segment must be half a segment along, in metres.
+        assert position[2] == pytest.approx(half)
+
+    def test_point_at_is_continuous_across_segment_boundaries(self):
+        track = self._track(4.0, count=6)
+        before = track.point_at(4.0 - 1e-9)
+        after = track.point_at(4.0 + 1e-9)
+        assert np.linalg.norm(before - after) < 1e-6
+
+    def test_endpoints(self):
+        track = self._track(5.0, count=4)
+        assert track.point_at(0.0) == pytest.approx(track.points[0])
+        assert track.point_at(track.length) == pytest.approx(track.points[-1])
+
+    def test_clamped_beyond_the_ends(self):
+        track = self._track(4.0, count=3)
+        assert track.point_at(-50.0) == pytest.approx(track.points[0])
+        assert track.point_at(1e6) == pytest.approx(track.points[-1])

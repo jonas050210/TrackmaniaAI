@@ -52,14 +52,84 @@ class DriverSpec:
 
 @dataclass
 class TrackSpec:
-    """Where the track centreline comes from."""
+    """Where the track centreline(s) come from.
+
+    Exactly one of ``path``, ``directory`` or ``synthetic`` should be set. ``directory`` is
+    the multi-track case: every centreline file in it becomes one track in a
+    :class:`~tmai.tracks.library.TrackLibrary`, and the split weights below decide which
+    tracks are trained on and which are held out.
+    """
 
     #: Path to a recorded centreline JSON (produced by ``tmai record-track``).
     path: str | None = None
-    #: Name of a procedurally generated track, used when ``path`` is not set. Only useful
-    #: with the simulated driver or for smoke tests.
+    #: Directory of centreline JSON files. Builds a multi-track library.
+    directory: str | None = None
+    #: Glob used inside ``directory``.
+    pattern: str = "*.json"
+    #: Search ``directory`` recursively.
+    recursive: bool = False
+    #: Name of a procedurally generated track, used when neither path nor directory is set.
+    #: Only useful with the simulated driver or for smoke tests.
     synthetic: str | None = None
     synthetic_kwargs: dict[str, Any] = field(default_factory=dict)
+    #: Several synthetic tracks at once, for generalisation tests without recorded maps.
+    #: Each entry is ``{"name": "oval", "kwargs": {...}}``.
+    synthetic_suite: list[dict[str, Any]] = field(default_factory=list)
+
+    #: Relative split sizes for tracks that have no explicit assignment. Must sum to 1.
+    split_weights: dict[str, float] = field(
+        default_factory=lambda: {"train": 0.7, "validation": 0.15, "test": 0.15}
+    )
+    #: Filename stem -> split, for pinning particular maps to ``test``.
+    explicit_splits: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class NormalizeSpec:
+    """Online observation normalisation.
+
+    Applied inside a :class:`~tmai.agents.normalize.NormalizingLearner`, so the replay buffer
+    keeps raw observations and stored transitions stay valid as the statistics improve.
+    """
+
+    enabled: bool = True
+    #: Symmetric clip after normalisation. Bounds the damage from a single outlier frame
+    #: (a respawn teleport) without discarding ordinary variation.
+    clip: float = 10.0
+    epsilon: float = 1e-4
+    #: Samples before the running standard deviation is trusted; until then observations are
+    #: centred only. Dividing by a provisional near-zero std would inject huge inputs.
+    warmup_steps: int = 100
+
+
+@dataclass
+class MultiTrackSpec:
+    """How tracks and episode start conditions are sampled during training."""
+
+    #: Sample a different track on every episode reset. This is the primary defence against
+    #: memorising a single map; turning it off trains on the first track only.
+    sample_tracks: bool = True
+    #: Randomise the arc-length position each episode starts from.
+    #:
+    #: Requires a driver that supports start repositioning. The real game does not (see
+    #: ``DriverCapabilities.supports_start_repositioning``), so real-game runs must set this
+    #: to false -- the environment raises rather than silently starting at the start line.
+    random_start_station: bool = True
+    #: Fraction of the lap the random start may cover.
+    start_station_fraction: float = 1.0
+    #: Standard deviation of the random lateral start offset, metres.
+    start_lateral_std: float = 1.5
+    #: Metres of corridor edge kept clear of the random start offset.
+    start_edge_margin: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sample_tracks": self.sample_tracks,
+            "random_start_station": self.random_start_station,
+            "start_station_fraction": self.start_station_fraction,
+            "start_lateral_std": self.start_lateral_std,
+            "start_edge_margin": self.start_edge_margin,
+        }
 
 
 @dataclass
@@ -77,6 +147,11 @@ class TrainSpec:
     log_interval: int = 100
     eval_interval: int = 5_000
     eval_episodes: int = 3
+    #: Evaluate on held-out tracks every this many steps. ``0`` disables it. This is the
+    #: number that distinguishes learning to drive from memorising one map.
+    held_out_eval_interval: int = 0
+    #: Episodes per held-out evaluation.
+    held_out_eval_episodes: int = 2
     checkpoint_interval: int = 5_000
     keep_checkpoints: int = 3
     seed: int = 0
@@ -96,10 +171,132 @@ class RunConfig:
 
     driver: DriverSpec = field(default_factory=DriverSpec)
     track: TrackSpec = field(default_factory=TrackSpec)
+    multi: MultiTrackSpec = field(default_factory=MultiTrackSpec)
+    normalize: NormalizeSpec = field(default_factory=NormalizeSpec)
     env: EnvConfig = field(default_factory=EnvConfig)
     sac: SACConfig = field(default_factory=SACConfig)
     replay: ReplayBufferConfig = field(default_factory=ReplayBufferConfig)
     train: TrainSpec = field(default_factory=TrainSpec)
+
+    # -- validation -----------------------------------------------------------------
+
+    def validate(self) -> list[str]:
+        """Return a list of human-readable configuration problems (empty means valid).
+
+        Called before a run starts. Catching a bad configuration here costs nothing; catching
+        it three hours into a training run costs three hours.
+        """
+        problems: list[str] = []
+
+        sources = [
+            bool(self.track.path),
+            bool(self.track.directory),
+            bool(self.track.synthetic),
+            bool(self.track.synthetic_suite),
+        ]
+        if sum(sources) == 0:
+            problems.append(
+                "no track configured: set track.path, track.directory, track.synthetic "
+                "or track.synthetic_suite"
+            )
+        elif sum(sources) > 1:
+            problems.append(
+                "exactly one track source must be set; got "
+                + ", ".join(
+                    name
+                    for name, set_ in zip(
+                        ("track.path", "track.directory", "track.synthetic",
+                         "track.synthetic_suite"),
+                        sources,
+                        strict=True,
+                    )
+                    if set_
+                )
+            )
+
+        total = sum(self.track.split_weights.values())
+        if abs(total - 1.0) > 1e-6:
+            problems.append(f"track.split_weights must sum to 1.0, got {total:.4f}")
+        for name, weight in self.track.split_weights.items():
+            if weight < 0:
+                problems.append(f"track.split_weights[{name!r}] must be non-negative")
+
+        if self.driver.kind not in ("tminterface", "simulated"):
+            problems.append(
+                f"driver.kind must be 'tminterface' or 'simulated', got {self.driver.kind!r}"
+            )
+        if self.driver.kind == "simulated" and not self.driver.allow_simulated:
+            problems.append(
+                "driver.kind='simulated' is a toy model, not Trackmania: set "
+                "driver.allow_simulated=true (CLI: --allow-simulated-driver) to proceed"
+            )
+        if self.driver.speed_ratio <= 0:
+            problems.append(f"driver.speed_ratio must be positive, got {self.driver.speed_ratio}")
+        if self.driver.position_scale <= 0:
+            problems.append(
+                f"driver.position_scale must be positive, got {self.driver.position_scale}"
+            )
+
+        # Start randomisation needs a driver that can actually move the car.
+        wants_random_start = (
+            self.multi.random_start_station or self.multi.start_lateral_std > 0
+        )
+        if self.driver.kind == "tminterface" and wants_random_start:
+            problems.append(
+                "multi.random_start_station / start_lateral_std require a driver that can "
+                "reposition the car, and the real game cannot. Set "
+                "multi.random_start_station=false and multi.start_lateral_std=0 for "
+                "real-game runs (see docs/LIMITATIONS.md)."
+            )
+
+        if self.env.control_dt <= 0:
+            problems.append(f"env.control_dt must be positive, got {self.env.control_dt}")
+        if self.env.action_repeat < 1:
+            problems.append(f"env.action_repeat must be >= 1, got {self.env.action_repeat}")
+        if self.env.observation.dim <= 0:
+            problems.append(
+                "the observation spec produced an empty vector; enable at least one feature"
+            )
+
+        t = self.train
+        if t.total_steps <= 0:
+            problems.append(f"train.total_steps must be positive, got {t.total_steps}")
+        if t.batch_size <= 0:
+            problems.append(f"train.batch_size must be positive, got {t.batch_size}")
+        if t.warmup_steps < 0:
+            problems.append(f"train.warmup_steps must be non-negative, got {t.warmup_steps}")
+        if t.warmup_steps >= t.total_steps:
+            problems.append(
+                f"train.warmup_steps ({t.warmup_steps}) must be below train.total_steps "
+                f"({t.total_steps}) or no gradient step ever happens"
+            )
+        if t.updates_per_step <= 0:
+            problems.append(f"train.updates_per_step must be positive, got {t.updates_per_step}")
+        if t.keep_checkpoints < 1:
+            problems.append(f"train.keep_checkpoints must be >= 1, got {t.keep_checkpoints}")
+        if t.eval_interval and t.eval_interval > t.total_steps:
+            problems.append(
+                f"train.eval_interval ({t.eval_interval}) exceeds train.total_steps "
+                f"({t.total_steps}); the run would never evaluate"
+            )
+        if self.replay.capacity < t.batch_size:
+            problems.append(
+                f"replay.capacity ({self.replay.capacity}) is below train.batch_size "
+                f"({t.batch_size}); no minibatch could ever be drawn"
+            )
+        if self.sac.gamma <= 0 or self.sac.gamma >= 1:
+            problems.append(f"sac.gamma must be in (0, 1), got {self.sac.gamma}")
+        if self.sac.tau <= 0 or self.sac.tau > 1:
+            problems.append(f"sac.tau must be in (0, 1], got {self.sac.tau}")
+
+        return problems
+
+    def validate_or_raise(self) -> None:
+        problems = self.validate()
+        if problems:
+            raise ValueError(
+                "invalid configuration:\n  - " + "\n  - ".join(problems)
+            )
 
     # -- serialisation --------------------------------------------------------------
 
@@ -275,6 +472,8 @@ def parse_overrides(pairs: list[str] | None) -> dict[str, Any]:
 
 __all__ = [
     "DriverSpec",
+    "MultiTrackSpec",
+    "NormalizeSpec",
     "RunConfig",
     "TrackSpec",
     "TrainSpec",

@@ -225,9 +225,19 @@ class RunLogger:
 
 
 def _jsonable(value: Any) -> Any:
-    """Coerce numpy scalars/arrays to JSON-friendly values."""
+    """Coerce a value into something ``json`` can serialise, preserving structure.
+
+    Containers are handled recursively rather than falling through to ``str()``: an event
+    payload is meant to be machine-readable, and a nested report turned into the *string*
+    ``"{'a': 1}"`` is not. Anything genuinely unserialisable still degrades to ``str``, so
+    logging can never raise on an odd value.
+    """
     if isinstance(value, (str, bool, int, float)) or value is None:
         return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
     if hasattr(value, "item"):
         try:
             return value.item()
