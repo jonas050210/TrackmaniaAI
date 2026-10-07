@@ -1,11 +1,17 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
 **Branch** `arena/f325538e-trackmaniaai` (pushed) · **date** 2026-10-07
-**Gate** `pytest tests/ -q` → **552 passed** · `ruff check tmai tests` → **All checks passed!**
-**Cumulative diff vs `main`** 78 files, +18 146 · source 9 805 lines (`tmai/`), 5 846 lines (`tests/`)
+**Gate at time of writing** `pytest tests/ -q` → **552 passed** · `ruff check tmai tests` → **All checks passed!**
 
-The commit hash is deliberately not named here: recording it would go stale the moment this file
-is committed. `git log main..HEAD` on the branch above is the authoritative list.
+Commit hashes, diff totals and line counts are deliberately *not* recorded here: every one of them
+goes stale the moment this file is committed, and a stale number that looks precise is worse than
+no number. Run these instead — they are always current:
+
+```bash
+git log --oneline main..HEAD   # what this branch adds
+git diff --shortstat main      # cumulative size
+pytest tests/ -q               # the gate
+```
 
 ---
 
