@@ -54,7 +54,18 @@ Three categories are used throughout:
 | Evaluation reports (per-track, per-split, gap) | **Verified** | 38 tests against artefacts from a real training run. |
 | Status/compare CLI and dashboard API | **Verified** | 25 + 38 tests. |
 | Simplified track visualisation | **Verified** | Headless PNG + `.obj`. |
-| **Total** | | **501 tests, `ruff` clean** |
+| **Total** | | **524 tests, `ruff` clean, 93% statement coverage** |
+
+Measured with `pytest --cov=tmai --cov-report=term-missing`. Coverage is high everywhere except
+one file, deliberately:
+
+| File | Coverage | Why |
+|---|---|---|
+| `tmai/game/tminterface/session.py` | **43%** | The Windows named-shared-memory transport. The untested lines are the ones that require a running game and cannot execute anywhere else. |
+| `tmai/cli.py` | 89% | The remainder is `doctor --calibrate` and `record-track`, both of which drive the real game. |
+
+A low number on the transport is the honest result, not a gap to paper over: testing it here
+would mean faking the game.
 
 ### Things that have never happened
 

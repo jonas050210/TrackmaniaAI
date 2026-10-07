@@ -1,7 +1,7 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
 **Branch** `arena/f325538e-trackmaniaai` · **commit** `6f81483` (pushed) · **date** 2026-10-07
-**Gate** `pytest tests/ -q` → **501 passed** · `ruff check tmai tests` → **All checks passed!**
+**Gate** `pytest tests/ -q` → **524 passed** · `ruff check tmai tests` → **All checks passed!**
 **Diff** 40 files, +6001 / −314 · source 9 735 lines (`tmai/`), 5 158 lines (`tests/`)
 
 ---
@@ -15,7 +15,7 @@ running `TMInterface.exe` creates; it cannot be opened here.
 What *has* been built and verified is everything around that transport: the environment, reward,
 termination, observations, track representation, multi-track training, evaluation, checkpointing,
 the run-status API and the CLI. Those run against a clearly-labelled kinematic stand-in, and are
-covered by 501 tests.
+covered by 524 tests.
 
 Three verification tiers are used consistently across the code and docs:
 
@@ -182,7 +182,7 @@ which is why the final verification pass drives the real commands rather than on
 ## 5. Tests
 
 ```
-pytest tests/ -q        →  501 passed in ~21s
+pytest tests/ -q        →  524 passed in ~21s
 ruff check tmai tests   →  All checks passed!
 ```
 
