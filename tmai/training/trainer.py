@@ -39,6 +39,8 @@ from tmai.training.checkpoint import (
     restore_rng,
     save_best,
     save_checkpoint,
+    seed_everything,
+    seed_spaces,
 )
 from tmai.training.evaluate import EvaluationReport, evaluate_policy
 
@@ -136,6 +138,15 @@ class Trainer:
         start_step = 0
         if cfg.resume:
             start_step = self._resume(cfg.resume)
+            # The checkpoint restored the *global* RNG state, but gymnasium spaces keep their
+            # own generators, so they are re-seeded from the state that was just restored.
+            seed_spaces(self.env)
+            seed_spaces(self.held_out_env)
+        else:
+            seed_everything(cfg.seed, env=self.env)
+            if self.held_out_env is not None:
+                # A distinct stream, so held-out exploration cannot shadow training's.
+                seed_everything(None if cfg.seed is None else cfg.seed + 500, env=self.held_out_env)
 
         self.log.update_manifest(
             learner=self.learner.describe(),

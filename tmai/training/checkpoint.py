@@ -1,10 +1,17 @@
 """Checkpointing for long training runs.
 
-A run that takes days will be interrupted, so checkpoints must be complete enough to resume
-*exactly*: network weights, both optimisers, the entropy temperature, the gradient-step
-counter, the replay buffer size, the RNG states and the config. Everything is written to a
-temporary file and atomically renamed, so a crash mid-write cannot leave a corrupt
+A run that takes days will be interrupted, so checkpoints must be complete enough to resume a
+run without losing its place: network weights, both optimisers, the entropy temperature, the
+gradient-step counter, the replay buffer size, the RNG states and the config. Everything is
+written to a temporary file and atomically renamed, so a crash mid-write cannot leave a corrupt
 "latest" checkpoint behind.
+
+One thing is deliberately *not* stored: the replay buffer contents. Only its size is recorded,
+so a resumed run refills the buffer from fresh interaction and therefore does not reproduce the
+uninterrupted trajectory step for step. Saving a million-transition buffer into every
+checkpoint of a multi-day run is not a trade worth making; the learner state and the RNG are
+what actually matter for continuing to learn. ``tests/test_reproducibility.py`` pins both the
+guarantee and this limitation.
 """
 
 from __future__ import annotations
@@ -59,6 +66,39 @@ def _rng_state() -> dict[str, Any]:
     if torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
     return state
+
+
+def seed_spaces(env: Any) -> None:
+    """Re-seed an environment's gymnasium spaces from the *current* global RNG state.
+
+    Gymnasium spaces own a private generator that ``np.random.seed`` and ``torch.manual_seed``
+    do not reach, so ``action_space.sample()`` (used for warm-up exploration) stays
+    non-reproducible unless the spaces are seeded explicitly. Deriving the seed from the global
+    state rather than taking one as an argument is what makes this work identically for a fresh
+    run and for a resume: both call it right after the global state is established.
+    """
+    if env is None:
+        return
+    for name in ("action_space", "observation_space"):
+        space = getattr(env, name, None)
+        if space is not None and hasattr(space, "seed"):
+            space.seed(int(np.random.randint(0, 2**31 - 1)))
+
+
+def seed_everything(seed: int | None, *, env: Any = None) -> None:
+    """Seed every RNG a training run touches, so a rerun of a seed reproduces bit for bit.
+
+    Seeding the learner alone is not enough: warm-up actions come from
+    ``env.action_space.sample()``, and the track sampler and normaliser draw from numpy.
+    """
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    seed_spaces(env)
 
 
 def _restore_rng_state(state: dict[str, Any] | None) -> None:

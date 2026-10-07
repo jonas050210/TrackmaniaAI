@@ -1,7 +1,7 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
 **Branch** `arena/f325538e-trackmaniaai` · **commit** `6f81483` (pushed) · **date** 2026-10-07
-**Gate** `pytest tests/ -q` → **524 passed** · `ruff check tmai tests` → **All checks passed!**
+**Gate** `pytest tests/ -q` → **541 passed** · `ruff check tmai tests` → **All checks passed!**
 **Diff** 40 files, +6001 / −314 · source 9 735 lines (`tmai/`), 5 158 lines (`tests/`)
 
 ---
@@ -15,7 +15,7 @@ running `TMInterface.exe` creates; it cannot be opened here.
 What *has* been built and verified is everything around that transport: the environment, reward,
 termination, observations, track representation, multi-track training, evaluation, checkpointing,
 the run-status API and the CLI. Those run against a clearly-labelled kinematic stand-in, and are
-covered by 524 tests.
+covered by 541 tests.
 
 Three verification tiers are used consistently across the code and docs:
 
@@ -119,6 +119,34 @@ CLI: `doctor` · `train` · `eval` · `record-track` · `show-track` · `export-
 
 ---
 
+### 2.6 Reproducibility — measured, and found broken
+
+`train.seed` **did not reproduce a run.** This was discovered by running the same config twice
+and diffing the metrics, not by reading code; nothing in the source looked wrong.
+
+Two independent sources of entropy escaped the seed:
+
+| Escape | Effect | Fix |
+|---|---|---|
+| Gymnasium spaces own a private generator that `np.random.seed` and `torch.manual_seed` cannot reach | Warm-up actions from `env.action_space.sample()` varied run to run | `seed_everything()` / `seed_spaces()` in `tmai/training/checkpoint.py` |
+| `ReplayBuffer` owns a `default_rng(config.seed)`, and every shipped config sets `replay.seed: null` | Minibatch sampling drew fresh OS entropy | `build_buffer()` derives a distinct stream from `train.seed`; an explicit `replay.seed` still wins |
+
+After both fixes, same config + same seed reproduces **identical metrics and bit-identical final
+weights** (asserted in `tests/test_reproducibility.py`). A companion test asserts that different
+seeds *differ*, so the reproducibility test cannot pass merely because seeding is ignored.
+
+**Resume is deliberately not trajectory-identical.** A checkpoint stores the buffer *size* but
+not its contents — saving a 1 M-transition buffer into every checkpoint of a multi-day run is not
+a trade worth making. A resumed run therefore refills the buffer and diverges from the
+uninterrupted run. The checkpoint docstring previously claimed resume was "exact"; that claim was
+false and has been corrected, and a test now pins the limitation so it cannot silently regress.
+
+Scope matters here: this is reproducibility of the *training pipeline*. Real Trackmania physics is
+not deterministic across processes, so a real-game run will not reproduce exactly even with a
+fixed seed. The simulated driver will.
+
+---
+
 ## 3. How real Trackmania communication is designed to work
 
 Everything game-facing lives behind `tmai/game/`. **Only that package knows Trackmania exists.**
@@ -173,6 +201,8 @@ These are real production bugs, not test defects:
 | **`tmai/cli.py` used `Any` without importing it** | `NameError` on the entire `compare` path |
 | `cmd_compare` printed the timestamped run directory | Ignored the manifest `run_name` |
 | **`tmai eval` evaluated only the first train track** | Silently discarded the per-track comparison for multi-track runs |
+| **`train.seed` did not reproduce a run** | Gymnasium space generators and `replay.seed: null` both escaped the seed, so two runs of one config diverged. Found by measurement, not by reading code. |
+| Checkpoint docstring claimed resume was "exact" | The buffer contents are not stored, so a resumed run refills and diverges. Claim corrected; the limitation is now pinned by a test. |
 
 The last one is worth calling out: it was found by running the CLI end to end, not by a unit test,
 which is why the final verification pass drives the real commands rather than only the suite.
@@ -182,7 +212,7 @@ which is why the final verification pass drives the real commands rather than on
 ## 5. Tests
 
 ```
-pytest tests/ -q        →  524 passed in ~21s
+pytest tests/ -q        →  541 passed in ~21s
 ruff check tmai tests   →  All checks passed!
 ```
 

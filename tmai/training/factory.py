@@ -11,6 +11,7 @@ run against the real game.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import numpy as np
 
@@ -191,10 +192,18 @@ def build_learner(env: TrackmaniaEnv, config: RunConfig) -> Learner:
 
 
 def build_buffer(env: TrackmaniaEnv, config: RunConfig) -> ReplayBuffer:
+    replay = config.replay
+    if replay.seed is None and config.train.seed is not None:
+        # The buffer owns a private generator that global seeding does not reach, and
+        # `replay.seed: null` is what every shipped config ships with. Left alone it draws
+        # fresh OS entropy, which silently breaks reproducibility even when `train.seed` is
+        # set. Derive a distinct stream from the run seed instead; an explicit replay seed
+        # still wins.
+        replay = replace(replay, seed=config.train.seed + 7000)
     return ReplayBuffer(
         observation_dim=env.observation_dim,
         action_dim=int(env.action_space.shape[0]),
-        config=config.replay,
+        config=replay,
     )
 
 

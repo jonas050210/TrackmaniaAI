@@ -77,7 +77,28 @@ counter, RNG state (Python, NumPy, PyTorch and CUDA) and the config. A resumed r
 the counters rather than restarting them, and records `resumed_from` in its manifest.
 
 The replay buffer is **not** restored: it would dominate checkpoint size for a 1 M-transition
-buffer. A resumed run refills it during warm-up. This is a deliberate trade-off.
+buffer. A resumed run refills it during warm-up. This is a deliberate trade-off, and it means
+**a resumed run does not reproduce the uninterrupted trajectory step for step.** It resumes the
+*learning state* exactly; the data it learns from next is freshly collected. Both halves of
+that sentence are pinned by `tests/test_reproducibility.py`.
+
+## Reproducibility
+
+`train.seed` makes a fresh run reproduce bit for bit. That was not true before it was measured:
+two sources of entropy escaped the seed, and neither was visible from reading the code.
+
+| Escape | Effect | Fix |
+|---|---|---|
+| Gymnasium spaces own a private generator that `np.random.seed` cannot reach | Warm-up actions (`env.action_space.sample()`) varied between runs | `seed_everything()` seeds the spaces explicitly |
+| `ReplayBuffer` owns a `default_rng`, and every shipped config sets `replay.seed: null` | Minibatch sampling drew fresh OS entropy | `build_buffer()` derives a distinct stream from `train.seed`; an explicit `replay.seed` still wins |
+
+So the invariant is: **same config, same seed, fresh run → identical metrics and identical final
+weights.** A resumed run is reproducible *given the same checkpoint*, but is not expected to
+match an uninterrupted run.
+
+Note this is reproducibility of the training pipeline, not of the game. The real
+Trackmania physics is not deterministic across processes, so a real-game run will not
+reproduce exactly even with a fixed seed — the simulated driver will.
 
 ## Reward tuning
 
