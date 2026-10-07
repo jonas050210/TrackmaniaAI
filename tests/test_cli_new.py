@@ -497,3 +497,39 @@ class TestConfigDiscoveryForResumeAndEval:
         # State really was restored rather than restarted from zero.
         assert resumed[0]["step"] == 30
         assert resumed[0]["gradient_steps"] > 0
+
+
+class TestDoctorCalibrateIsNotSilent:
+    """`--calibrate` needs the real game, so against the simulated driver it is skipped.
+
+    Skipping is correct. Skipping *silently* was not: the operator asked for a measurement and
+    got no output at all, with exit 0, which reads exactly like a calibration that found nothing
+    wrong.
+    """
+
+    def test_skipped_calibration_says_so(self, capsys):
+        import tmai
+
+        smoke = Path(tmai.__file__).parent / "configs" / "smoke.yaml"
+        assert main(["doctor", "-c", str(smoke), "--calibrate", "--calibrate-steps", "5"]) == 0
+        err = capsys.readouterr().err
+        assert "calibration skipped" in err
+        assert "needs the real game" in err
+
+    def test_without_the_flag_nothing_is_claimed(self, capsys):
+        """Guard against the message being printed unconditionally."""
+        import tmai
+
+        smoke = Path(tmai.__file__).parent / "configs" / "smoke.yaml"
+        assert main(["doctor", "-c", str(smoke)]) == 0
+        captured = capsys.readouterr()
+        assert "calibration skipped" not in captured.err
+        assert "calibration skipped" not in captured.out
+
+    def test_doctor_still_reports_the_simulated_driver_as_a_warning(self, capsys):
+        import tmai
+
+        smoke = Path(tmai.__file__).parent / "configs" / "smoke.yaml"
+        assert main(["doctor", "-c", str(smoke)]) == 0
+        out = capsys.readouterr().out
+        assert "simulated (NOT the real game)" in out

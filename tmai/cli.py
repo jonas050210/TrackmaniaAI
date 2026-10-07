@@ -177,6 +177,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     exit_code = 0 if all(s != "fail" for _, _, s in game_rows) else 1
 
+    if args.calibrate and driver is None:
+        # Skipping is correct -- calibration measures real telemetry against the real game's
+        # clock, so it is meaningless against the toy model -- but skipping *silently* is not.
+        # The operator asked for a measurement and would otherwise get no output and exit 0.
+        print(
+            "\ncalibration skipped: it needs the real game.\n"
+            "  --calibrate measures how the game's telemetry maps to metres and seconds, so it\n"
+            "  requires a driver connected to Trackmania via TMInterface on Windows. The\n"
+            "  simulated driver is a fixed-step toy model with no real clock to measure.\n"
+            "  Run this on the game host with driver.kind: tminterface.",
+            file=sys.stderr,
+        )
+
     if args.calibrate and driver is not None:
         from tmai.game.calibration import calibrate_driver
 

@@ -54,7 +54,7 @@ Three categories are used throughout:
 | Evaluation reports (per-track, per-split, gap) | **Verified** | 38 tests against artefacts from a real training run. |
 | Status/compare CLI and dashboard API | **Verified** | 25 + 38 tests. |
 | Simplified track visualisation | **Verified** | Headless PNG + `.obj`. |
-| **Total** | | **549 tests, `ruff` clean, 93% statement coverage** |
+| **Total** | | **552 tests, `ruff` clean, 93% statement coverage** |
 
 Measured with `pytest --cov=tmai --cov-report=term-missing`. Coverage is high everywhere except
 one file, deliberately:
@@ -101,6 +101,7 @@ several are the kind that produce *plausible-looking but wrong* results rather t
 | Checkpoint docstring claimed resume was "exact" | It is not: the buffer *contents* are not stored, so a resumed run refills and diverges. The docstring and `TRAINING.md` now state the trade-off explicitly, and a test pins it. |
 | `tmai compare` always printed `--` in the `gap` column | It read `generalization_gap` off the *training* report, but training and held-out runs are logged as separate reports that each carry only their own split — so the value was always `None`. The one column that shows overfitting was silently blank; the gap is now computed across both reports. |
 | **`tmai train --resume runs/<run>` did not work** | The documented command failed with "no track configured". Config auto-discovery was wired only to `--checkpoint`, so `--resume` silently fell back to `default.yaml` even though the run's own `config.yaml` was in the directory. Found by running the documented command; discovery now covers both flags. |
+| `tmai doctor --calibrate` produced no output against the simulated driver | Skipping is correct — calibration measures real telemetry against the game's clock — but it skipped *silently* with exit 0, which reads exactly like a calibration that found nothing wrong. It now says why it was skipped. |
 | Nested dicts were stringified in `events.jsonl` | Evaluation reports were written as the *string* `"{'a': 1}"`, breaking machine readability. |
 | Episode events did not record which track they ran on | Per-track episode analysis was impossible for a multi-track run; a bad track looked like a bad policy. |
 | `Any` used but not imported in `tmai/cli.py` | A `NameError` waiting on the `compare` code path; caught by `ruff`. |
