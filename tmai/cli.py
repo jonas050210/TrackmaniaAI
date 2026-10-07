@@ -66,11 +66,18 @@ def _run_dir_config(checkpoint: str | None) -> Path | None:
 
 def _load_config(args: argparse.Namespace) -> RunConfig:
     source = getattr(args, "config", None)
-    if not source and getattr(args, "checkpoint", None):
-        found = _run_dir_config(args.checkpoint)
-        if found is not None:
-            source = str(found)
-            logger.info("using the run's saved configuration: %s", found)
+    if not source:
+        # Both `eval --checkpoint <run>` and `train --resume <run>` point at an existing run,
+        # and in both cases the run's own config.yaml is the right one: the observation layout,
+        # the track and the normalisation have to match what produced the checkpoint. Without
+        # this, `tmai train --resume runs/<run>` silently fell back to default.yaml and failed
+        # with "no track configured" even though the run directory says exactly what to use.
+        for attr in ("checkpoint", "resume"):
+            found = _run_dir_config(getattr(args, attr, None))
+            if found is not None:
+                source = str(found)
+                logger.info("using the run's saved configuration: %s", found)
+                break
     config = RunConfig.from_yaml(source) if source else RunConfig()
     overrides = parse_overrides(getattr(args, "set", None))
     if getattr(args, "allow_simulated_driver", False):

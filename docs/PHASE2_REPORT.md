@@ -1,7 +1,7 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
 **Branch** `arena/f325538e-trackmaniaai` (pushed) · **date** 2026-10-07
-**Gate** `pytest tests/ -q` → **543 passed** · `ruff check tmai tests` → **All checks passed!**
+**Gate** `pytest tests/ -q` → **549 passed** · `ruff check tmai tests` → **All checks passed!**
 **Cumulative diff vs `main`** 78 files, +18 146 · source 9 805 lines (`tmai/`), 5 846 lines (`tests/`)
 
 The commit hash is deliberately not named here: recording it would go stale the moment this file
@@ -18,7 +18,7 @@ running `TMInterface.exe` creates; it cannot be opened here.
 What *has* been built and verified is everything around that transport: the environment, reward,
 termination, observations, track representation, multi-track training, evaluation, checkpointing,
 the run-status API and the CLI. Those run against a clearly-labelled kinematic stand-in, and are
-covered by 543 tests.
+covered by 549 tests.
 
 Three verification tiers are used consistently across the code and docs:
 
@@ -207,6 +207,7 @@ These are real production bugs, not test defects:
 | **`train.seed` did not reproduce a run** | Gymnasium space generators and `replay.seed: null` both escaped the seed, so two runs of one config diverged. Found by measurement, not by reading code. |
 | Checkpoint docstring claimed resume was "exact" | The buffer contents are not stored, so a resumed run refills and diverges. Claim corrected; the limitation is now pinned by a test. |
 | `tmai compare` always printed `--` in the `gap` column | It read `generalization_gap` off the *training* report, but training and held-out runs are logged as separate reports that each carry only their own split, so the value was always `None`. The one column that shows overfitting was silently blank. |
+| **`tmai train --resume runs/<run>` did not work** | The documented command failed with "no track configured" — config auto-discovery was wired only to `--checkpoint`, so `--resume` silently fell back to `default.yaml`. Found by running the documented command, not by a unit test. |
 
 The last one is worth calling out: it was found by running the CLI end to end, not by a unit test,
 which is why the final verification pass drives the real commands rather than only the suite.
@@ -216,7 +217,7 @@ which is why the final verification pass drives the real commands rather than on
 ## 5. Tests
 
 ```
-pytest tests/ -q        →  543 passed in ~21s
+pytest tests/ -q        →  549 passed in ~21s
 ruff check tmai tests   →  All checks passed!
 ```
 
@@ -231,15 +232,15 @@ ruff check tmai tests   →  All checks passed!
 | `test_trainer.py` | 40 | training loop, held-out eval, resume |
 | `test_api_status.py` | 38 | status API, snapshots, history |
 | `test_tminterface_driver.py` | 31 | driver logic over a scripted tick source |
-| `test_cli_new.py` | 31 | new CLI commands, end to end |
+| `test_cli_new.py` | 37 | new CLI commands, config discovery, end to end |
 | `test_evaluate_gaps.py` | 23 | generalisation gap, sampled evaluation, off-track accounting |
 | `test_telemetry.py` | 21 | real `SimStateData` struct decoding |
 | `test_calibration.py` | 18 | wrong-convention detection |
 | `test_reproducibility.py` | 17 | seeding, run reproduction, resume guarantees |
 | `test_viz.py` | 13 | headless PNG and `.obj` export |
-| **Total** | **543** | |
+| **Total** | **549** | |
 
-Phase 1 gate was 314 passed; phase 2 adds 229.
+Phase 1 gate was 314 passed; phase 2 adds 235.
 
 **Verified end to end in this sandbox:** `validate-config` → `train` (multi-track, held-out
 evaluation, 800 steps, best_score 0.5724) → `status` → `eval --split train,validation` (4 tracks

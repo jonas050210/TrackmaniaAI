@@ -379,3 +379,121 @@ class TestEvalCoversTheLibrary:
         from tmai.training.trainer import train_from_config
 
         return train_from_config(cfg).run_dir
+
+
+class TestConfigDiscoveryForResumeAndEval:
+    """A run directory says exactly how it was configured, so pointing a command at one is also
+    a request to use that configuration.
+
+    `eval --checkpoint` did this from the start. `train --resume` did not, so the documented
+    `tmai train --resume runs/<run>` fell back to default.yaml and failed with "no track
+    configured" even though the run's own config.yaml was sitting right there.
+    """
+
+    def test_load_config_finds_the_saved_config_for_checkpoint(self, two_runs):
+        from tmai.cli import _run_dir_config
+
+        assert _run_dir_config(two_runs[0]) is not None
+
+    def test_load_config_finds_the_saved_config_for_resume(self, two_runs):
+        """The regression guard: `--resume` must discover the config just like `--checkpoint`."""
+        import argparse
+
+        from tmai.cli import _load_config
+
+        # An args namespace carrying only `resume`, as `tmai train --resume <run>` produces.
+        args = argparse.Namespace(config=None, resume=two_runs[0], set=None)
+        config = _load_config(args)
+
+        # The smoke runs configure a four-track synthetic suite; default.yaml does not, so a
+        # non-empty suite here proves the run's config.yaml was loaded.
+        assert config.track.synthetic_suite, "the run's own track configuration must be used"
+
+    def test_resume_discovers_config_from_a_checkpoint_file_path(self, two_runs):
+        """A `.pt` path lives inside the run directory, so discovery must walk up from it."""
+        import argparse
+
+        from tmai.cli import _load_config
+        from tmai.training.checkpoint import latest_checkpoint
+
+        ckpt = latest_checkpoint(two_runs[0])
+        assert ckpt is not None, "precondition: the fixture run has a checkpoint"
+
+        args = argparse.Namespace(config=None, resume=str(ckpt), set=None)
+        assert _load_config(args).track.synthetic_suite
+
+    def test_explicit_config_wins_over_discovery(self, two_runs, tmp_path):
+        """An operator who passes -c means it; discovery must not override an explicit choice."""
+        import argparse
+
+        from tmai.cli import _load_config
+
+        explicit = tmp_path / "explicit.yaml"
+        explicit.write_text("track:\n  synthetic: oval\n", encoding="utf-8")
+
+        args = argparse.Namespace(config=str(explicit), resume=two_runs[0], set=None)
+        config = _load_config(args)
+        assert config.track.synthetic == "oval"
+        assert not config.track.synthetic_suite
+
+    def test_no_run_and_no_config_falls_back_to_defaults(self):
+        import argparse
+
+        from tmai.cli import _load_config
+
+        args = argparse.Namespace(config=None, resume=None, checkpoint=None, set=None)
+        config = _load_config(args)
+        assert not config.track.synthetic
+        assert not config.track.synthetic_suite
+        assert not config.track.path
+        assert not config.track.directory
+
+    def test_resume_actually_continues_a_run(self, tmp_path):
+        """End to end: the documented command form must work, and must restore state."""
+        import json
+
+        from tmai.config import RunConfig
+        from tmai.runlog import read_manifest
+        from tmai.training.trainer import train_from_config
+
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        config.track.synthetic_suite = [{"name": "straight"}, {"name": "oval"}]
+        config.train.output_dir = str(tmp_path / "first")
+        config.train.run_name = "resume-e2e"
+        config.train.total_steps = 30
+        config.train.warmup_steps = 5
+        config.train.batch_size = 8
+        config.train.log_interval = 15
+        config.train.eval_interval = 0
+        config.train.held_out_eval_interval = 0
+        config.train.checkpoint_interval = 30
+        config.sac.network.hidden_sizes = (16,)
+        first = train_from_config(config).run_dir
+
+        # The command under test: resume with no -c, exactly as documented.
+        assert main(
+            [
+                "train",
+                "--resume", str(first),
+                "--set", "train.total_steps=60",
+                "--set", "train.checkpoint_interval=30",
+                "--set", f"train.output_dir={tmp_path / 'second'}",
+            ]
+        ) == 0
+
+        second = sorted(p for p in (tmp_path / "second").iterdir() if p.is_dir())[0]
+        manifest = read_manifest(second)
+        assert manifest["resumed_from"] == str(first)
+
+        events = [
+            json.loads(line)
+            for line in (second / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        resumed = [e for e in events if e.get("event") == "resumed"]
+        assert resumed, "the resumed run must record a `resumed` event"
+        # State really was restored rather than restarted from zero.
+        assert resumed[0]["step"] == 30
+        assert resumed[0]["gradient_steps"] > 0
