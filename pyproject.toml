@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trackmania-ai"
+version = "0.1.0"
+description = "Reinforcement-learning agents that learn to drive the real Trackmania game"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "TrackmaniaAI contributors" }]
+keywords = ["trackmania", "reinforcement-learning", "robotics", "racing", "sac"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core runtime dependencies are deliberately small: the environment, the track model and
+# the RL algorithm need nothing but numpy, a YAML reader and gymnasium's interface types.
+dependencies = [
+    "numpy>=1.24",
+    "gymnasium>=0.29",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# The learner. Kept as an extra because the game host and the learner are expected to run
+# on different machines: a rollout host needs `game`, a training host needs `learn`.
+learn = ["torch>=2.1"]
+# Real game integration. `tminterface` only works on Windows (it talks to the game through
+# a Windows named-memory-mapped file), so it is never a hard dependency of the package.
+game = ["tminterface>=1.0.2; sys_platform == 'win32'"]
+# Simplified track visualisation / debugging plots.
+viz = ["matplotlib>=3.7"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "torch>=2.1",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+tmai = "tmai.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jonas050210/TrackmaniaAI"
+
+[tool.setuptools.packages.find]
+include = ["tmai*"]
+
+[tool.setuptools.package-data]
+tmai = ["configs/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: tests that take more than a few seconds",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length is advisory; docstrings with URLs exceed it
+    "B008",  # function calls in dataclass defaults are intentional in config objects
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]

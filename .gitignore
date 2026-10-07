@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Experiment output: runs, checkpoints, metrics and recorded track data are artefacts,
+# not source. Keep them out of git (see docs/TRAINING.md for the layout).
+runs/
+checkpoints/
+data/tracks/*.npz
+data/tracks/*.json
+!data/tracks/README.md
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

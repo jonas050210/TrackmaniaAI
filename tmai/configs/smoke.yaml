@@ -1,0 +1,104 @@
+driver:
+  kind: simulated
+  server_name: TMInterface0
+  position_scale: 1.0
+  speed_ratio: 1.0
+  reset_strategy: respawn
+  reset_command: respawn
+  settle_ticks: 5
+  connect_timeout_s: 20.0
+  frame_timeout_s: 30.0
+  allow_simulated: true
+track:
+  path: null
+  synthetic: s_curve
+  synthetic_kwargs:
+    length: 300.0
+env:
+  control_dt: 0.05
+  action_repeat: 1
+  observation:
+    curvature_lookahead:
+    - 5.0
+    - 10.0
+    - 20.0
+    - 40.0
+    - 80.0
+    include_speed: true
+    include_drivetrain: true
+    include_sliding: true
+    include_lateral: true
+    include_heading_error: true
+    include_progress_rate: true
+    include_curvature: true
+    include_edge_distances: true
+    include_last_action: true
+    include_checkpoint_progress: true
+    scales:
+      speed: 70.0
+      lateral: 8.0
+      curvature: 0.05
+      yaw_rate: 2.0
+      rpm: 10000.0
+      gear: 6.0
+      progress_delta: 3.5
+  reward:
+    progress_weight: 1.0
+    speed_weight: 0.05
+    off_track_weight: 0.3
+    heading_weight: 0.02
+    slip_weight: 0.02
+    slide_penalty: 0.0
+    step_penalty: 0.0
+    finish_bonus: 20.0
+    max_progress_per_step: 6.0
+    max_backward_per_step: 2.0
+    speed_ref: 70.0
+    off_track_margin: 0.0
+  termination:
+    max_steps: 200
+    off_track_limit: 40
+    off_track_margin: 1.5
+    stall_limit: 60
+    min_progress_per_step: 0.05
+    min_steps_before_stall: 40
+    no_ground_contact_limit: 25
+  projection_window: 120.0
+sac:
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  temperature_lr: 0.0003
+  initial_temperature: 0.2
+  learnable_temperature: true
+  target_entropy: null
+  max_grad_norm: 0.0
+  network:
+    hidden_sizes:
+    - 64
+    - 64
+    activation: relu
+    layer_norm: false
+    separate_encoders: true
+    dropout: 0.0
+replay:
+  capacity: 20000
+  seed: null
+train:
+  total_steps: 400
+  warmup_steps: 100
+  batch_size: 64
+  updates_per_step: 1.0
+  update_every: 1
+  log_interval: 100
+  eval_interval: 200
+  eval_episodes: 1
+  checkpoint_interval: 200
+  keep_checkpoints: 3
+  seed: 0
+  device: null
+  run_name: smoke-simulated
+  output_dir: runs
+  resume: null
+  max_wall_seconds: null
