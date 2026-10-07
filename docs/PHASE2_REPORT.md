@@ -1,8 +1,8 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
-**Branch** `arena/f325538e-trackmaniaai` · **commit** `6f81483` (pushed) · **date** 2026-10-07
+**Branch** `arena/f325538e-trackmaniaai` · **commit** `02ce5d0` (pushed) · **date** 2026-10-07
 **Gate** `pytest tests/ -q` → **541 passed** · `ruff check tmai tests` → **All checks passed!**
-**Diff** 40 files, +6001 / −314 · source 9 735 lines (`tmai/`), 5 158 lines (`tests/`)
+**Cumulative diff vs `main`** 78 files, +18 088 · source 9 795 lines (`tmai/`), 5 805 lines (`tests/`)
 
 ---
 
@@ -228,9 +228,14 @@ ruff check tmai tests   →  All checks passed!
 | `test_api_status.py` | 38 | status API, snapshots, history |
 | `test_tminterface_driver.py` | 31 | driver logic over a scripted tick source |
 | `test_cli_new.py` | 29 | new CLI commands, end to end |
-| `test_calibration.py` / `test_telemetry.py` / `test_viz.py` | 18 / 21 / 13 | |
+| `test_evaluate_gaps.py` | 23 | generalisation gap, sampled evaluation, off-track accounting |
+| `test_telemetry.py` | 21 | real `SimStateData` struct decoding |
+| `test_calibration.py` | 18 | wrong-convention detection |
+| `test_reproducibility.py` | 17 | seeding, run reproduction, resume guarantees |
+| `test_viz.py` | 13 | headless PNG and `.obj` export |
+| **Total** | **541** | |
 
-Phase 1 gate was 314 passed; phase 2 adds 187.
+Phase 1 gate was 314 passed; phase 2 adds 227.
 
 **Verified end to end in this sandbox:** `validate-config` → `train` (multi-track, held-out
 evaluation, 800 steps, best_score 0.5724) → `status` → `eval --split train,validation` (4 tracks
