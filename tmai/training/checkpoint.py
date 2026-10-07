@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pickle
 import random
 import tempfile
 from dataclasses import dataclass
@@ -35,6 +36,15 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_EXTENSION = ".pt"
 CHECKPOINT_PREFIX = "checkpoint"
 BEST_PREFIX = "best"
+
+
+class CheckpointError(ValueError):
+    """A checkpoint file exists but cannot be read as a payload of this build.
+
+    Raised for a truncated, zero-byte or otherwise damaged file. ``torch.load`` would surface
+    these as a bare ``OSError``/``EOFError``/``UnpicklingError`` naming no file and suggesting no
+    remedy, which is exactly the wrong report to hand someone resuming a multi-day run.
+    """
 
 
 @dataclass
@@ -194,11 +204,30 @@ def save_best(
 
 
 def load_checkpoint(path: str | Path, *, map_location: str = "cpu") -> dict[str, Any]:
-    """Load a checkpoint payload."""
+    """Load a checkpoint payload.
+
+    A file that is present but unreadable is reported as a :class:`CheckpointError` naming the
+    file, its size and the underlying cause, rather than letting ``torch.load`` escape with a
+    bare ``OSError``/``EOFError`` that points at neither.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"checkpoint not found: {path}")
-    payload = torch.load(path, map_location=map_location, weights_only=False)
+    try:
+        payload = torch.load(path, map_location=map_location, weights_only=False)
+    except (OSError, EOFError, pickle.UnpicklingError, RuntimeError, TypeError) as exc:
+        size = path.stat().st_size if path.exists() else -1
+        raise CheckpointError(
+            f"checkpoint is unreadable and cannot be resumed: {path} ({size} bytes). "
+            f"Cause: {type(exc).__name__}: {exc}. "
+            "The file is truncated or damaged; delete it and resume from an earlier "
+            f"{CHECKPOINT_PREFIX}_N{CHECKPOINT_EXTENSION}, or start a fresh run."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CheckpointError(
+            f"checkpoint does not contain a payload mapping: {path} "
+            f"(got {type(payload).__name__}); expected a dict written by this build."
+        )
     version = int(payload.get("schema_version", 0))
     if version != 1:
         raise ValueError(f"unsupported checkpoint schema version {version}; this build reads 1")

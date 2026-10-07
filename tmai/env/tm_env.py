@@ -348,8 +348,18 @@ class TrackmaniaEnv(gym.Env):
         frame = self._frame
         assert frame is not None
         info: dict[str, Any] = {
+            # Absolute arc-length position, for diagnostics and the trainer's accumulator.
             "progress": projection.progress,
-            "progress_fraction": projection.progress / max(self.track.length, 1e-6),
+            # Fraction of a lap *covered this episode*. This used to be
+            # `projection.progress / length`, i.e. absolute position on the track, which made
+            # the headline metric report where the car started rather than how far it drove: a
+            # car that never moved and was placed at 95% of the lap reported 95% progress, and
+            # since random_start_station is on by default, evaluation scores and best-checkpoint
+            # selection were dominated by the luck of the start position.
+            "progress_fraction": min(1.0, max(0.0, self._episode_progress
+                                              / max(self.track.length, 1e-6))),
+            # Where the car currently is on the track, which the above deliberately is not.
+            "track_position_fraction": projection.progress / max(self.track.length, 1e-6),
             "lateral_offset": projection.lateral_offset,
             "distance_to_centerline": projection.distance,
             "speed_forward": frame.vehicle.speed_forward,

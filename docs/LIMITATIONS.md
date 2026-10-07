@@ -54,7 +54,7 @@ Three categories are used throughout:
 | Evaluation reports (per-track, per-split, gap) | **Verified** | 38 tests against artefacts from a real training run. |
 | Status/compare CLI and dashboard API | **Verified** | 25 + 38 tests. |
 | Simplified track visualisation | **Verified** | Headless PNG + `.obj`. |
-| **Total** | | **552 tests, `ruff` clean, 93% statement coverage** |
+| **Total** | | **568 tests, `ruff` clean, 93% statement coverage** |
 
 Measured with `pytest --cov=tmai --cov-report=term-missing`. Coverage is high everywhere except
 one file, deliberately:

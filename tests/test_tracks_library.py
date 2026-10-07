@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -322,3 +324,63 @@ class TestTrackStats:
         stats = compute_stats(figure_eight())
         assert stats.total_turning > 0
         assert stats.num_points > 10
+
+
+class TestDuplicateGeometryIsReported:
+    """Loading a directory must not silently drop tracks.
+
+    Two files with identical geometry are the same map under two names, and collapsing them is
+    correct -- but it used to happen at `debug` level while the INFO log still claimed each file
+    was "loaded", so an operator training on what they believed was N maps was actually training
+    on fewer, with nothing in the log to reveal it.
+    """
+
+    @staticmethod
+    def _write(directory: Path, name: str, base: str) -> Path:
+        track = build_synthetic(base)
+        track.name = name
+        path = directory / f"{name}.json"
+        track.save(path)
+        return path
+
+    def test_identical_geometry_collapses_to_one_track(self, tmp_path):
+        self._write(tmp_path, "oval", "oval")
+        self._write(tmp_path, "oval_copy", "oval")
+        library = TrackLibrary.from_directory(tmp_path)
+        assert len(library) == 1
+
+    def test_the_duplicate_is_reported_as_a_warning(self, tmp_path, caplog):
+        self._write(tmp_path, "oval", "oval")
+        self._write(tmp_path, "oval_copy", "oval")
+        with caplog.at_level(logging.WARNING, logger="tmai.tracks.library"):
+            library = TrackLibrary.from_directory(tmp_path)
+        text = caplog.text
+        assert "duplicate" in text
+        assert "oval_copy" in text
+        # It must name the track it was collapsed into, or the operator cannot act on it.
+        assert "oval" in text
+        assert len(library) == 1
+
+    def test_no_warning_when_every_track_is_distinct(self, tmp_path, caplog):
+        for name in ("straight", "oval", "s_curve"):
+            self._write(tmp_path, name, name)
+        with caplog.at_level(logging.WARNING, logger="tmai.tracks.library"):
+            library = TrackLibrary.from_directory(tmp_path)
+        assert "duplicate" not in caplog.text
+        assert len(library) == 3
+
+    def test_loaded_log_only_names_tracks_actually_added(self, tmp_path, caplog):
+        """The regression itself: 'loaded' must not be logged for a file that was skipped."""
+        self._write(tmp_path, "oval", "oval")
+        self._write(tmp_path, "oval_copy", "oval")
+        with caplog.at_level(logging.INFO, logger="tmai.tracks.library"):
+            library = TrackLibrary.from_directory(tmp_path)
+
+        loaded = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "loaded track" in r.getMessage()
+        ]
+        assert len(loaded) == len(library), (
+            f"logged {len(loaded)} loads but the library holds {len(library)} tracks"
+        )
+        assert not any("oval_copy" in line for line in loaded)

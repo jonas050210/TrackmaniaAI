@@ -198,16 +198,36 @@ class TrackLibrary:
         if not paths:
             raise TrackLibraryError(f"no track files matching {pattern!r} in {directory}")
 
+        duplicates: list[tuple[str, str]] = []
         for path in paths:
             track = CenterlineTrack.load(path)
             split = (explicit_splits or {}).get(path.stem)
-            library.add(track, split=split, source=str(path))
+            entry = library.add(track, split=split, source=str(path))
+
+            # `add` returns the *existing* entry when the geometry is already present, so the
+            # file was read but not added. Logging that as "loaded" would claim something that
+            # did not happen, and the library would then look smaller than the log implies.
+            if entry.track is not track:
+                duplicates.append((track.name, entry.track.name))
+                continue
+
             logger.info(
                 "loaded track %r -> %s (%.0f m, %d points)",
                 track.name,
-                library.entries[-1].split,
+                entry.split,
                 track.length,
                 track.num_points,
+            )
+
+        if duplicates:
+            # Silent here means an operator believes they are training on N maps when they are
+            # training on fewer, with no way to notice from the log.
+            logger.warning(
+                "skipped %d duplicate track file(s) with geometry identical to one already "
+                "loaded: %s. Each distinct map must have distinct geometry, or it is the same "
+                "map under another name.",
+                len(duplicates),
+                ", ".join(f"{name!r} == {kept!r}" for name, kept in duplicates),
             )
         return library
 

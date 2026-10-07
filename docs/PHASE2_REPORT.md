@@ -1,7 +1,7 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
 **Branch** `arena/f325538e-trackmaniaai` (pushed) · **date** 2026-10-07
-**Gate at time of writing** `pytest tests/ -q` → **552 passed** · `ruff check tmai tests` → **All checks passed!**
+**Gate at time of writing** `pytest tests/ -q` → **568 passed** · `ruff check tmai tests` → **All checks passed!**
 
 Commit hashes, diff totals and line counts are deliberately *not* recorded here: every one of them
 goes stale the moment this file is committed, and a stale number that looks precise is worse than
@@ -24,7 +24,7 @@ running `TMInterface.exe` creates; it cannot be opened here.
 What *has* been built and verified is everything around that transport: the environment, reward,
 termination, observations, track representation, multi-track training, evaluation, checkpointing,
 the run-status API and the CLI. Those run against a clearly-labelled kinematic stand-in, and are
-covered by 552 tests.
+covered by 568 tests.
 
 Three verification tiers are used consistently across the code and docs:
 
@@ -224,30 +224,30 @@ which is why the final verification pass drives the real commands rather than on
 ## 5. Tests
 
 ```
-pytest tests/ -q        →  552 passed in ~21s
+pytest tests/ -q        →  568 passed in ~29s
 ruff check tmai tests   →  All checks passed!
 ```
 
 | File | Tests | Coverage |
 |---|---|---|
 | `test_generalization.py` | 59 | library, splits, sampler, normalisation, translation invariance, held-out |
-| `test_env.py` | 53 | reward (rewritten), termination, observation spec |
+| `test_env.py` | 57 | reward (rewritten), termination, observation spec, progress semantics |
 | `test_tracks.py` | 53 | centreline, geometry, stats, GBX block conversion |
 | `test_agents.py` | 52 | SAC, replay buffer, normalising wrapper |
-| `test_infra.py` | 50 | checkpointing, runlog, config validation |
-| `test_tracks_library.py` | 44 | library loading, manifests, split stability |
+| `test_infra.py` | 55 | checkpointing, damaged-checkpoint reporting, runlog, config validation |
+| `test_tracks_library.py` | 48 | library loading, duplicate geometry, manifests, split stability |
 | `test_trainer.py` | 40 | training loop, held-out eval, resume |
 | `test_api_status.py` | 38 | status API, snapshots, history |
 | `test_tminterface_driver.py` | 31 | driver logic over a scripted tick source |
-| `test_cli_new.py` | 40 | new CLI commands, config discovery, doctor, end to end |
+| `test_cli_new.py` | 43 | new CLI commands, config discovery, doctor, end to end |
 | `test_evaluate_gaps.py` | 23 | generalisation gap, sampled evaluation, off-track accounting |
 | `test_telemetry.py` | 21 | real `SimStateData` struct decoding |
 | `test_calibration.py` | 18 | wrong-convention detection |
 | `test_reproducibility.py` | 17 | seeding, run reproduction, resume guarantees |
 | `test_viz.py` | 13 | headless PNG and `.obj` export |
-| **Total** | **552** | |
+| **Total** | **568** | |
 
-Phase 1 gate was 314 passed; phase 2 adds 238.
+Phase 1 gate was 314 passed; phase 2 adds 238; the verification pass adds 16.
 
 **Verified end to end in this sandbox:** `validate-config` → `train` (multi-track, held-out
 evaluation, 800 steps, best_score 0.5724) → `status` → `eval --split train,validation` (4 tracks

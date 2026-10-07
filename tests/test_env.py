@@ -24,6 +24,7 @@ from tmai.env.tm_env import EnvConfig, TrackmaniaEnv
 from tmai.game.protocol import Action
 from tmai.game.simulated import SimulatedGameDriver
 from tmai.tracks.centerline import CenterlineTrack
+from tmai.tracks.synthetic import build_synthetic
 
 
 def build_env(track, config=None, *, throttle=1.0):
@@ -602,3 +603,85 @@ class TestEnvContract:
         env.close()
         assert driver.is_connected() is True
         driver.close()
+
+
+class TestProgressFractionMeasuresDrivingNotPlacement:
+    """`progress_fraction` must measure how far the car drove, not where it started.
+
+    It used to be `projection.progress / track.length` -- absolute position on the track. With
+    `random_start_station` on by default, that made the headline evaluation metric report the
+    luck of the start position: a car placed at 95% of the lap that never moved reported 95%
+    progress. Because that metric feeds `EvaluationReport.score`, best-checkpoint selection
+    could be won by a fortunate spawn rather than by driving.
+    """
+
+    @staticmethod
+    def _env():
+        from tmai.env.tm_env import EnvConfig, TrackmaniaEnv
+        from tmai.game.simulated import SimulatedGameDriver
+
+        track = build_synthetic("s_curve")
+        driver = SimulatedGameDriver(track)
+        driver.open()
+        return TrackmaniaEnv(driver, track, EnvConfig()), track
+
+    def test_a_stationary_car_reports_zero_from_any_start(self):
+        """The regression itself: placement must not be mistaken for progress."""
+        env, track = self._env()
+        try:
+            for fraction in (0.0, 0.25, 0.5, 0.75, 0.95):
+                _, info = env.reset(options={"start_station": fraction * track.length})
+                zero = np.zeros(env.action_space.shape[0], dtype=np.float32)
+                for _ in range(5):
+                    _, _, term, trunc, info = env.step(zero)
+                    if term or trunc:
+                        break
+                assert info["progress_fraction"] == 0.0, (
+                    f"started at {fraction:.0%} and reported "
+                    f"{info['progress_fraction']:.1%} progress without moving"
+                )
+        finally:
+            env.close()
+
+    def test_equal_driving_reports_equal_progress_from_any_start(self):
+        """The metric must be start-invariant, or evaluation is not comparable across episodes."""
+        env, track = self._env()
+        results = []
+        try:
+            for fraction in (0.0, 0.5):
+                _, info = env.reset(options={"start_station": fraction * track.length})
+                forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                for _ in range(80):
+                    _, _, term, trunc, info = env.step(forward)
+                    if term or trunc:
+                        break
+                results.append(info["progress_fraction"])
+        finally:
+            env.close()
+        assert results[0] > 0.0, "the car must actually make progress"
+        assert abs(results[0] - results[1]) < 1e-6, (
+            f"same driving reported different progress by start: {results}"
+        )
+
+    def test_track_position_is_still_available_separately(self):
+        """Absolute position is still useful; it just must not be the progress metric."""
+        env, track = self._env()
+        try:
+            _, info = env.reset(options={"start_station": 0.5 * track.length})
+            assert info["track_position_fraction"] == pytest.approx(0.5, abs=1e-3)
+            assert info["progress_fraction"] == 0.0
+        finally:
+            env.close()
+
+    def test_progress_fraction_is_bounded(self):
+        env, track = self._env()
+        try:
+            _, info = env.reset()
+            forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            for _ in range(400):
+                _, _, term, trunc, info = env.step(forward)
+                assert 0.0 <= info["progress_fraction"] <= 1.0
+                if term or trunc:
+                    break
+        finally:
+            env.close()

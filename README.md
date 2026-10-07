@@ -15,7 +15,7 @@ The GUI is deliberately not built yet — but the data API it will consume alrea
 | | |
 |---|---|
 | Real Trackmania integration | Implemented against TMInterface's documented API. **Not yet verified on a live game** — it needs a Windows host with Trackmania, which this repository's CI does not have. See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md). |
-| RL environment, reward, termination | Implemented and unit-tested (**552 tests**). |
+| RL environment, reward, termination | Implemented and unit-tested (**568 tests**). |
 | SAC learner | Implemented from scratch, tested, including a Bellman fixed-point check. |
 | Multi-track training + generalisation | Implemented and tested: track library, train/validation/test splits, leakage prevention, held-out evaluation. |
 | Observation normalisation | Implemented as a learner decorator, so replay data stays valid as statistics improve. |
@@ -180,7 +180,7 @@ files into JSON for a dashboard, so a GUI can be added later without touching th
 ## Tests
 
 ```bash
-pytest                 # 552 tests, no game, no Windows, no display
+pytest                 # 568 tests, no game, no Windows, no display
 ruff check tmai tests
 pytest --cov=tmai --cov-report=term-missing   # 93% statement coverage
 ```

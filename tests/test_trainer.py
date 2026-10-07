@@ -87,7 +87,9 @@ class TestFactory:
         config = RunConfig()
         config.driver.kind = "carbondioxide"
         config.track.synthetic = "straight"
-        with pytest.raises(ConfigError, match="unknown driver.kind"):
+        # Escaped dot: the unescaped form matched any character, so the assertion would also
+        # have passed on a message that said something else entirely.
+        with pytest.raises(ConfigError, match=r"unknown driver\.kind"):
             build_driver(config, build_track(config))
 
     def test_tminterface_driver_is_built_without_connecting(self):

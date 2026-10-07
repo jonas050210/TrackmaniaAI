@@ -21,6 +21,7 @@ from tmai.runlog import (
     read_metrics,
 )
 from tmai.training.checkpoint import (
+    CheckpointError,
     latest_checkpoint,
     list_checkpoints,
     load_checkpoint,
@@ -360,6 +361,48 @@ class TestCheckpoints:
         assert meta.episode == 2
         assert meta.best_score == pytest.approx(0.25)
         assert meta.created_utc
+
+    # -- a damaged file must be reported, not silently accepted or cryptically rejected ------
+
+    def test_truncated_checkpoint_raises_actionable_error(self, tmp_path, learner):
+        """A half-written file names itself, its size and a remedy.
+
+        ``torch.load`` alone raises a bare ``OSError`` that points at neither the file nor a way
+        forward, which is the wrong report for someone resuming a multi-day run.
+        """
+        path = save_checkpoint(tmp_path, step=11, learner=learner)
+        path.write_bytes(path.read_bytes()[: path.stat().st_size // 2])
+
+        with pytest.raises(CheckpointError) as exc:
+            load_checkpoint(path)
+        msg = str(exc.value)
+        assert path.name in msg
+        assert "bytes" in msg
+        assert "truncated or damaged" in msg
+
+    def test_zero_byte_checkpoint_raises_actionable_error(self, tmp_path, learner):
+        path = save_checkpoint(tmp_path, step=12, learner=learner)
+        path.write_bytes(b"")
+        with pytest.raises(CheckpointError, match="0 bytes"):
+            load_checkpoint(path)
+
+    def test_non_torch_bytes_raise_actionable_error(self, tmp_path, learner):
+        path = save_checkpoint(tmp_path, step=13, learner=learner)
+        path.write_bytes(b"this is not a torch checkpoint at all")
+        with pytest.raises(CheckpointError, match="truncated or damaged"):
+            load_checkpoint(path)
+
+    def test_payload_that_is_not_a_mapping_is_rejected(self, tmp_path, learner):
+        """A valid pickle of the wrong shape must not reach the resume path."""
+        path = save_checkpoint(tmp_path, step=14, learner=learner)
+        torch.save([1, 2, 3], path)
+        with pytest.raises(CheckpointError, match="payload mapping"):
+            load_checkpoint(path)
+
+    def test_missing_checkpoint_still_reports_filenotfound(self, tmp_path):
+        """Absence is a different problem from damage and keeps its distinct exception."""
+        with pytest.raises(FileNotFoundError, match="checkpoint not found"):
+            load_checkpoint(tmp_path / "checkpoint_000000001.pt")
 
     def test_rng_state_is_restored(self, tmp_path, learner):
         np.random.seed(123)

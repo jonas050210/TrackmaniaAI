@@ -160,12 +160,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if driver is None:
                 game_rows.append(("driver", "not built (no track available)", "warn"))
             else:
-                driver.open()
-                game_rows.append(("driver", f"connected ({driver.name})", "ok"))
-                info = driver.describe()
-                game_rows.append(
-                    ("checkpoints on map", str(info.get("checkpoint_total")), "ok")
-                )
+                # A driver whose open() raised is NOT usable, so it must not stay bound:
+                # the --calibrate path below tests `driver is None` to decide whether to
+                # skip. Leaving it set would send calibration into a closed driver and
+                # report a secondary "open() has not been called" error over the real cause.
+                try:
+                    driver.open()
+                    info = driver.describe()
+                except Exception as exc:  # noqa: BLE001 - report and continue
+                    driver = None
+                    game_rows.append(("driver", str(exc).splitlines()[0], "fail"))
+                else:
+                    game_rows.append(("driver", f"connected ({driver.name})", "ok"))
+                    game_rows.append(
+                        ("checkpoints on map", str(info.get("checkpoint_total")), "ok")
+                    )
         else:
             game_rows.append(
                 ("driver", "simulated (NOT the real game)", "warn")
@@ -514,12 +523,35 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     evaluations = run_evaluations(args.run)
     if evaluations:
+        # Training and held-out runs are logged as separate single-split reports, so neither
+        # carries a generalization_gap of its own; reading it per row left this column
+        # permanently blank. The gap is a property of a *step*, so pair the two kinds per step.
+        by_step: dict[int, dict[str, dict[str, Any]]] = {}
+        for item in evaluations:
+            by_step.setdefault(int(item["step"]), {})[item["kind"]] = item["report"]
+
+        def gap_at(step: int) -> float | None:
+            pair = by_step[step]
+            train, held = pair.get("training"), pair.get("held_out")
+            if train is None or held is None:
+                return None
+            own = train.get("generalization_gap")
+            if own is not None:
+                return float(own)
+            return round(
+                float(train.get("mean_progress_fraction", 0.0))
+                - float(held.get("mean_progress_fraction", 0.0)),
+                4,
+            )
+
         print("\nevaluations")
         print("-" * 74)
         print(f"  {'step':>8} {'kind':<10} {'fin%':>5} {'prog%':>6} {'crash%':>7} {'gap':>8}")
         for item in evaluations[-10:]:
             report = item["report"]
-            gap = report.get("generalization_gap")
+            # Only show the gap once per step, on the training row, so the same number is not
+            # printed twice and misread as two independent measurements.
+            gap = gap_at(int(item["step"])) if item["kind"] == "training" else None
             print(
                 f"  {item['step']:>8} {item['kind']:<10} "
                 f"{report.get('finish_rate', 0) * 100:>5.0f} "

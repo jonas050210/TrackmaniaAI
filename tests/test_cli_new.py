@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -533,3 +534,91 @@ class TestDoctorCalibrateIsNotSilent:
         assert main(["doctor", "-c", str(smoke)]) == 0
         out = capsys.readouterr().out
         assert "simulated (NOT the real game)" in out
+
+    def test_failed_driver_does_not_send_calibration_into_a_closed_driver(
+        self, tmp_path, capsys
+    ):
+        """A driver whose open() raised must be treated as absent, not as connected.
+
+        On a non-Windows host TMInterface cannot open, so `doctor` reports the driver as a
+        failure. The `--calibrate` path decides whether to skip by testing whether a driver was
+        obtained; because the failed driver stayed bound, calibration ran against it and
+        reported a secondary "open() has not been called" error over the real cause. The
+        operator must see the actionable explanation, not the knock-on one.
+        """
+        import tmai
+
+        smoke = Path(tmai.__file__).parent / "configs" / "smoke.yaml"
+        cfg = tmp_path / "realgame.yaml"
+        cfg.write_text(smoke.read_text().replace("kind: simulated", "kind: tminterface"))
+        assert "kind: tminterface" in cfg.read_text()
+
+        # Only meaningful on a host where TMInterface cannot connect; on the real game host this
+        # would legitimately succeed, so the assertion is scoped to that case.
+        if sys.platform == "win32":  # pragma: no cover - the real game host
+            pytest.skip("TMInterface can connect here, so the failure path is unreachable")
+
+        rc = main(["doctor", "-c", str(cfg), "--calibrate", "--calibrate-steps", "5"])
+        captured = capsys.readouterr()
+        assert rc == 1, "a driver that failed to open must not exit 0"
+        assert "calibration skipped" in captured.err
+        assert "open() has not been called" not in captured.err
+        assert "open() has not been called" not in captured.out
+
+
+class TestStatusGapColumnIsPopulated:
+    """The `gap` column in `tmai status` used to be permanently blank.
+
+    Training and held-out runs are logged as separate single-split reports, so neither carries a
+    `generalization_gap` of its own -- reading it per row always yielded None, and the one column
+    that shows whether a run is overfitting printed `--` forever.
+    """
+
+    def _run(self, tmp_path):
+        from tmai.config import RunConfig
+        from tmai.training.trainer import train_from_config
+
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        config.track.synthetic_suite = [{"name": "straight"}, {"name": "oval"},
+                                        {"name": "s_curve"}, {"name": "figure_eight"}]
+        config.track.split_weights = {"train": 0.5, "validation": 0.5, "test": 0.0}
+        config.train.output_dir = str(tmp_path)
+        config.train.run_name = "gap-status"
+        config.train.total_steps = 60
+        config.train.warmup_steps = 10
+        config.train.batch_size = 8
+        config.train.log_interval = 30
+        config.train.eval_interval = 60
+        config.train.eval_episodes = 1
+        config.train.held_out_eval_interval = 60
+        config.train.held_out_eval_episodes = 1
+        config.train.checkpoint_interval = 60
+        config.sac.network.hidden_sizes = (16,)
+        return train_from_config(config).run_dir
+
+    def test_gap_is_printed_for_the_training_row(self, tmp_path, capsys):
+        run = self._run(tmp_path)
+        assert main(["status", "--run", str(run)]) == 0
+        out = capsys.readouterr().out
+
+        table = out.split("evaluations")[-1]
+        rows = [line for line in table.splitlines() if "training" in line]
+        assert rows, "precondition: a training evaluation row exists"
+        # The gap must be a signed number, not the '--' placeholder.
+        assert any("--" not in row.split()[-1] for row in rows), (
+            f"gap column still blank: {rows}"
+        )
+
+    def test_gap_is_not_duplicated_across_both_rows(self, tmp_path, capsys):
+        """Printing the same gap on both rows would read as two independent measurements."""
+        run = self._run(tmp_path)
+        assert main(["status", "--run", str(run)]) == 0
+        out = capsys.readouterr().out
+
+        table = out.split("evaluations")[-1]
+        held = [line for line in table.splitlines() if "held_out" in line]
+        assert held
+        for row in held:
+            assert row.split()[-1] == "--", f"held-out row should not repeat the gap: {row}"
