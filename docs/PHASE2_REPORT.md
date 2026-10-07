@@ -1,8 +1,11 @@
 # Phase 2 report — generalisation, reward rework, evaluation, observability
 
-**Branch** `arena/f325538e-trackmaniaai` · **commit** `02ce5d0` (pushed) · **date** 2026-10-07
+**Branch** `arena/f325538e-trackmaniaai` (pushed) · **date** 2026-10-07
 **Gate** `pytest tests/ -q` → **543 passed** · `ruff check tmai tests` → **All checks passed!**
-**Cumulative diff vs `main`** 78 files, +18 088 · source 9 795 lines (`tmai/`), 5 805 lines (`tests/`)
+**Cumulative diff vs `main`** 78 files, +18 146 · source 9 805 lines (`tmai/`), 5 846 lines (`tests/`)
+
+The commit hash is deliberately not named here: recording it would go stale the moment this file
+is committed. `git log main..HEAD` on the branch above is the authoritative list.
 
 ---
 
