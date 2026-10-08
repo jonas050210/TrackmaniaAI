@@ -62,6 +62,26 @@ def _multi_env(config: MultiTrackConfig | None = None, *, seed: int = 0, split: 
 
 
 class TestRunningNormalizer:
+    def test_batch_update_matches_row_by_row_welford(self):
+        """The vectorised update must give the same statistics as folding one row at a time."""
+        rng = np.random.default_rng(4)
+        batches = [rng.normal(loc=3.0, scale=2.0, size=(n, 5)) for n in (7, 1, 64, 0, 256)]
+        batches.append(rng.normal(size=5))  # a single 1-D observation
+
+        fast = RunningNormalizer(5, warmup_steps=0)
+        count, mean, m2 = 0, np.zeros(5), np.zeros(5)
+        for batch in batches:
+            fast.update(batch)
+            for row in np.atleast_2d(batch):
+                count += 1
+                delta = row - mean
+                mean = mean + delta / count
+                m2 = m2 + delta * (row - mean)
+
+        assert fast.count == count
+        np.testing.assert_allclose(fast.mean, mean, rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(fast.std, np.sqrt(m2 / count), rtol=1e-10, atol=1e-12)
+
     def test_zero_mean_unit_std_after_enough_data(self):
         rng = np.random.default_rng(0)
         data = rng.normal(loc=5.0, scale=3.0, size=(2000, 4))

@@ -65,7 +65,12 @@ class RunningNormalizer:
     # -- updating -------------------------------------------------------------------
 
     def update(self, observations: np.ndarray) -> None:
-        """Fold a batch of observations into the running statistics."""
+        """Fold a batch of observations into the running statistics.
+
+        The batch is merged in one step with Chan et al.'s parallel update, which gives the same
+        mean and variance as folding the rows one at a time (Welford) but without a Python loop
+        per row. That loop cost about a millisecond per gradient step on a 256-row batch.
+        """
         obs = np.asarray(observations, dtype=np.float64)
         if obs.ndim == 1:
             obs = obs[None, :]
@@ -74,14 +79,18 @@ class RunningNormalizer:
         if not np.all(np.isfinite(obs)):
             # Never let a NaN into the statistics: it would poison the mean forever.
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        for row in obs:
-            self._update_one(row)
+        batch = obs.reshape(-1, self.dim)
+        batch_count = batch.shape[0]
+        if batch_count == 0:
+            return
 
-    def _update_one(self, x: np.ndarray) -> None:
-        self._count += 1
-        delta = x - self._mean
-        self._mean += delta / self._count
-        self._m2 += delta * (x - self._mean)
+        batch_mean = batch.mean(axis=0)
+        batch_m2 = ((batch - batch_mean) ** 2).sum(axis=0)
+        total = self._count + batch_count
+        delta = batch_mean - self._mean
+        self._mean = self._mean + delta * (batch_count / total)
+        self._m2 = self._m2 + batch_m2 + delta**2 * (self._count * batch_count / total)
+        self._count = total
 
     @property
     def count(self) -> int:
