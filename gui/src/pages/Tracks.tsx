@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type TrackGeometry, type TrackLibraryReport } from "../api";
-import { TrackViewer3D } from "../components/TrackViewer3D";
+import { LazyTrackViewer3D } from "../components/LazyTrackViewer3D";
 import { Badge, Empty, ErrorBox, Loading, formatNumber, formatPercent, useToast } from "../components/ui";
 
 export function Tracks() {
@@ -55,8 +55,8 @@ export function Tracks() {
         <div>
           <h1>Tracks</h1>
           <p className="subtitle">
-            The track library with its split assignment, and an interactive 3D view of the
-            geometry the agent actually drives on.
+            The track library with split and family assignments, plus an interactive 3D view of
+            the geometry the agent actually drives on.
           </p>
         </div>
         <div className="btn-row">
@@ -76,7 +76,7 @@ export function Tracks() {
         {error && !geometry ? (
           <ErrorBox>{error}</ErrorBox>
         ) : (
-          <TrackViewer3D
+          <LazyTrackViewer3D
             geometry={geometry}
             showCorridor={showCorridor}
             showCurvature={showCurvature}
@@ -146,6 +146,7 @@ export function Tracks() {
               <thead>
                 <tr>
                   <th>Track</th>
+                  <th>Family</th>
                   <th>Split</th>
                   <th>Length</th>
                   <th>Corners</th>
@@ -158,6 +159,7 @@ export function Tracks() {
                 {report.tracks.map((track) => (
                   <tr key={track.identity} onClick={() => view(track.name)}>
                     <td><strong>{track.name}</strong></td>
+                    <td className="dim">{track.family ?? "—"}</td>
                     <td>
                       <Badge
                         tone={
@@ -190,6 +192,10 @@ export function Tracks() {
               .join(" · ")}
             {" "}· counts:{" "}
             {Object.entries(report.counts)
+              .map(([k, v]) => `${k} ${v}`)
+              .join(" · ")}
+            {" "}· labelled families:{" "}
+            {Object.entries(report.families_by_split)
               .map(([k, v]) => `${k} ${v}`)
               .join(" · ")}
           </p>

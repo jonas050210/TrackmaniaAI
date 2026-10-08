@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,9 +211,9 @@ class ModelStore:
         shutil.rmtree(info.directory)
         logger.info("deleted model %r (%s)", name, info.directory)
 
-    def add_tags(self, name: str, tags: list[str]) -> ModelInfo:
+    def add_tags(self, name: str, tags: Sequence[str]) -> ModelInfo:
         info = self.get(name)
-        merged = list(dict.fromkeys([*info.tags, *tags]))
+        merged = [tag for tag in dict.fromkeys([*info.tags, *tags])]
         return self._update(name, tags=merged)
 
     def set_evaluation(self, name: str, evaluation: dict[str, Any]) -> ModelInfo:

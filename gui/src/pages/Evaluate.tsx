@@ -6,6 +6,56 @@ import { api, waitForJob, type BenchmarkRow, type Job, type RunRow } from "../ap
 import { LogViewer } from "../components/LogViewer";
 import { Badge, Empty, ErrorBox, JobBadge, Loading, Spinner, formatPercent, useToast } from "../components/ui";
 
+type BootstrapEstimate = {
+  ci95: [number, number] | null;
+  resampling_unit: "families" | "tracks" | "episodes" | "episodes_within_family" | null;
+  sample_count: number;
+};
+
+type BenchmarkSplitSummary = {
+  finish_rate: number;
+  mean_progress_fraction: number;
+  crash_rate: number;
+  num_tracks: number;
+  num_episodes: number;
+};
+
+type BenchmarkModelResult = {
+  label: string;
+  score: number;
+  splits: Record<string, BenchmarkSplitSummary>;
+  confidence_intervals: Record<string, Record<string, BootstrapEstimate>>;
+};
+
+type BenchmarkPairResult = {
+  split: string;
+  model_a: string;
+  model_b: string;
+  episodes: number;
+  wins_a: number;
+  wins_b: number;
+  ties: number;
+  win_rate_a: number;
+  mean_progress_delta: number;
+  confidence_intervals: {
+    win_rate_a?: BootstrapEstimate;
+    mean_progress_delta?: BootstrapEstimate;
+  };
+};
+
+type BenchmarkReportResult = {
+  seed_repeats: number;
+  evaluation_seeds: number[];
+  models: BenchmarkModelResult[];
+  head_to_head: BenchmarkPairResult[];
+};
+
+function formatCi(estimate: BootstrapEstimate | undefined): string {
+  const interval = estimate?.ci95;
+  if (!interval || interval.length !== 2) return "not enough independent samples";
+  return `${formatPercent(interval[0])}–${formatPercent(interval[1])}`;
+}
+
 export function Evaluate() {
   const { toast } = useToast();
   const [runs, setRuns] = useState<RunRow[]>([]);
@@ -28,9 +78,11 @@ export function Evaluate() {
   ]);
   const [benchSplits, setBenchSplits] = useState("validation,test");
   const [benchEpisodes, setBenchEpisodes] = useState(3);
+  const [benchSeedRepeats, setBenchSeedRepeats] = useState(3);
   const [benchName, setBenchName] = useState("benchmark");
   const [benchJob, setBenchJob] = useState<Job | null>(null);
   const [benchRunning, setBenchRunning] = useState(false);
+  const benchmarkReport = (benchJob?.result?.report ?? null) as unknown as BenchmarkReportResult | null;
 
   async function load() {
     try {
@@ -105,6 +157,7 @@ export function Evaluate() {
         models: benchRows.filter((r) => r.label && r.checkpoint),
         splits: benchSplits.split(",").map((s) => s.trim()).filter(Boolean),
         episodes: benchEpisodes,
+        seed_repeats: benchSeedRepeats,
         name: benchName || "benchmark",
       };
       const { job } = await api.benchmark(payload);
@@ -192,7 +245,7 @@ export function Evaluate() {
             {benchJob && <JobBadge state={benchJob.state} />}
           </div>
           <div className="field">
-            <label>Models (label → checkpoint or run)</label>
+            <label>Models & baselines (label → checkpoint, run, or heuristic)</label>
             {benchRows.map((row, i) => (
               <div key={i} className="grid cols-2" style={{ gap: 8, marginBottom: 8 }}>
                 <input
@@ -209,6 +262,9 @@ export function Evaluate() {
                   }
                 >
                   <option value="">— pick a model or run —</option>
+                  <option value="baseline:curvature">
+                    CurvaturePilot heuristic (not real-game validated)
+                  </option>
                   {models.map((m) => (
                     <option key={m.name} value={m.source_checkpoint || m.name}>
                       {m.name} (step {m.step})
@@ -228,19 +284,34 @@ export function Evaluate() {
             >
               + add model
             </button>
+            <p className="hint" style={{ marginTop: 8 }}>
+              CurvaturePilot is a geometry-based heuristic for comparison, not a trained checkpoint or a live-game-validated controller.
+            </p>
           </div>
-          <div className="grid cols-3" style={{ gap: 12 }}>
+          <div className="grid cols-4" style={{ gap: 12 }}>
             <div className="field">
               <label>Splits</label>
               <input value={benchSplits} onChange={(e) => setBenchSplits(e.target.value)} />
             </div>
             <div className="field">
-              <label>Episodes / track</label>
+              <label>Episodes / track / seed</label>
               <input
                 type="number"
                 min={1}
+                step={1}
                 value={benchEpisodes}
-                onChange={(e) => setBenchEpisodes(Number(e.target.value))}
+                onChange={(e) => setBenchEpisodes(Math.max(1, Number(e.target.value) || 1))}
+              />
+            </div>
+            <div className="field">
+              <label>Seed repeats</label>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                step={1}
+                value={benchSeedRepeats}
+                onChange={(e) => setBenchSeedRepeats(Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
               />
             </div>
             <div className="field">
@@ -248,6 +319,9 @@ export function Evaluate() {
               <input value={benchName} onChange={(e) => setBenchName(e.target.value)} />
             </div>
           </div>
+          <p className="hint" style={{ marginTop: -4, marginBottom: 12 }}>
+            Repeats keep models paired on the same seeds. Intervals resample family clusters when labeled, otherwise tracks; seeds only vary starts when the configured driver supports random starts.
+          </p>
           <button
             className="btn primary"
             onClick={startBenchmark}
@@ -270,6 +344,66 @@ export function Evaluate() {
               <pre className="log" style={{ maxHeight: 220 }}>
                 {(benchJob.result.table as string) ?? JSON.stringify(benchJob.result, null, 2)}
               </pre>
+              {benchmarkReport && (
+                <div style={{ marginTop: 16 }}>
+                  <h3 style={{ marginBottom: 6 }}>Approximate 95% bootstrap intervals</h3>
+                  <p className="hint" style={{ marginBottom: 10 }}>
+                    {benchmarkReport.seed_repeats} paired seed repeats: {benchmarkReport.evaluation_seeds?.join(", ")}. Explicit family clusters are resampled together, otherwise tracks; a single cluster falls back to episodes.
+                  </p>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Model</th>
+                          <th>Split</th>
+                          <th>Finish rate</th>
+                          <th>Mean progress</th>
+                          <th>Crash rate</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {benchmarkReport.models.flatMap((model) =>
+                          Object.entries(model.splits).map(([split, metrics]) => {
+                            const intervals = model.confidence_intervals?.[split];
+                            return (
+                              <tr key={`${model.label}-${split}`}>
+                                <td>{model.label}</td>
+                                <td className="dim">{split} · {metrics.num_tracks} tracks / {metrics.num_episodes} episodes</td>
+                                <td>{formatPercent(metrics.finish_rate)}<div className="dim">{formatCi(intervals?.finish_rate)}</div></td>
+                                <td>{formatPercent(metrics.mean_progress_fraction)}<div className="dim">{formatCi(intervals?.mean_progress_fraction)}</div></td>
+                                <td>{formatPercent(metrics.crash_rate)}<div className="dim">{formatCi(intervals?.crash_rate)}</div></td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                  {benchmarkReport.head_to_head.length > 0 && (
+                    <>
+                      <h3 style={{ margin: "16px 0 8px" }}>Paired comparison intervals</h3>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr><th>Split</th><th>Pair</th><th>W–L–T</th><th>A win share · 95% CI</th><th>Progress delta · 95% CI</th></tr>
+                          </thead>
+                          <tbody>
+                            {benchmarkReport.head_to_head.map((pair) => (
+                              <tr key={`${pair.split}-${pair.model_a}-${pair.model_b}`}>
+                                <td>{pair.split}</td>
+                                <td>{pair.model_a} vs {pair.model_b}</td>
+                                <td>{pair.wins_a}–{pair.wins_b}–{pair.ties} · {pair.episodes} pairs</td>
+                                <td>{formatPercent(pair.win_rate_a)}<div className="dim">{formatCi(pair.confidence_intervals.win_rate_a)}</div></td>
+                                <td>{formatPercent(pair.mean_progress_delta)}<div className="dim">{formatCi(pair.confidence_intervals.mean_progress_delta)}</div></td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
           {benchJob && <div style={{ marginTop: 12 }}><LogViewer lines={benchJob.log_tail} maxHeight={200} /></div>}
@@ -288,6 +422,7 @@ export function Evaluate() {
                   <th>Name</th>
                   <th>Created</th>
                   <th>Splits</th>
+                  <th>Seeds</th>
                   <th>Ranking</th>
                 </tr>
               </thead>
@@ -297,6 +432,7 @@ export function Evaluate() {
                     <td className="mono">{b.benchmark}</td>
                     <td className="dim">{new Date(b.created_utc).toLocaleString()}</td>
                     <td className="dim">{b.splits.join(", ")}</td>
+                    <td className="dim">{b.seed_repeats}</td>
                     <td>
                       {b.ranking.map((label, i) => (
                         <span key={label} style={{ marginRight: 8 }}>
@@ -319,6 +455,8 @@ export function Evaluate() {
             <li>Evaluations are deterministic by default (policy mean); stochastic mode samples actions.</li>
             <li>Held-out splits measure generalisation; a big train/validation gap means the policy is memorising.</li>
             <li>Register interesting checkpoints in <Link to="/models">Models</Link>, then benchmark them here.</li>
+            <li>Head-to-head results pair the same track and episode index for each model.</li>
+            <li>CurvaturePilot is a transparent geometric heuristic; it is not validated on a live Trackmania session.</li>
             <li>All numbers here come from the same evaluation code as <code className="mono">tmai eval</code>.</li>
           </ul>
         </div>

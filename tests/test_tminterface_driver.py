@@ -20,7 +20,7 @@ from tmai.game.tminterface.driver import (
     TMInterfaceDriver,
     TMInterfaceDriverConfig,
 )
-from tmai.game.tminterface.ops import CommandOp, RespawnOp, SetSpeedOp
+from tmai.game.tminterface.ops import CommandOp, RespawnOp, RestartRaceOp, SetSpeedOp
 from tmai.game.tminterface.session import TMInterfaceSession, TMInterfaceSessionConfig
 
 
@@ -111,16 +111,20 @@ class TestOpenClose:
 
 
 class TestReset:
-    def test_waits_for_settle_ticks_in_running_phase(self):
-        source = ScriptedTickSource(_running_frames(10))
+    def test_restarts_full_race_and_waits_for_settle_ticks(self):
+        frames = (
+            _running_frames(1)
+            + [make_frame(phase=RacePhase.NOT_RACING)]
+            + _running_frames(4, start=1)
+        )
+        source = ScriptedTickSource(frames)
         driver = TMInterfaceDriver(source, TMInterfaceDriverConfig(settle_ticks=4))
         driver.open()
         frame = driver.reset()
         assert frame.race.phase is RacePhase.RUNNING
-        # 1 frame for open() + 4 settling frames.
-        assert source.consumed == 5
-        # A respawn must have been queued before the first settling frame.
-        assert any(isinstance(op, RespawnOp) for op in source.ops)
+        # One open frame, a reset transition, and four settled running frames.
+        assert source.consumed == 6
+        assert any(isinstance(op, RestartRaceOp) for op in source.ops)
         driver.close()
 
     def test_resets_settle_counter_when_phase_is_not_running(self):
@@ -141,7 +145,11 @@ class TestReset:
         driver.close()
 
     def test_command_reset_strategy_sends_console_command(self):
-        source = ScriptedTickSource(_running_frames(5))
+        frames = _running_frames(1) + [
+            make_frame(phase=RacePhase.NOT_RACING),
+            *_running_frames(1, start=1),
+        ]
+        source = ScriptedTickSource(frames)
         driver = TMInterfaceDriver(
             source,
             TMInterfaceDriverConfig(
@@ -153,7 +161,27 @@ class TestReset:
         assert any(
             isinstance(op, CommandOp) and op.command == "restart_race" for op in source.ops
         )
-        assert not any(isinstance(op, RespawnOp) for op in source.ops)
+        assert not any(isinstance(op, (RespawnOp, RestartRaceOp)) for op in source.ops)
+        driver.close()
+
+    def test_checkpoint_respawn_is_rejected_as_a_full_episode_reset(self):
+        frames = [
+            make_frame(phase=RacePhase.RUNNING, race_time=5.0, checkpoint_index=2),
+            make_frame(
+                phase=RacePhase.RUNNING,
+                race_time=5.1,
+                checkpoint_index=2,
+                respawn_count=1,
+            ),
+        ]
+        source = ScriptedTickSource(frames)
+        driver = TMInterfaceDriver(
+            source,
+            TMInterfaceDriverConfig(reset_strategy=ResetStrategy.RESPAWN, settle_ticks=1),
+        )
+        driver.open()
+        with pytest.raises(GameConnectionError, match="respawn returned to a checkpoint"):
+            driver.reset()
         driver.close()
 
     def test_timeout_when_car_never_starts(self):
@@ -178,6 +206,15 @@ class TestStep:
         frame = driver.step(action)
         assert source.actions[-1] == action
         assert frame.race.phase is RacePhase.RUNNING
+        driver.close()
+
+    def test_non_finite_action_is_rejected_before_reaching_the_game(self):
+        source = ScriptedTickSource(_running_frames(5))
+        driver = TMInterfaceDriver(source)
+        driver.open()
+        with pytest.raises(ValueError, match="finite"):
+            driver.step(Action(steer=float("nan"), throttle=1.0))
+        assert source.actions == []
         driver.close()
 
     def test_action_is_clipped_before_reaching_the_game(self):
@@ -282,6 +319,60 @@ class TestFactory:
         driver = build_tminterface_driver(server_name="TMInterface0", speed_ratio=2.0)
         assert driver.name == "tminterface"
         assert driver.capabilities.analog_control is True
+        assert driver.config.reset_strategy is ResetStrategy.RESTART
+
+    def test_factory_passes_calibrated_forward_axis_to_session(self):
+        from tmai.game.tminterface.driver import build_tminterface_driver
+
+        driver = build_tminterface_driver(forward_axis=2, forward_sign=-1.0)
+        assert driver.session.config.forward_axis == 2
+        assert driver.session.config.forward_sign == -1.0
+
+    def test_production_factory_decimates_to_configured_control_period(self):
+        from tmai.config import RunConfig
+        from tmai.tracks.centerline import CenterlineTrack
+        from tmai.training.factory import build_driver
+
+        config = RunConfig()
+        config.driver.kind = "tminterface"
+        config.driver.physics_hz = 100.0
+        config.env.control_dt = 0.05
+        track = CenterlineTrack([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]], name="recorded")
+        driver = build_driver(config, track)
+        assert driver.session.config.publish_every_n_ticks == 5
+
+    def test_real_factory_rejects_synthetic_geometry(self):
+        from tmai.config import RunConfig
+        from tmai.tracks.synthetic import straight
+        from tmai.training.factory import ConfigError, build_driver
+
+        config = RunConfig()
+        with pytest.raises(ConfigError, match="synthetic track geometry"):
+            build_driver(config, straight())
+
+    def test_real_factory_rejects_maps_spread_across_splits(self):
+        from tmai.config import RunConfig
+        from tmai.tracks.centerline import CenterlineTrack
+        from tmai.tracks.library import TrackLibrary
+        from tmai.training.factory import ConfigError, build_multi_track_env
+
+        library = TrackLibrary()
+        library.add(CenterlineTrack([[0, 0, 0], [0, 0, 10]], name="one"), split="train")
+        library.add(CenterlineTrack([[1, 0, 0], [1, 0, 10]], name="two"), split="validation")
+        with pytest.raises(ConfigError, match="cannot switch maps"):
+            build_multi_track_env(RunConfig(), library, split="train")
+
+    def test_simulated_factory_uses_configured_control_period(self):
+        from tmai.config import RunConfig
+        from tmai.tracks.synthetic import straight
+        from tmai.training.factory import build_driver
+
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        config.env.control_dt = 0.02
+        driver = build_driver(config, straight())
+        assert driver.config.dt == pytest.approx(0.02)
 
     def test_build_rejects_unknown_reset_strategy(self):
         from tmai.game.tminterface.driver import build_tminterface_driver

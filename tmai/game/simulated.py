@@ -171,17 +171,23 @@ class SimulatedGameDriver:
         self._yaw = float(math.atan2(tangent[0], tangent[2]))
         self._speed = 0.0
         self._yaw_rate = 0.0
+        self._progress = station
         self._update_progress()
         return self._frame()
 
-    def step(self, action: Action) -> GameFrame:
+    def step(self, action: Action | None) -> GameFrame:
         self._require_open()
-        action = action.clipped()
-        self._last_action = action
+        if action is not None:
+            self._last_action = action.clipped()
+        # In observation-only mode the toy driver simply keeps its last input held; it has
+        # no separate human keyboard source to observe.
+        action = self._last_action
         cfg = self.config
         dt = cfg.dt
 
-        projection = self.track.project(self._position)
+        projection = self.track.project(
+            self._position, hint_s=self._progress, search_window=120.0
+        )
         on_track = abs(projection.lateral_offset) <= cfg.lane_half_width
         at_wall = abs(projection.lateral_offset) > cfg.lane_half_width + cfg.wall_margin
         off_map = abs(projection.lateral_offset) > cfg.lane_half_width + cfg.fall_margin
@@ -247,7 +253,9 @@ class SimulatedGameDriver:
         self._last_action = Action()
 
     def _update_progress(self) -> None:
-        projection = self.track.project(self._position)
+        projection = self.track.project(
+            self._position, hint_s=self._progress, search_window=120.0
+        )
         self._progress = projection.progress
         expected = int(self._progress // self.config.checkpoint_every)
         if expected > self._checkpoint_index and not self._finished:
@@ -261,7 +269,7 @@ class SimulatedGameDriver:
 
     def _frame(self) -> GameFrame:
         yaw = self._yaw
-        # VehicleState.yaw() reads the forward vector as column 0 of the rotation matrix and
+        # VehicleState.yaw() reads the configured forward vector (column 0 by default) and
         # defines yaw = atan2(forward_x, forward_z). This matrix is the proper rotation about
         # the world up axis that satisfies that (det = +1), so heading_error starts at 0.
         rotation = np.array(

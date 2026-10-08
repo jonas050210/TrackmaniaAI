@@ -97,7 +97,8 @@ per split**, never one blended average.
 
 `score = progress + 1/(1 + best_lap/60)` ∈ [0, 2) drives `best.pt`, so selection cannot be gamed by
 finishing slowly. A finish that did not collect the map's checkpoints is flagged `invalid_finish`,
-excluded from lap-time statistics and logged as a warning — the game's own counter is authoritative.
+receives no training finish bonus, and is excluded from lap-time statistics. Evaluation logs a
+warning; training events and replays retain the raw finish flag and checkpoint counts.
 
 ### 2.4 Visualisation foundation (data only, no GUI)
 

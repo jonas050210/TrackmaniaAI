@@ -16,6 +16,7 @@ import dataclasses
 import logging
 from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
+from math import isfinite
 from pathlib import Path
 from typing import Any, TypeVar, get_args, get_origin, get_type_hints
 
@@ -25,6 +26,7 @@ from tmai.agents.replay import ReplayBufferConfig
 from tmai.agents.sac import SACConfig
 from tmai.env.tm_env import EnvConfig
 from tmai.training.curriculum import CurriculumSpec
+from tmai.training.director import TrainingDirectorSpec
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +42,18 @@ class DriverSpec:
     server_name: str = "TMInterface0"
     #: Game position units -> metres. Calibrate with ``tmai doctor --calibrate``.
     position_scale: float = 1.0
+    #: Rotation-matrix column calibrated as vehicle forward (0, 1 or 2).
+    forward_axis: int = 0
+    #: Sign of the calibrated forward column (-1 or +1).
+    forward_sign: float = 1.0
     #: Requested game-speed multiplier (training throughput).
     speed_ratio: float = 1.0
-    reset_strategy: str = "respawn"
-    reset_command: str = "respawn"
+    #: Expected Trackmania physics callbacks per simulated second. The session uses this
+    #: estimate to decimate callbacks toward env.control_dt; elapsed time is measured from
+    #: the in-game race clock on every transition.
+    physics_hz: float = 100.0
+    reset_strategy: str = "restart"
+    reset_command: str = "restart"
     settle_ticks: int = 5
     connect_timeout_s: float = 20.0
     frame_timeout_s: float = 30.0
@@ -233,6 +243,8 @@ class RunConfig:
     curriculum: CurriculumSpec = field(default_factory=CurriculumSpec)
     #: Behaviour-cloning pretraining from recorded human demonstrations.
     bc: BCSpec = field(default_factory=BCSpec)
+    #: Adaptive training-only focus on tracks the current policy struggles with.
+    director: TrainingDirectorSpec = field(default_factory=TrainingDirectorSpec)
 
     # -- validation -----------------------------------------------------------------
 
@@ -271,26 +283,53 @@ class RunConfig:
             )
 
         total = sum(self.track.split_weights.values())
-        if abs(total - 1.0) > 1e-6:
+        if not isfinite(total) or abs(total - 1.0) > 1e-6:
             problems.append(f"track.split_weights must sum to 1.0, got {total:.4f}")
         for name, weight in self.track.split_weights.items():
-            if weight < 0:
-                problems.append(f"track.split_weights[{name!r}] must be non-negative")
+            if not isfinite(weight) or weight < 0:
+                problems.append(f"track.split_weights[{name!r}] must be finite and non-negative")
 
         if self.driver.kind not in ("tminterface", "simulated"):
             problems.append(
                 f"driver.kind must be 'tminterface' or 'simulated', got {self.driver.kind!r}"
+            )
+        if self.driver.reset_strategy not in {"restart", "respawn", "command"}:
+            problems.append(
+                "driver.reset_strategy must be 'restart', 'respawn' or 'command', "
+                f"got {self.driver.reset_strategy!r}"
             )
         if self.driver.kind == "simulated" and not self.driver.allow_simulated:
             problems.append(
                 "driver.kind='simulated' is a toy model, not Trackmania: set "
                 "driver.allow_simulated=true (CLI: --allow-simulated-driver) to proceed"
             )
-        if self.driver.speed_ratio <= 0:
-            problems.append(f"driver.speed_ratio must be positive, got {self.driver.speed_ratio}")
-        if self.driver.position_scale <= 0:
+        if self.driver.kind == "tminterface" and (
+            self.track.synthetic or self.track.synthetic_suite
+        ):
             problems.append(
-                f"driver.position_scale must be positive, got {self.driver.position_scale}"
+                "synthetic track geometry is only valid with the simulated driver; "
+                "record/load the centreline for the map currently open in Trackmania"
+            )
+        for field_name, value in (
+            ("speed_ratio", self.driver.speed_ratio),
+            ("position_scale", self.driver.position_scale),
+            ("physics_hz", self.driver.physics_hz),
+            ("connect_timeout_s", self.driver.connect_timeout_s),
+            ("frame_timeout_s", self.driver.frame_timeout_s),
+        ):
+            if not isfinite(value) or value <= 0:
+                problems.append(f"driver.{field_name} must be finite and positive, got {value}")
+        if self.driver.settle_ticks < 1:
+            problems.append(
+                f"driver.settle_ticks must be >= 1, got {self.driver.settle_ticks}"
+            )
+        if self.driver.forward_axis not in (0, 1, 2):
+            problems.append(
+                f"driver.forward_axis must be 0, 1 or 2, got {self.driver.forward_axis}"
+            )
+        if self.driver.forward_sign not in (-1.0, 1.0):
+            problems.append(
+                f"driver.forward_sign must be -1 or +1, got {self.driver.forward_sign}"
             )
 
         # Start randomisation needs a driver that can actually move the car.
@@ -305,8 +344,10 @@ class RunConfig:
                 "real-game runs (see docs/LIMITATIONS.md)."
             )
 
-        if self.env.control_dt <= 0:
-            problems.append(f"env.control_dt must be positive, got {self.env.control_dt}")
+        if not isfinite(self.env.control_dt) or self.env.control_dt <= 0:
+            problems.append(
+                f"env.control_dt must be finite and positive, got {self.env.control_dt}"
+            )
         if self.env.action_repeat < 1:
             problems.append(f"env.action_repeat must be >= 1, got {self.env.action_repeat}")
         if self.env.observation.dim <= 0:
@@ -320,6 +361,8 @@ class RunConfig:
         for problem in self.curriculum.validate():
             problems.append(problem)
         for problem in self.bc.validate():
+            problems.append(problem)
+        for problem in self.director.validate():
             problems.append(problem)
 
         t = self.train
@@ -352,10 +395,10 @@ class RunConfig:
             problems.append(f"train.replay_decimation must be >= 1, got {t.replay_decimation}")
         if t.max_replays < 0:
             problems.append(f"train.max_replays must be non-negative, got {t.max_replays}")
-        if self.sac.gamma <= 0 or self.sac.gamma >= 1:
-            problems.append(f"sac.gamma must be in (0, 1), got {self.sac.gamma}")
-        if self.sac.tau <= 0 or self.sac.tau > 1:
-            problems.append(f"sac.tau must be in (0, 1], got {self.sac.tau}")
+        if not isfinite(self.sac.gamma) or self.sac.gamma <= 0 or self.sac.gamma >= 1:
+            problems.append(f"sac.gamma must be finite and in (0, 1), got {self.sac.gamma}")
+        if not isfinite(self.sac.tau) or self.sac.tau <= 0 or self.sac.tau > 1:
+            problems.append(f"sac.tau must be finite and in (0, 1], got {self.sac.tau}")
 
         return problems
 
@@ -382,7 +425,7 @@ class RunConfig:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> RunConfig:
-        return _from_dict(RunConfig, data)  # type: ignore[return-value]
+        return _from_dict(RunConfig, data)
 
     @staticmethod
     def from_yaml(path: str | Path) -> RunConfig:
@@ -426,9 +469,9 @@ def _to_dict(obj: Any) -> Any:
 def _from_dict(cls: type[T], data: Any) -> T:
     """Recursively build ``cls`` from a plain mapping, ignoring unknown keys with a warning."""
     if not is_dataclass(cls):
-        return data  # type: ignore[return-value]
+        return data
     if data is None:
-        return cls()  # type: ignore[call-arg]
+        return cls()
     if not isinstance(data, dict):
         raise ValueError(f"{cls.__name__} expects a mapping, got {type(data).__name__}")
 
@@ -443,7 +486,7 @@ def _from_dict(cls: type[T], data: Any) -> T:
         if key not in known:
             continue
         kwargs[key] = _coerce(hints[key], value, path=f"{cls.__name__}.{key}")
-    return cls(**kwargs)  # type: ignore[call-arg]
+    return cls(**kwargs)
 
 
 def _coerce(hint: Any, value: Any, *, path: str) -> Any:

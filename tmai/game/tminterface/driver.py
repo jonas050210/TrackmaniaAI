@@ -32,7 +32,7 @@ from tmai.game.protocol import (
     RacePhase,
 )
 from tmai.game.ticksource import TickSource
-from tmai.game.tminterface.ops import CommandOp, RespawnOp, SetSpeedOp
+from tmai.game.tminterface.ops import CommandOp, RespawnOp, RestartRaceOp, SetSpeedOp
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +40,12 @@ logger = logging.getLogger(__name__)
 class ResetStrategy(str, Enum):
     """How an episode is restarted in the real game."""
 
-    #: ``TMInterface.respawn()`` -- respawns at the last checkpoint. Reliable, verified API.
+    #: ``TMInterface.give_up()`` -- restarts the current race in run mode; preferred for episodes.
+    RESTART = "restart"
+    #: ``TMInterface.respawn()`` -- respawns at the nearest checkpoint, not necessarily the
+    #: start of the race. Kept as an explicit recovery option, not a full episode reset.
     RESPAWN = "respawn"
-    #: An arbitrary TMInterface console command, for hosts where a full race restart is
-    #: needed. The command string is deployment-specific and must be validated in-game.
+    #: An arbitrary TMInterface console command for deployment-specific reset behavior.
     COMMAND = "command"
 
 
@@ -51,8 +53,8 @@ class ResetStrategy(str, Enum):
 class TMInterfaceDriverConfig:
     """Driver-level settings (connection settings live on the session config)."""
 
-    reset_strategy: ResetStrategy = ResetStrategy.RESPAWN
-    reset_command: str = "respawn"
+    reset_strategy: ResetStrategy = ResetStrategy.RESTART
+    reset_command: str = "restart"
     #: Consecutive ``RUNNING`` ticks required before ``reset()`` returns, so that the
     #: countdown has actually finished and the car is settled on the start pad.
     settle_ticks: int = 5
@@ -85,6 +87,7 @@ class TMInterfaceDriver:
         self._own_session = own_session
         self._opened = False
         self._applied_speed_ratio = 1.0
+        self._last_frame: GameFrame | None = None
 
     # -- GameDriver -----------------------------------------------------------------
 
@@ -119,6 +122,7 @@ class TMInterfaceDriver:
             raise GameConnectionError("TMInterface session is not alive after start()")
         # Make sure the tick stream actually flows before we claim success.
         first = self.session.next_frame(self.config.frame_timeout_s)
+        self._last_frame = first
         logger.info(
             "TMInterface connected; first frame: race_time=%.3fs phase=%s cp=%d/%d",
             first.race.race_time,
@@ -141,34 +145,72 @@ class TMInterfaceDriver:
         return self._opened and self.session.is_alive
 
     def reset(self) -> GameFrame:
-        """Restart the attempt and wait until the car is live and controllable."""
+        """Start a fresh race attempt and wait for its countdown to finish.
+
+        ``respawn()`` is not episode-safe after checkpoints: TMInterface returns to the last
+        respawnable checkpoint. The default therefore uses ``give_up()`` and requires the
+        running race clock/checkpoint state to show a reset before returning.
+        """
         self._require_open()
+        before = self._last_frame
 
         if self.config.reset_strategy is ResetStrategy.COMMAND:
             self.session.request_op(CommandOp(self.config.reset_command))
-        else:
+        elif self.config.reset_strategy is ResetStrategy.RESPAWN:
             self.session.request_op(RespawnOp())
+        else:
+            self.session.request_op(RestartRaceOp())
 
-        deadline = time.monotonic() + self.config.frame_timeout_s
+        # If we were not in a live attempt, there is no previous episode to distinguish from
+        # the new one. Otherwise require evidence that the old attempt actually ended/reset.
+        reset_seen = before is None or before.race.phase is not RacePhase.RUNNING
         settled = 0
+        deadline = time.monotonic() + self.config.frame_timeout_s
         while True:
             if time.monotonic() > deadline:
                 raise GameTimeoutError(
-                    f"car did not reach a RUNNING state within {self.config.frame_timeout_s:.0f}s "
-                    "after reset (is a map loaded and a race started?)"
+                    f"a fresh race did not reach a RUNNING state within "
+                    f"{self.config.frame_timeout_s:.0f}s after reset "
+                    "(check that a map is loaded and the game is in run mode)"
                 )
             frame = self.session.next_frame(self.config.frame_timeout_s)
-            if frame.race.phase is RacePhase.RUNNING:
+            self._last_frame = frame
+
+            if before is not None and not reset_seen:
+                reset_seen = (
+                    frame.race.phase is not RacePhase.RUNNING
+                    or frame.race.race_time + 1e-3 < before.race.race_time
+                    or frame.race.checkpoint_index < before.race.checkpoint_index
+                    or frame.race.respawn_count > before.race.respawn_count
+                )
+
+            if (
+                self.config.reset_strategy is ResetStrategy.RESPAWN
+                and before is not None
+                and before.race.checkpoint_index > 0
+                and frame.race.respawn_count > before.race.respawn_count
+                and frame.race.checkpoint_index >= before.race.checkpoint_index
+            ):
+                raise GameConnectionError(
+                    "TMInterface respawn returned to a checkpoint instead of restarting the race",
+                    remedy="set driver.reset_strategy: restart (default) or use a verified full-race command",
+                )
+
+            if reset_seen and frame.race.phase is RacePhase.RUNNING:
                 settled += 1
                 if settled >= max(1, self.config.settle_ticks):
                     logger.debug(
-                        "reset complete after %d settled ticks (race_time=%.3fs)",
+                        "fresh race settled after %d RUNNING frames (race_time=%.3fs)",
                         settled,
                         frame.race.race_time,
                     )
                     return frame
             else:
                 settled = 0
+
+            # The real session pauses at each published frame. Keep reset/countdown frames
+            # moving with neutral controls until the requested settle window is complete.
+            self.session.push_action(Action())
 
     def reposition(self, station: float, lateral: float = 0.0) -> GameFrame:
         """Not supported by the real game integration.
@@ -189,16 +231,18 @@ class TMInterfaceDriver:
             ),
         )
 
-    def step(self, action: Action) -> GameFrame:
-        """Send ``action`` to the game and return the frame produced by it.
+    def step(self, action: Action | None) -> GameFrame:
+        """Advance one control interval and return the resulting telemetry.
 
-        The action is clipped here rather than only in the session: the ``GameDriver``
-        contract promises the game never sees an out-of-range input, and a policy that emits
-        a slightly out-of-bounds value must not be able to violate that.
+        Actions are clipped here rather than only in the session: the ``GameDriver`` contract
+        promises the game never sees out-of-range input. ``None`` explicitly requests passive
+        observation and leaves keyboard/controller input untouched.
         """
         self._require_open()
-        self.session.push_action(action.clipped())
-        return self.session.next_frame(self.config.frame_timeout_s)
+        self.session.push_action(None if action is None else action.clipped())
+        frame = self.session.next_frame(self.config.frame_timeout_s)
+        self._last_frame = frame
+        return frame
 
     def set_speed_ratio(self, ratio: float) -> float:
         """Request a game-speed multiplier; returns the ratio actually requested."""
@@ -245,11 +289,14 @@ def build_tminterface_driver(
     *,
     speed_ratio: float = 1.0,
     position_scale: float = 1.0,
-    reset_strategy: str = "respawn",
-    reset_command: str = "respawn",
+    forward_axis: int = 0,
+    forward_sign: float = 1.0,
+    reset_strategy: str = "restart",
+    reset_command: str = "restart",
     settle_ticks: int = 5,
     frame_timeout_s: float = 30.0,
     connect_timeout_s: float = 20.0,
+    publish_every_n_ticks: int = 1,
 ) -> GameDriver:
     """Construct the production driver from plain configuration values.
 
@@ -265,8 +312,11 @@ def build_tminterface_driver(
         TMInterfaceSessionConfig(
             server_name=server_name,
             position_scale=position_scale,
+            forward_axis=forward_axis,
+            forward_sign=forward_sign,
             connect_timeout_s=connect_timeout_s,
             frame_timeout_s=frame_timeout_s,
+            publish_every_n_ticks=max(1, int(publish_every_n_ticks)),
         )
     )
     return TMInterfaceDriver(

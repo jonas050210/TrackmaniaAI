@@ -92,39 +92,55 @@ the game.
 
 | Call | Use here |
 |---|---|
-| `iface.set_speed(ratio)` | Game-speed multiplier. The main training-throughput lever. Upstream warns that factors above ~100 can make the game skip subsystems *including input processing*; `tmai` warns above 20 and the capability advertises `max_speed_ratio = 20.0`. |
-| `iface.respawn()` | Default episode restart. |
-| `iface.execute_command(cmd)` | Alternative restart path (`ResetStrategy.COMMAND`), for hosts where a full race restart is needed. |
+| `iface.set_speed(ratio)` | Game-speed multiplier. The main training-throughput lever. Upstream warns that factors above ~100 can make the game skip subsystems *including input processing*; `tmai` warns above 20 and the capability advertises `max_speed_ratio = 20.0`. This has not been measured in a live run. |
+| `iface.give_up()` | Default `restart` strategy requests a new race attempt. A fresh running clock/checkpoint state is required before `reset()` returns. This reset sequence is unit-tested against a scripted source, not against Trackmania. |
+| `iface.respawn()` | Checkpoint recovery, **not** a full episode reset after a checkpoint. It is available only as the explicit `respawn` strategy. |
+| `iface.execute_command(cmd)` | Explicit `command` strategy for a host-specific reset command; the default is not this path. |
 | `iface.get_context_mode()` | Distinguishes a normal race from replay validation. |
 
 ## Thread model
 
 Every call into `TMInterface` must happen on its worker thread, because the request/response
 handshake uses one shared buffer. Calls from the learner thread are therefore described as
-small value objects (`RespawnOp`, `SetSpeedOp`, `CommandOp`, `CallableOp`) and executed at the
-top of the next tick:
+small value objects (`RestartRaceOp`, `RespawnOp`, `SetSpeedOp`, `CommandOp`, `CallableOp`) and
+executed at the top of the next callback. At each published control frame, the callback then
+waits for the learner's next command before replying to TMInterface:
 
 ```
-tminterface worker thread            learner / env thread
--------------------------            --------------------
-on_run_step(iface, t):               push_action(a)      ──┐ mailbox, newest wins
-  drain op queue       <──────────   request_op(op)        │
-  apply pending input                                      │
-  set_input_state(...)                                     │
-  get_simulation_state()                                   │
-  publish GameFrame  ────────────>   next_frame(timeout) <─┘
+tminterface callback thread           learner / env thread
+--------------------------           --------------------
+on_run_step(iface, t):               next_frame(timeout)
+  drain queued operations  <──────── request_op(op)
+  apply current input
+  read state and publish   ────────> next_frame returns GameFrame
+  park callback at frame   <──────── push_action(a or None)
+  apply new input / op
+  return; game advances
 ```
 
-If the learner is slow, the newest action wins and the previous input is held, rather than
-stalling the game. If no frame arrives within `frame_timeout_s`, `step()` raises
-`GameTimeoutError` instead of hanging.
+`publish_every_n_ticks` controls the physics-tick decimation. The factory derives it from
+`env.control_dt * driver.physics_hz` (defaults: 0.05 s and an estimated 100 Hz, or five ticks); `env.action_repeat` can hold each policy action across several such control intervals. The
+configured rate is an estimate, not a measured property of the current game session.
+
+This lock-step gate is intended to prevent the game advancing through unobserved control
+frames while policy inference runs. If the learner stalls, the game callback also stalls until
+`frame_timeout_s` causes the caller to fail and close the session. The behavior of the
+upstream callback and game under this gate still requires a live Trackmania test.
 
 ## Timing semantics
 
-TMInterface applies an input set during tick *t* at tick *t+1* (documented on
-`set_input_state`). `step()` therefore returns the frame observed at the tick after the input
-was injected: a one-tick (≈10 ms) actuation latency inherent to this integration. This is the
-standard real-time-gym trade-off and is not something the driver can remove.
+The session uses the `on_run_step` callback as the frame boundary and submits input before the
+callback returns; the installed TMInterface source shows that the protocol response follows
+that callback. TMInterface documents that `set_input_state` affects a subsequent simulation
+tick. Therefore a command can have a physics-tick actuation latency in addition to the
+configured decimation interval. Race-clock deltas, when positive, measure actual simulated
+time per environment transition; the configured interval is the fallback. Wall time is not
+used for reward integration. All callback cadence, input timing, reset timing and game-speed
+interactions remain **unverified against a running Trackmania instance**.
+
+SAC now scales its per-transition discount as `gamma ** (elapsed_seconds / nominal_control_seconds)`.
+This preserves the configured discount rate when real callback intervals differ from the
+nominal step; old hand-built batches without elapsed-time metadata retain the ordinary `gamma`.
 
 ## Conventions that must be calibrated, not assumed
 
@@ -149,7 +165,19 @@ It reports PASS/FAIL with numbers and prints the recommended `forward_axis`, sig
 `position_scale`. `tests/test_calibration.py` feeds it deliberately wrong conventions and
 requires a failure — a calibrator that passed everything would be worthless.
 
-Apply the result with `--set driver.position_scale=0.01`.
+Apply all three measured conventions directly, for example:
+
+```bash
+tmai train -c tmai/configs/default.yaml \
+  --set driver.position_scale=0.01 \
+  --set driver.forward_axis=2 \
+  --set driver.forward_sign=-1
+```
+
+`forward_axis` and `forward_sign` are propagated into `VehicleState.forward_vector()` and
+therefore affect yaw, heading error, and all track-relative observations. Calibration checks
+`speed_forward` against the detected axis/sign rather than assuming column 0. These values
+still need a live-game calibration; the default is not evidence that column 0 is correct.
 
 ## Legal and practical notes
 
@@ -170,7 +198,21 @@ Apply the result with `--set driver.position_scale=0.01`.
 4. `pip install "trackmania-ai[game,learn]"`.
 5. `tmai doctor --calibrate` and confirm every check passes.
 6. `tmai record-track --out data/tracks/my_map.json --name my_map` — drive one clean lap.
-7. `tmai validate-config -c tmai/configs/default.yaml`, then `tmai train -c tmai/configs/default.yaml --set driver.speed_ratio=8`.
+7. Configure training to use the recorded maps and run `tmai validate-config`; start with a
+   short `tmai train` before attempting a long run.
+8. To drive a live map, set `track.path` to the centreline for the **currently loaded** map
+   (and `track.directory: null`), then run `tmai play --checkpoint runs/<run> --record-replay`.
+   `tmai play` runs at 1x by default, prints telemetry, progress and requested controls, and
+   is bounded by the episode step limit; Ctrl+C requests neutral controls during shutdown.
+   Actual live input delivery/release remains unverified. The printed controls are commands
+   from the policy, not proof the game accepted them.
+   Omitting `--checkpoint` selects
+   the clearly labelled, untrained `CurvaturePilot` baseline instead.
+
+The current TMInterface runtime cannot identify or switch maps. `tmai play` requires a
+single configured track for real control and rejects a multi-map library rather than silently
+selecting a centreline that might not match the game. These safeguards and the control loop
+are tested offline; actual steering and map alignment still require the Windows game host.
 
 ## Adding a different backend
 

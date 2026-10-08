@@ -207,6 +207,20 @@ class TestCompareReplays:
         np.testing.assert_allclose(comparison.segment_gaps, 1.0, atol=1e-9)
         assert comparison.mean_gap == pytest.approx(1.0)
 
+    def test_replays_from_different_named_tracks_are_rejected(self):
+        ai = _replay(progress=[0, 10], times=[0.0, 1.0], track="map-a")
+        ghost = _replay(progress=[0, 10], times=[0.0, 1.0], track="map-b")
+        with pytest.raises(ValueError, match="different tracks"):
+            compare_replays(ai, ghost)
+
+    def test_replays_with_different_track_identities_are_rejected(self):
+        ai = _replay(progress=[0, 10], times=[0.0, 1.0])
+        ghost = _replay(progress=[0, 10], times=[0.0, 1.0])
+        ai.metadata["track_identity"] = "geom:first"
+        ghost.metadata["track_identity"] = "geom:second"
+        with pytest.raises(ValueError, match="different track identities"):
+            compare_replays(ai, ghost)
+
     def test_no_overlap_rejected(self):
         ai = _replay(progress=[0, 10], times=[0.0, 1.0])
         ghost = _replay(progress=[50, 60], times=[0.0, 1.0])
@@ -245,6 +259,18 @@ class TestCompareReplays:
         )
         comparison = compare_replays(ai, ghost, track=track, station_spacing=10.0)
         np.testing.assert_allclose(comparison.stations, ghost_progress, atol=1e-6)
+        assert comparison.mean_gap == pytest.approx(0.0, abs=0.05)
+
+    def test_legacy_all_zero_progress_is_projected_when_track_is_available(self):
+        track = build_synthetic("straight", length=200.0)
+        stations = np.arange(0.0, 100.0, 10.0)
+        ghost = _replay(progress=stations, times=stations / 10.0)
+        ghost.progress = np.zeros_like(stations)
+        ai = _replay(progress=stations, times=stations / 10.0 + 0.1)
+
+        comparison = compare_replays(ai, ghost, track=track, station_spacing=10.0)
+
+        np.testing.assert_allclose(comparison.stations, stations, atol=1e-6)
         assert comparison.mean_gap == pytest.approx(0.0, abs=0.05)
 
     def test_early_crash_shortens_the_comparison(self):

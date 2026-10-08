@@ -37,7 +37,7 @@ from tmai.env.termination import (
     TerminationTracker,
 )
 from tmai.game.errors import UnsupportedFeatureError
-from tmai.game.protocol import Action, GameDriver, GameFrame
+from tmai.game.protocol import Action, GameDriver, GameFrame, RaceState
 from tmai.tracks.centerline import CenterlineTrack, TrackProjection
 
 logger = logging.getLogger(__name__)
@@ -124,10 +124,10 @@ class TrackmaniaEnv(gym.Env):
             self._encoder.dim, self.config.observation.history_length
         )
 
-        self.observation_space = spaces.Box(
+        self.observation_space: spaces.Box = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self._stacker.stacked_dim,), dtype=np.float32
         )
-        self.action_space = spaces.Box(
+        self.action_space: spaces.Box = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
             high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
@@ -138,6 +138,7 @@ class TrackmaniaEnv(gym.Env):
         self._prev_projection: TrackProjection | None = None
         self._prev_yaw: float | None = None
         self._last_action = Action()
+        self._last_elapsed_seconds = 0.0
         self._episode_return = 0.0
         self._episode_steps = 0
         self._episode_progress = 0.0
@@ -201,6 +202,7 @@ class TrackmaniaEnv(gym.Env):
         self._prev_projection = None
         self._prev_yaw = frame.vehicle.yaw()
         self._last_action = Action()
+        self._last_elapsed_seconds = 0.0
         self._episode_return = 0.0
         self._episode_steps = 0
         self._episode_progress = 0.0
@@ -223,24 +225,36 @@ class TrackmaniaEnv(gym.Env):
         obs = self._stacker.reset(self._encode_frame(frame, projection, yaw_rate=0.0))
         return obs, self._info(projection, RewardBreakdown(), EndReason.RUNNING)
 
+    @staticmethod
+    def _valid_finish(race: RaceState) -> bool:
+        """A finish only counts when the game-reported checkpoint set is complete."""
+        return bool(
+            race.finished
+            and (race.checkpoint_total <= 0 or race.checkpoint_index >= race.checkpoint_total)
+        )
+
     def step(
-        self, action: np.ndarray | Action
+        self, action: np.ndarray | Action | None
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         if self._frame is None or self._projection is None:
             raise RuntimeError("TrackmaniaEnv.reset() must be called before step()")
 
-        act = self._coerce_action(action)
-        self._last_action = act
+        act = None if action is None else self._coerce_action(action)
+        if act is not None:
+            self._last_action = act
 
         cfg = self.config
         total_reward = 0.0
         breakdown = RewardBreakdown()
         frame = self._frame
+        previous_frame = self._frame
         projection = self._projection
-        dt = cfg.control_dt * max(1, cfg.action_repeat)
+        elapsed_seconds = 0.0
 
         for _ in range(max(1, cfg.action_repeat)):
             frame = self.driver.step(act)
+            frame_dt = self._frame_elapsed_seconds(previous_frame, frame, cfg.control_dt)
+            elapsed_seconds += frame_dt
             prev_progress = projection.progress
             projection = self.track.project(
                 frame.vehicle.position,
@@ -251,13 +265,27 @@ class TrackmaniaEnv(gym.Env):
                 frame=frame,
                 projection=projection,
                 prev_progress=prev_progress,
-                finished=frame.race.finished,
-                dt=cfg.control_dt,
+                finished=self._valid_finish(frame.race),
+                dt=frame_dt,
             )
             total_reward += breakdown.total
+            previous_frame = frame
+            # Stop at the game's finish event even if checkpoint validation later marks it
+            # invalid. Only a valid finish earns the reward bonus, but the game cannot be
+            # meaningfully stepped again after crossing its finish line.
+            if frame.race.finished:
+                break
 
+        if act is None:
+            self._last_action = Action(
+                steer=frame.vehicle.input_steer,
+                throttle=frame.vehicle.input_gas,
+                brake=frame.vehicle.input_brake,
+            ).clipped()
+
+        self._last_elapsed_seconds = elapsed_seconds
         yaw = frame.vehicle.yaw()
-        yaw_rate = self._yaw_rate(self._prev_yaw, yaw, dt)
+        yaw_rate = self._yaw_rate(self._prev_yaw, yaw, max(elapsed_seconds, 1e-9))
         self._prev_yaw = yaw
 
         result = self._termination.update(
@@ -345,6 +373,18 @@ class TrackmaniaEnv(gym.Env):
             )
         return self.driver.reposition(float(station or 0.0), lateral)
 
+    @staticmethod
+    def _frame_elapsed_seconds(previous: GameFrame, current: GameFrame, fallback: float) -> float:
+        """Use the game's simulation clock when it advances; otherwise use the configured step.
+
+        Host wall time is intentionally not used here: accelerated game speed changes wall-time
+        spacing without changing how long a control command acted in simulation time.
+        """
+        delta = float(current.race.race_time) - float(previous.race.race_time)
+        if np.isfinite(delta) and delta > 1e-9:
+            return delta
+        return float(fallback)
+
     def _coerce_action(self, action: np.ndarray | Action) -> Action:
         if isinstance(action, Action):
             return action.clipped()
@@ -373,7 +413,11 @@ class TrackmaniaEnv(gym.Env):
                 projection=projection,
                 prev_projection=self._prev_projection,
                 prev_yaw=self._prev_yaw,
-                dt=self.config.control_dt * max(1, self.config.action_repeat),
+                dt=(
+                    self._last_elapsed_seconds
+                    if self._last_elapsed_seconds > 0.0
+                    else self.config.control_dt * max(1, self.config.action_repeat)
+                ),
                 last_action=self._last_action,
                 yaw_rate=yaw_rate,
             )
@@ -406,10 +450,16 @@ class TrackmaniaEnv(gym.Env):
         """
         frame = self._frame
         assert frame is not None
+        track_station = (
+            projection.progress % self.track.length if self.track.closed else projection.progress
+        )
+        valid_finish = self._valid_finish(frame.race)
         info: dict[str, Any] = {
-            # Absolute arc-length position, for diagnostics and the trainer's accumulator.
+            # Absolute (unwrapped on circuits) arc-length position, for diagnostics and the
+            # trainer's accumulator.
             "progress": projection.progress,
-            # Fraction of a lap *covered this episode*. This used to be
+            "elapsed_seconds": self._last_elapsed_seconds,
+            # Fraction of a lap *covered this episode*.  This used to be
             # `projection.progress / length`, i.e. absolute position on the track, which made
             # the headline metric report where the car started rather than how far it drove: a
             # car that never moved and was placed at 95% of the lap reported 95% progress, and
@@ -418,7 +468,7 @@ class TrackmaniaEnv(gym.Env):
             "progress_fraction": min(1.0, max(0.0, self._episode_progress
                                               / max(self.track.length, 1e-6))),
             # Where the car currently is on the track, which the above deliberately is not.
-            "track_position_fraction": projection.progress / max(self.track.length, 1e-6),
+            "track_position_fraction": track_station / max(self.track.length, 1e-6),
             "lateral_offset": projection.lateral_offset,
             "distance_to_centerline": projection.distance,
             "speed_forward": frame.vehicle.speed_forward,
@@ -427,7 +477,11 @@ class TrackmaniaEnv(gym.Env):
             "gear": frame.vehicle.gear,
             "is_sliding": frame.vehicle.is_sliding,
             "race_time": frame.race.race_time,
+            # ``finished`` preserves the game's raw flag for auditing; policy metrics use the
+            # checkpoint-validated status so a cut finish is never mistaken for a lap.
             "finished": frame.race.finished,
+            "valid_finish": valid_finish,
+            "invalid_finish": bool(frame.race.finished and not valid_finish),
             "checkpoint_index": frame.race.checkpoint_index,
             "checkpoint_total": frame.race.checkpoint_total,
             "episode_return": self._episode_return,

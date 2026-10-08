@@ -32,6 +32,10 @@ class TestConstruction:
         with pytest.raises(ValueError, match="at least 2"):
             CenterlineTrack(np.zeros((1, 3)))
 
+    def test_closed_track_requires_three_points(self):
+        with pytest.raises(ValueError, match="closed track needs at least 3"):
+            CenterlineTrack(np.zeros((2, 3)), closed=True)
+
     def test_rejects_non_finite(self):
         pts = np.zeros((3, 3))
         pts[1, 0] = np.nan
@@ -43,7 +47,9 @@ class TestConstruction:
         with pytest.raises(ValueError, match="zero-length segment"):
             CenterlineTrack(pts)
 
-    def test_rejects_non_positive_corridor(self, ):
+    def test_rejects_non_positive_corridor(
+        self,
+    ):
         pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         with pytest.raises(ValueError, match="positive"):
             CenterlineTrack(pts, corridor_half_width=0.0)
@@ -65,6 +71,28 @@ class TestConstruction:
 
 
 class TestProjection:
+    def test_closed_track_wraps_geometry_and_unwraps_progress_across_seam(self):
+        track = oval(length=120.0, width=60.0, spacing=1.0)
+        assert len(track._segment_lengths) == track.num_points
+        np.testing.assert_allclose(track.point_at(track.length), track.point_at(0.0))
+
+        before = track.project(track.point_at(track.length - 1.0))
+        after = track.project(
+            track.point_at(0.5),
+            hint_s=before.progress,
+            search_window=3.0,
+        )
+        assert before.progress == pytest.approx(track.length - 1.0, abs=1e-3)
+        assert after.progress == pytest.approx(track.length + 0.5, abs=1e-3)
+        assert after.progress - before.progress == pytest.approx(1.5, abs=1e-3)
+
+    def test_closed_track_lookahead_curvature_wraps_at_start_finish_seam(self):
+        track = oval(length=120.0, width=60.0, spacing=1.0)
+        near_seam = track.sample_lookahead(track.length - 0.5, [1.0, 2.0, 5.0])
+        wrapped = np.array([track.curvature_at(0.5), track.curvature_at(1.5), track.curvature_at(4.5)])
+        np.testing.assert_allclose(near_seam, wrapped)
+        assert np.isfinite(near_seam).all()
+
     def test_point_on_centreline_has_zero_lateral(self, straight_track):
         projection = straight_track.project([0.0, 0.0, 50.0])
         assert projection.progress == pytest.approx(50.0)
@@ -109,9 +137,7 @@ class TestProjection:
     def test_is_on_track(self, straight_track):
         half = straight_track.corridor_half_width_at(50.0)
         assert straight_track.is_on_track(straight_track.project([0.0, 0.0, 50.0]))
-        assert not straight_track.is_on_track(
-            straight_track.project([half + 1.0, 0.0, 50.0])
-        )
+        assert not straight_track.is_on_track(straight_track.project([half + 1.0, 0.0, 50.0]))
 
 
 class TestCurvature:
@@ -168,9 +194,7 @@ class TestSerialisation:
         assert loaded.uid == s_curve_track.uid
         assert loaded.length == pytest.approx(s_curve_track.length)
         np.testing.assert_allclose(loaded.points, s_curve_track.points)
-        np.testing.assert_allclose(
-            loaded.corridor_half_width, s_curve_track.corridor_half_width
-        )
+        np.testing.assert_allclose(loaded.corridor_half_width, s_curve_track.corridor_half_width)
         assert loaded.metadata == s_curve_track.metadata
 
     def test_load_missing_file_raises(self, tmp_path):
@@ -245,6 +269,33 @@ class TestRecorder:
         assert track.metadata["source"] == "recorded_telemetry"
         assert track.metadata["raw_samples"] == 101
 
+    def test_finished_lap_builds_closed_track_and_deduplicates_finish_sample(self):
+        recorder = CenterlineRecorder(min_spacing=0.0, smoothing_window=1)
+        angles = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
+        points = np.column_stack([20.0 * np.cos(angles), np.zeros(32), 20.0 * np.sin(angles)])
+        for point in (*points, points[0]):
+            recorder.add(point)
+
+        track = recorder.build_track(name="lap", closed=True)
+        assert track.closed is True
+        assert track.num_points == len(points)
+        assert track.length > float(np.linalg.norm(points[-1] - points[0]))
+        assert track.point_at(track.length) == pytest.approx(track.point_at(0.0))
+
+    def test_closed_smoothing_deduplicates_finish_sample_before_wrapping(self):
+        recorder = CenterlineRecorder(min_spacing=0.0, smoothing_window=3)
+        angles = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
+        points = np.column_stack([20.0 * np.cos(angles), np.zeros(32), 20.0 * np.sin(angles)])
+        for point in (*points, points[0]):
+            recorder.add(point)
+
+        track = recorder.build_track(name="smoothed-lap", closed=True)
+        assert track.num_points == len(points)
+        assert np.all(track._segment_lengths > 0.0)
+        raw_length = 32 * 2 * 20.0 * np.sin(np.pi / 32)
+        smoothing_scale = (1.0 + 2.0 * np.cos(2.0 * np.pi / 32)) / 3.0
+        assert track.length == pytest.approx(raw_length * smoothing_scale, rel=1e-4)
+
     def test_smoothing_requires_odd_window(self):
         recorder = CenterlineRecorder(smoothing_window=4)
         for i in range(20):
@@ -254,9 +305,7 @@ class TestRecorder:
 
     def test_smoothing_reduces_jitter(self):
         rng = np.random.default_rng(0)
-        clean = np.stack(
-            [np.zeros(200), np.zeros(200), np.arange(200.0)], axis=1
-        )
+        clean = np.stack([np.zeros(200), np.zeros(200), np.arange(200.0)], axis=1)
         noisy = clean + rng.normal(0.0, 0.4, size=clean.shape)
         noisy[:, 2] = np.arange(200.0)  # keep monotonic progress
 
@@ -287,11 +336,11 @@ class TestRecordTrackFromDriver:
         driver = SimulatedGameDriver(s_curve_track)
         driver.open()
         out = tmp_path / "rec.json"
+
         # Drive with a gentle correcting controller so the recording stays near the line.
         def controller(frame):
             projection = s_curve_track.project(frame.vehicle.position, hint_s=None)
-            return Action(steer=float(np.clip(-projection.lateral_offset * 0.1, -1, 1)),
-                          throttle=0.8)
+            return Action(steer=float(np.clip(-projection.lateral_offset * 0.1, -1, 1)), throttle=0.8)
 
         track = record_track(
             driver,
@@ -299,6 +348,7 @@ class TestRecordTrackFromDriver:
             name="recorded",
             min_spacing=2.0,
             action_provider=controller,
+            metadata={"family": "seasonal-cup"},
         )
         driver.close()
         assert out.exists()
@@ -306,6 +356,7 @@ class TestRecordTrackFromDriver:
         assert track.length > 0
         reloaded = CenterlineTrack.load(out)
         assert reloaded.num_points == track.num_points
+        assert reloaded.metadata["family"] == "seasonal-cup"
 
     def test_stops_on_should_stop(self, tmp_path, straight_track):
         from tmai.game.protocol import Action

@@ -8,6 +8,8 @@ save the telemetry) or, later, from a ``.Map.Gbx`` parser.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 
 from tmai.tracks.centerline import CenterlineTrack
@@ -71,7 +73,7 @@ def figure_eight(radius: float = 40.0, spacing: float = 1.0,
 
 
 #: Named generators, used by ``tmai train --synthetic-track <name>`` and by the tests.
-SYNTHETIC_TRACKS = {
+SYNTHETIC_TRACKS: dict[str, Callable[..., CenterlineTrack]] = {
     "straight": straight,
     "oval": oval,
     "s_curve": s_curve,

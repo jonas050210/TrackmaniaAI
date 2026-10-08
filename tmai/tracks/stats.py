@@ -89,16 +89,24 @@ def compute_stats(
     total_length = float(lengths.sum()) or 1.0
     straight_fraction = float(lengths[straight_mask].sum() / total_length) if lengths.size else 0.0
 
-    # A "corner" is a maximal run of consecutive turning segments.
+    # A "corner" is a maximal run of consecutive turning segments. On a closed circuit,
+    # merge the first and last runs because they meet at the seam.
     turning_mask = ~straight_mask
-    corner_count = 0
-    in_corner = False
-    for is_turning in turning_mask:
-        if is_turning and not in_corner:
-            corner_count += 1
-            in_corner = True
-        elif not is_turning:
-            in_corner = False
+    if track.closed and turning_mask.size and np.all(turning_mask):
+        corner_count = 1
+    elif track.closed and turning_mask.size:
+        corner_count = int(
+            np.count_nonzero(turning_mask & ~np.roll(turning_mask, 1))
+        )
+    else:
+        corner_count = 0
+        in_corner = False
+        for is_turning in turning_mask:
+            if is_turning and not in_corner:
+                corner_count += 1
+                in_corner = True
+            elif not is_turning:
+                in_corner = False
 
     widths = track.corridor_half_width * 2.0
     points = track.points

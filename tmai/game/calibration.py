@@ -214,15 +214,21 @@ class TelemetryCalibrator:
         self, frames: Sequence[GameFrame], usable: list[int]
     ) -> CheckResult:
         """``speed_forward`` must equal the longitudinal component of world velocity."""
+        axis_check = self._check_forward_axis(frames, usable)
+        axis = int(axis_check.extras.get("axis", 0))
+        sign = float(axis_check.extras.get("sign", 1.0))
         errors = []
         for i in usable:
             vehicle = frames[i].vehicle
             speed = float(np.linalg.norm(vehicle.velocity))
             if speed < 1e-6:
                 continue
-            # Use the same convention the environment uses so the check is meaningful.
-            forward = vehicle.forward_vector()
-            projected = float(np.dot(vehicle.velocity, forward))
+            matrix = np.asarray(vehicle.rotation, dtype=np.float64).reshape(3, 3)
+            forward = matrix[:, axis] * sign
+            norm = float(np.linalg.norm(forward))
+            if norm < 1e-9:
+                continue
+            projected = float(np.dot(vehicle.velocity, forward / norm))
             errors.append(abs(projected - vehicle.speed_forward) / max(speed, 1e-6))
         value = float(np.mean(errors)) if errors else float("nan")
         passed = bool(errors) and value <= self.axis_tolerance
@@ -232,7 +238,11 @@ class TelemetryCalibrator:
             value=value,
             reference=0.0,
             tolerance=self.axis_tolerance,
-            detail=f"mean relative mismatch between speed_forward and dot(velocity, forward) = {value:.3f}",
+            detail=(
+                f"mean relative mismatch between speed_forward and dot(velocity, "
+                f"calibrated_forward[{axis}] * {sign:+.0f}) = {value:.3f}"
+            ),
+            extras={"axis": float(axis), "sign": sign},
         )
 
     def _check_position_scale(

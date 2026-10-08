@@ -17,7 +17,7 @@ export interface Trajectory {
   color: number;
 }
 
-interface Props {
+export interface Props {
   geometry: TrackGeometry | null;
   trajectories?: Trajectory[];
   /** Sample index to show the car at, when a trajectory is present. */
@@ -88,9 +88,11 @@ export function TrackViewer3D({
         for (let i = 0; i < points.length; i++) {
           positions.set([left[i].x, left[i].y + 0.02, left[i].z], i * 6);
           positions.set([right[i].x, right[i].y + 0.02, right[i].z], i * 6 + 3);
-          if (i < points.length - 1) {
+          if (i < points.length - 1 || geometry.closed) {
+            const next = (i + 1) % points.length;
             const a = i * 2;
-            indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+            const b = next * 2;
+            indices.push(a, a + 1, b, a + 1, b + 1, b);
           }
         }
         const meshGeometry = new THREE.BufferGeometry();
@@ -125,14 +127,14 @@ export function TrackViewer3D({
         }
         lineGeometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
       }
+      const centerlineMaterial = new THREE.LineBasicMaterial({
+        color: hasCurvature ? 0xffffff : 0x38bdf8,
+        vertexColors: hasCurvature,
+      });
       group.add(
-        new THREE.Line(
-          lineGeometry,
-          new THREE.LineBasicMaterial({
-            color: hasCurvature ? 0xffffff : 0x38bdf8,
-            vertexColors: hasCurvature,
-          })
-        )
+        geometry.closed
+          ? new THREE.LineLoop(lineGeometry, centerlineMaterial)
+          : new THREE.Line(lineGeometry, centerlineMaterial)
       );
 
       // start marker
@@ -158,11 +160,18 @@ export function TrackViewer3D({
       controls.update();
     }
 
-    // trajectories + car markers
+    // trajectories + car markers. If an old replay has no matching track geometry, frame the
+    // recorded path itself rather than silently substituting a synthetic map.
     const cars: THREE.Mesh[] = [];
+    const trajectoryBounds = new THREE.Box3();
+    let hasTrajectoryPoints = false;
     trajectories.forEach((trajectory) => {
       const points = toVector3Array(trajectory.positions);
       if (points.length < 2) return;
+      if (!geometry) {
+        for (const point of points) trajectoryBounds.expandByPoint(point);
+        hasTrajectoryPoints = true;
+      }
       group.add(
         new THREE.Line(
           new THREE.BufferGeometry().setFromPoints(points),
@@ -181,6 +190,14 @@ export function TrackViewer3D({
       group.add(car);
       cars.push(car);
     });
+    if (!geometry && hasTrajectoryPoints) {
+      const center = trajectoryBounds.getCenter(new THREE.Vector3());
+      const size = trajectoryBounds.getSize(new THREE.Vector3());
+      const radius = Math.max(size.x, size.y, size.z) / 2 || 100;
+      camera.position.set(center.x + radius * 1.1, center.y + radius * 0.9, center.z + radius * 1.1);
+      controls.target.copy(center);
+      controls.update();
+    }
     carsRef.current = cars;
 
     const resize = () => {
@@ -207,6 +224,18 @@ export function TrackViewer3D({
       cancelAnimationFrame(frame);
       observer.disconnect();
       controls.dispose();
+      scene.traverse((object) => {
+        const renderable = object as THREE.Object3D & {
+          geometry?: THREE.BufferGeometry;
+          material?: THREE.Material | THREE.Material[];
+        };
+        renderable.geometry?.dispose();
+        if (Array.isArray(renderable.material)) {
+          renderable.material.forEach((material) => material.dispose());
+        } else {
+          renderable.material?.dispose();
+        }
+      });
       renderer.dispose();
       mount.removeChild(renderer.domElement);
       carsRef.current = [];
@@ -250,7 +279,13 @@ export function TrackViewer3D({
           )}
         </div>
       )}
-      {!geometry && <div className="overlay">No track selected</div>}
+      {!geometry && (
+        <div className="overlay">
+          {trajectories.length > 0
+            ? "Track geometry unavailable · replay trajectory only"
+            : "No track or replay selected"}
+        </div>
+      )}
       {!ready && <div className="overlay">initialising 3D…</div>}
       {carIndex !== undefined && onCarIndexChange && maxIndex > 0 && (
         <div className="controls">

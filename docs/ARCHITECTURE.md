@@ -157,7 +157,7 @@ The obvious exploits are closed explicitly:
 | Cut across the map and rejoin far ahead | Credited progress is capped by what is physically achievable in one step (`max_speed_for_progress × dt × cut_margin`) |
 | Oscillate across one station | backwards progress is credited negatively, bounded |
 | Shortcut across grass | per-metre penalty outside the drivable corridor |
-| Finish by an invalid route | the game's checkpoint counter is authoritative; `invalid_finish` is flagged |
+| Finish by an invalid route | the game's checkpoint counter is authoritative; no finish bonus is paid and `invalid_finish` is logged |
 | Farm reward by crashing into a wall | a significant wall collision terminates the episode immediately with a one-off `crash_penalty` |
 | Farm reward by leaving the map | a confirmed out-of-bounds or fall terminates immediately with its own penalty |
 

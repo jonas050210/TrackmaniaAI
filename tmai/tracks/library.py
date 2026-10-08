@@ -7,9 +7,8 @@ module is what makes the distinction enforceable rather than a matter of discipl
   order or a global shuffle. Adding a track to the library never moves another track between
   splits, so results stay comparable across runs.
 * **Leakage prevention.** A track identity (its UID, falling back to a content hash of its
-  geometry) can only ever belong to one split. The same map recorded twice is *the same
-  track* for this purpose, which is the failure mode that silently inflates every
-  generalisation number ever reported.
+  geometry) can only ever belong to one split. Related maps can also share an explicit
+  metadata ``family`` label; the whole family is then assigned as one group.
 * **Explicit held-out sets.** ``test`` tracks are never sampled during training and are only
   reachable through the evaluation path.
 
@@ -23,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +61,33 @@ def track_identity(track: CenterlineTrack) -> str:
     return f"geom:{digest.hexdigest()[:32]}"
 
 
+def _clean_family_label(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def track_family(track: CenterlineTrack) -> str | None:
+    """Return an optional operator-supplied family label.
+
+    Families are declared in track metadata as ``{"family": "author-or-layout-family"}``.
+    A reliable family cannot be inferred from a centreline alone, so unlabelled tracks retain
+    identity-based splitting rather than being clustered by a guess.
+    """
+    value = track.metadata.get("family")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TrackLibraryError(
+            f"track {track.name!r} metadata family must be a string, got {type(value).__name__}"
+        )
+    family = _clean_family_label(value)
+    return family or None
+
+
+def _family_key(family: str) -> str:
+    """Canonical, namespaced key for grouping explicitly related tracks."""
+    return f"family:{_clean_family_label(family).casefold()}"
+
+
 def split_for_identity(identity: str, *, weights: Mapping[str, float]) -> str:
     """Deterministically map an identity to a split.
 
@@ -88,6 +115,8 @@ class TrackEntry:
     track: CenterlineTrack
     split: str
     identity: str
+    #: Optional explicit group label. All tracks in one family share a split.
+    family: str | None = None
     #: Path the track was loaded from, when it came from disk.
     source: str | None = None
     stats: TrackStats | None = None
@@ -96,10 +125,17 @@ class TrackEntry:
     def name(self) -> str:
         return self.track.name
 
+    @property
+    def split_group(self) -> str:
+        """Stable grouping key used to keep related layouts in one split."""
+        return _family_key(self.family) if self.family else self.identity
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.track.name,
             "identity": self.identity,
+            "family": self.family,
+            "split_group": self.split_group,
             "split": self.split,
             "source": self.source,
             "length": round(self.track.length, 2),
@@ -135,10 +171,14 @@ class TrackLibrary:
         """Add a track, assigning it a split if one was not given.
 
         Raises:
-            TrackLibraryError: if the track's identity is already present in a *different*
-                split, which would leak it.
+            TrackLibraryError: if an identity or explicitly labelled family is assigned to
+                more than one split, which would leak map geometry across evaluation sets.
         """
         identity = track_identity(track)
+        family = track_family(track)
+        if split is not None and split not in SPLITS:
+            raise TrackLibraryError(f"unknown split {split!r}; expected one of {SPLITS}")
+
         existing = self.find(identity)
         if existing is not None:
             wanted = split or existing.split
@@ -151,15 +191,33 @@ class TrackLibrary:
             logger.debug("track %r already present in %r; skipping", track.name, existing.split)
             return existing
 
-        if split is None:
-            split = split_for_identity(identity, weights=self.split_weights)
-        if split not in SPLITS:
-            raise TrackLibraryError(f"unknown split {split!r}; expected one of {SPLITS}")
+        group_key = _family_key(family) if family else identity
+        family_entries = [entry for entry in self.entries if entry.split_group == group_key]
+        group_splits = {entry.split for entry in family_entries}
+        if len(group_splits) > 1:
+            raise TrackLibraryError(
+                f"track family {family!r} is already spread across splits "
+                f"{sorted(group_splits)}; fix the existing assignments before adding more maps"
+            )
+        if family_entries:
+            family_split = family_entries[0].split
+            if split is not None and split != family_split:
+                raise TrackLibraryError(
+                    f"track family {family!r} is already in the {family_split!r} split; "
+                    f"refusing to assign {track.name!r} to {split!r}. Related maps must "
+                    "stay in one split to avoid family leakage."
+                )
+            split = family_split
+        elif split is None:
+            split = split_for_identity(group_key, weights=self.split_weights)
 
+        # `split` is now either explicit or derived from the family/track grouping key.
+        assert split is not None
         entry = TrackEntry(
             track=track,
             split=split,
             identity=identity,
+            family=family,
             source=source,
             stats=compute_stats(track) if compute_track_stats else None,
         )
@@ -186,7 +244,8 @@ class TrackLibrary:
         """Load every centreline file in ``directory``.
 
         ``explicit_splits`` maps a *filename stem* to a split, which is how an operator pins
-        particular maps to ``test``. Anything unlisted is assigned deterministically.
+        particular maps or labelled families to ``test``. A pin on any family member is
+        propagated to the rest of that family. Anything unlisted is assigned deterministically.
         """
         directory = Path(directory)
         if not directory.is_dir():
@@ -198,10 +257,29 @@ class TrackLibrary:
         if not paths:
             raise TrackLibraryError(f"no track files matching {pattern!r} in {directory}")
 
-        duplicates: list[tuple[str, str]] = []
+        loaded: list[tuple[Path, CenterlineTrack, str | None]] = []
+        family_splits: dict[str, str] = {}
         for path in paths:
             track = CenterlineTrack.load(path)
-            split = (explicit_splits or {}).get(path.stem)
+            requested_split = (explicit_splits or {}).get(path.stem)
+            family = track_family(track)
+            if family and requested_split:
+                key = _family_key(family)
+                prior = family_splits.get(key)
+                if prior is not None and prior != requested_split:
+                    raise TrackLibraryError(
+                        f"explicit splits assign family {family!r} to both {prior!r} and "
+                        f"{requested_split!r}; all related maps must stay in one split"
+                    )
+                family_splits[key] = requested_split
+            loaded.append((path, track, requested_split))
+
+        duplicates: list[tuple[str, str]] = []
+        for path, track, requested_split in loaded:
+            family = track_family(track)
+            split = requested_split
+            if split is None and family:
+                split = family_splits.get(_family_key(family))
             entry = library.add(track, split=split, source=str(path))
 
             # `add` returns the *existing* entry when the geometry is already present, so the
@@ -293,7 +371,17 @@ class TrackLibrary:
         """
         out: dict[str, Any] = {
             "num_tracks": len(self.entries),
+            "num_split_groups": len({entry.split_group for entry in self.entries}),
             "counts": self.counts(),
+            "families_by_split": {
+                split: len(
+                    {_family_key(entry.family) for entry in self.by_split(split) if entry.family is not None}
+                )
+                for split in SPLITS
+            },
+            "split_groups_by_split": {
+                split: len({entry.split_group for entry in self.by_split(split)}) for split in SPLITS
+            },
             "split_weights": dict(self.split_weights),
             "tracks": [e.as_dict() for e in self.entries],
             "geometry_by_split": {},
@@ -329,6 +417,8 @@ class TrackLibrary:
                 {
                     "name": e.track.name,
                     "identity": e.identity,
+                    "family": e.family,
+                    "split_group": e.split_group,
                     "split": e.split,
                     "source": e.source,
                 }
@@ -395,5 +485,6 @@ __all__ = [
     "TrackLibraryError",
     "TrackSampler",
     "split_for_identity",
+    "track_family",
     "track_identity",
 ]

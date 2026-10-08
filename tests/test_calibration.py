@@ -115,6 +115,15 @@ class TestSpeedForwardCheck:
         check = next(c for c in report.checks if c.name == "speed_forward_consistency")
         assert check.passed is True
 
+    def test_uses_detected_axis_and_sign_for_speed_consistency(self):
+        report = TelemetryCalibrator().analyse(
+            make_driving_frames(forward_axis=2, forward_sign=1.0)
+        )
+        check = next(c for c in report.checks if c.name == "speed_forward_consistency")
+        assert report.recommended_forward_axis == 2
+        assert check.passed is True
+        assert check.value == pytest.approx(0.0, abs=1e-6)
+
     def test_fails_when_speed_forward_disagrees(self):
         report = TelemetryCalibrator().analyse(
             make_driving_frames(speed_forward_matches=False)

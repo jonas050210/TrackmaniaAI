@@ -25,11 +25,12 @@ Three categories are used throughout:
 | `tminterface` 1.0.2 API surface used by the driver | **Verified** | Read from the published source (`interface.py`, `structs.py`, `constants.py`, `client.py`). |
 | Field mapping `SimStateData → VehicleState/RaceState` | **Offline-tested against real structs** | `tests/test_telemetry.py::TestAgainstRealStructs` decodes genuine `SimStateData` objects from byte buffers and checks the mapping. |
 | Analog input range `[-65536, 65536]` | **Offline-tested (documented)** | Taken from `TMInterface.set_input_state`'s docstring; asserted in `test_analog_full_scale_matches_tminterface_documentation`. Not exercised against a real car. |
-| Driver control logic (reset sequencing, decimation, speed ratio, connection loss) | **Offline-tested** | 31 tests in `tests/test_tminterface_driver.py` against a scripted tick source honouring the real `TickSource` contract. |
+| Driver control logic (reset sequencing, decimation, speed ratio, connection loss) | **Offline-tested** | Tests in `tests/test_tminterface_driver.py` use a scripted tick source honouring the real `TickSource` contract. |
+| `tmai play` CLI, checkpoint/heuristic selection, bounded rollout, replay recording and cleanup | **Offline-tested** | `tests/test_cli_new.py::TestPlayCli` runs both controller paths through the explicitly opted-in simulated driver. It does not verify a live TMInterface session or real-map steering. |
 | TMInterface cannot connect on Linux | **Verified** | `mmap.mmap(-1, size, tagname=...)` raises `TypeError` on Linux; asserted in `test_mmap_tagname_is_windows_only`. |
 | The game actually steers when `set_input_state` is called | **Requires the real PC** | — |
 | `get_simulation_state()` returns sane values during a live race | **Requires the real PC** | — |
-| Trackmania's forward axis is rotation column 0 | **Requires the real PC — must be calibrated** | `tmai doctor --calibrate` measures it. Do not trust the default. |
+| Trackmania's forward axis convention | **Requires the real PC — must be calibrated** | `tmai doctor --calibrate` measures it. `driver.forward_axis` and `driver.forward_sign` now apply the measured result; the default is only a starting value. |
 | Trackmania's position/velocity units are metres | **Requires the real PC — must be calibrated** | `tmai doctor --calibrate` measures `position_scale`. |
 | Physics tick period is 100 Hz | **Requires the real PC** | The `tick_period` check measures it. |
 | `iface.respawn()` restarts an episode usefully | **Requires the real PC** | `ResetStrategy.COMMAND` exists as the alternative if respawn is insufficient. |
@@ -46,36 +47,37 @@ Three categories are used throughout:
 | SAC learner | **Verified** | Includes a Bellman fixed-point check and a numerical log-prob check. |
 | Observation normalisation | **Verified** | Statistics, warmup, clipping, NaN resistance, checkpoint round-trip. |
 | Training loop, checkpointing, resume | **Verified** | Full runs executed and their artefacts inspected. |
-| Track geometry and centreline recording | **Verified** | 53 tests. |
-| Track library, splits, leakage prevention | **Verified** | 44 tests, including split determinism and refusal to place one track in two splits. |
-| Multi-track environment | **Verified** | Track switching, start randomisation, driver caching, episode context. |
-| Translation invariance of the observation | **Verified** | A translated track produces a bit-identical observation (diff exactly 0.0). |
-| Telemetry calibration detects wrong conventions | **Verified** | Deliberately fed wrong conventions and required failures. |
-| Evaluation reports (per-track, per-split, gap) | **Verified** | 38 tests against artefacts from a real training run. |
-| Status/compare CLI and dashboard API | **Verified** | 25 + 38 tests. |
-| Simplified track visualisation | **Verified** | Headless PNG + `.obj`. |
-| Driving rules (crash/OOB/fall/wrong-way → immediate respawn + penalty) | **Verified** | 27 tests incl. impact vs scrape vs parking, reward-exploit checks, failure-reason recording. |
-| Temporal observations (frame stacking) | **Verified** | 13 tests: stacker ordering/reset/guards, spec, env dims, translation invariance under stacking, checkpoint dim guard. |
-| Curriculum learning | **Verified** | 23 tests: spec validation, difficulty order, stage resolution, reveal + episode caps, env/trainer integration. |
-| Human demonstrations + behaviour cloning | **Verified (simulated driver)** | 14 demo tests + 11 BC tests. **The recording path has never run against the real game** — it needs a human at the wheel of a live Trackmania. |
-| Replays & ghost comparison | **Verified** | 20 tests: round-trips, decimation, store pruning, station + start-invariant segment gaps, overlap clamping. |
-| Model registry | **Verified** | 13 tests: register/list/get/delete/tag, name validation, corrupt-checkpoint handling, wrapped-learner unwrap. |
-| Benchmarking | **Verified** | 7 tests: ranking, run-dir resolution, serialisation, empty-split rejection. |
-| Resource monitoring | **Verified** | 9 tests; degrades to `None` when a counter is unavailable. |
-| GUI backend (HTTP + WebSocket + jobs) | **Verified** | 44 tests over FastAPI's TestClient, including a real training subprocess started through `POST /api/train`, and a WebSocket tick. |
-| GUI frontend | **Built and type-checked; verified by serving it** | `npm run build` (tsc + vite) is clean; the built app was served by `tmai serve` and its pages/API exercised over HTTP. **Not verified in a real browser with a human user.** |
-| **Total** | | **746 tests, `ruff` clean** |
+| Track geometry and centreline recording | **Verified offline** | Unit tests cover projection, closed-track wrapping, corridor interpolation, recording, and export. |
+| Track library, splits, leakage prevention | **Verified offline** | Tests cover split determinism and refusal to place identical geometry in different splits. |
+| Multi-track environment | **Verified offline** | Track switching, start randomisation, driver caching, episode context. |
+| Translation invariance of the observation | **Verified offline** | A translated track produces a bit-identical observation (diff exactly 0.0). |
+| Telemetry calibration detects wrong conventions | **Verified offline** | Deliberately fed wrong conventions and required failures. |
+| Evaluation reports (per-track, per-split, gap) | **Verified offline** | Tests and CLI workflows use simulated run artefacts; no real-game scores exist. |
+| Status/compare CLI and dashboard API | **Verified offline** | CLI tests and API tests cover snapshots, summaries, and split comparisons. |
+| Simplified track visualisation | **Verified offline** | Headless PNG and `.obj` exports, including the closed-track seam. |
+| Driving rules (crash/OOB/fall/wrong-way → immediate respawn + penalty) | **Verified offline** | Tests cover impact vs scrape vs parking, reward-exploit checks, and failure-reason recording. |
+| Temporal observations (frame stacking) | **Verified offline** | Tests cover stack ordering/reset, environment dimensions, translation invariance, and checkpoint dimension guards. |
+| Curriculum learning | **Verified offline** | Tests cover validation, difficulty order, stage resolution, reveal + episode caps, and trainer integration. |
+| Human demonstrations + behaviour cloning | **Verified against the simulated driver** | The data path and BC fit are tested. **The recording path has never run against the real game** — it needs a human at the wheel of live Trackmania. |
+| Replays, ghost comparison & replay analysis | **Verified offline** | Tests cover round-trips, decimation, store pruning, station-invariant segment gaps, overlap clamping, sector summaries and spatial failure bins; no real-game replays exist yet. |
+| Model registry | **Verified offline** | Tests cover register/list/get/delete/tag, name validation, corrupt checkpoints, and wrapped learners. |
+| Benchmarking | **Verified offline** | Tests cover ranking, run-directory resolution, serialization, and empty-split rejection. |
+| Resource monitoring | **Verified offline** | Tests cover graceful `None` values when a counter is unavailable. |
+| GUI backend (HTTP + WebSocket + jobs) | **Verified offline** | FastAPI tests include a real training subprocess started through `POST /api/train` and a WebSocket tick; no game is involved. |
+| GUI frontend | **Built and served; not user-tested in a browser** | `npm run build` (TypeScript + Vite) passes; `tmai serve` returned the static app and API health/system endpoints over HTTP. No human click-through or Trackmania connection was tested. |
+| **Total** | | **869 passed, 9 skipped; 91% overall coverage; Ruff and Mypy clean** |
 
-Measured with `pytest --cov=tmai --cov-report=term-missing`. Coverage is high everywhere except
-one file, deliberately:
+Measured with `pytest --cov=tmai --cov-report=term-missing` (869 passed, 9 skipped; 91% overall; 7,995 statements):
 
-| File | Coverage | Why |
-|---|---|---|
-| `tmai/game/tminterface/session.py` | **43%** | The Windows named-shared-memory transport. The untested lines are the ones that require a running game and cannot execute anywhere else. |
-| `tmai/cli.py` | ~90% | The remainder is `doctor --calibrate`, `record-track` and `record-demo`, all of which drive the real game. |
+| File | Coverage | Remaining gap |
+|---|---:|---|
+| `tmai/game/tminterface/session.py` | **74%** | Windows registration/callback transport and live-game synchronization are not exercised here. |
+| `tmai/cli.py` | **80%** | Interactive commands and some failure paths remain untested; commands requiring a real game are intentionally not simulated as live validation. |
+| `tmai/server/app.py` | **82%** | Optional job/error routes and host integrations remain partially uncovered. |
+| `tmai/monitoring.py` | **77%** | Some platform-specific resource counters are unavailable in this container. |
 
-A low number on the transport is the honest result, not a gap to paper over: testing it here
-would mean faking the game.
+The transport gap is an explicit real-game verification limitation, not a reason to fake the
+external process.
 
 ### Things that have never happened
 
@@ -122,6 +124,11 @@ several are the kind that produce *plausible-looking but wrong* results rather t
 | Replay comparison was not start-station invariant | With `random_start_station`, comparing absolute race times at each station made a partial lap look like it was losing time it never had a chance to lose. Segment gaps (time per station pair) are now the headline metric. |
 | The final curriculum stage re-applied the episode cap | A `1.0` length fraction overrode the env's own `max_steps` with the same value — harmless but wrong in principle, and it broke the "no cap" contract. `episode_max_steps` now returns `None` for full-length stages. |
 | The model registry read dims off a normalisation-wrapped learner | `observation_dim`/`action_dim` came back `null` for every wrapped checkpoint. The registry now unwraps `inner`. |
+| `tmai record-demo` dereferenced `.track` on a `CenterlineTrack` from `library.train` | The CLI crashed before recording when a track library was configured. It now passes the selected `CenterlineTrack` directly; an end-to-end simulated-recording test covers the wiring. |
+| `tmai replay show --out` passed an unsupported `car_positions` keyword to `TrackView.render` | Rendering a replay failed at runtime. The CLI now passes the replay positions as its trajectory, covered by a PNG export regression test. |
+| `tmai validate-config` printed the one-frame observation width for temporally stacked policies | With `history_length: 3`, it reported 20 although the policy receives 60 values. It now reports `stacked_dim`, with a CLI regression test. |
+| Closed-track curvature rendering paired `N` curvature values with `N-1` points and omitted the closing corridor quad | `show-track`/PNG rendering failed on closed tracks and `.obj` meshes left a seam. Rendering, mesh export, and OBJ polylines now wrap over the seam. |
+| The track-geometry API labelled the right-side offset as the left edge | The 3D viewer received swapped corridor-side labels even though the mesh shape looked plausible. API edge generation now matches `CenterlineTrack`/`TrackView` sign conventions, with a side-sign regression test. |
 
 ---
 
@@ -199,11 +206,15 @@ Trackmania and will not transfer.** The trainer refuses to use it unless
 `--allow-simulated-driver` is passed, every run records `driver: simulated` in its manifest,
 the CLI prints a banner, and `tmai status` / `tmai compare` flag it.
 
-### Evaluation is deterministic and the sim is deterministic
+### Seed repeats only create variety when the environment can randomise
 
-With a deterministic policy and the simulated driver, repeated evaluation episodes are
-identical, so `eval_episodes > 1` wastes time there. Against the real game there is
-nondeterminism and repeated episodes are meaningful.
+With a deterministic policy and the simulated driver, episodes are repeatable for a fixed
+seed; the default simulated configuration randomises start station/lateral offset, so distinct
+seeds can still produce meaningfully different trials. If start randomisation is disabled,
+repeated seeds may reproduce the same trajectory. The real game cannot reposition the car, so
+its seed repeats do not guarantee varied starts. Benchmark bootstrap intervals are descriptive
+and approximate, not a significance test; they resample track groups when possible and should
+be interpreted cautiously with few maps.
 
 ### The GUI backend has no authentication
 
@@ -219,22 +230,27 @@ doubt. See [`GUI.md`](GUI.md#security-model-read-this).
 In this order, because each step makes the next one trustworthy:
 
 1. `tmai doctor` — confirm the toolchain and that TMInterface is reachable.
-2. `tmai doctor --calibrate` — **all four checks must pass.** Apply the recommended
-   `position_scale` and, if the forward axis is not column 0, that finding has to be fed into
-   `VehicleState.forward_vector` (currently hard-coded to column 0 — this is the one place a
-   calibration failure requires a code change rather than a config change).
-3. `tmai record-track` — drive one clean lap and eyeball the result with `tmai show-track`.
+2. `tmai doctor --calibrate` — **all four checks must pass.** Apply the printed
+   `position_scale`, `forward_axis` and `forward_sign` recommendations to the matching
+   `driver.*` config keys before training. The forward-axis settings flow through telemetry,
+   yaw and track-relative observations.
+3. In offline/single-player mode, run `tmai record-track --out data/tracks/my_map.json` and
+   inspect it with `tmai show-track`. Use `--family "author-pack"` when the map is related to
+   another recorded layout; that prevents the family being split across train and test.
 4. `tmai validate-config -c tmai/configs/default.yaml` — confirm the real-game config is
    coherent before committing to a long run.
-5. A short `tmai train` run (a few thousand steps) purely to confirm the loop runs against the
-   real game and that `reward/progress` increases.
-6. `tmai record-demo` — drive one clean lap so the behaviour-cloning path is exercised against
-   real human input, then `tmai pretrain` from it.
-7. `tmai serve` — watch the run in the command center, and try the 3D track view and the
-   replay/ghost comparison.
-6. Record several more maps, then `tmai list-tracks data/tracks` to check the split geometry
-   coverage is comparable.
-7. Only then, a long run.
+5. Run a short `tmai train` (a few hundred or thousand steps) in offline/single-player mode;
+   confirm the game responds, telemetry stays finite, and `reward/progress` increases. Stop
+   immediately if control or reset behavior looks unsafe.
+6. Close TMInterface/game during a disposable short run and verify the process exits with a
+   useful error and preserves a checkpoint; then test Ctrl-C shutdown and checkpoint recovery.
+7. Optionally use `tmai record-demo` and `tmai pretrain` to exercise behaviour cloning against
+   real human input, then inspect the run and replays in `tmai serve`.
+8. Add maps and family labels as available; audit split counts and geometry with
+   `tmai list-tracks data/tracks --json`. Use `tmai benchmark --seed-repeats 3` for paired
+   comparisons, remembering that Trackmania cannot randomise its start position.
+9. Only then, attempt a long run.
 
-Steps 1–5 are the missing verification. Until they are done, nothing in this repository has
-been shown to control Trackmania.
+Steps 1–6 are the missing live-game acceptance checks. They are intentionally a Windows
+operator procedure rather than a claimed CI result: this repository has not controlled a
+running Trackmania instance in the current environment.

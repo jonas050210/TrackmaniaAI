@@ -76,6 +76,10 @@ export interface EpisodeRow {
   step: number;
   episode: number;
   end_reason: string;
+  finished?: boolean;
+  game_finished?: boolean;
+  invalid_finish?: boolean;
+  track?: string;
   reward: number;
   progress: number;
   [key: string]: unknown;
@@ -106,6 +110,8 @@ export interface RunSnapshot {
 export interface TrackEntryRow {
   name: string;
   identity: string;
+  family: string | null;
+  split_group: string;
   split: string;
   source: string | null;
   length: number;
@@ -114,7 +120,10 @@ export interface TrackEntryRow {
 
 export interface TrackLibraryReport {
   num_tracks: number;
+  num_split_groups: number;
   counts: Record<string, number>;
+  families_by_split: Record<string, number>;
+  split_groups_by_split: Record<string, number>;
   split_weights: Record<string, number>;
   tracks: TrackEntryRow[];
   geometry_by_split: Record<string, Record<string, number>>;
@@ -123,6 +132,7 @@ export interface TrackLibraryReport {
 export interface TrackGeometry {
   name: string;
   length: number;
+  closed: boolean;
   num_points: number;
   points: number[][];
   edges: { left: number[][]; right: number[][] };
@@ -200,6 +210,42 @@ export interface EpisodeReplay {
   metadata: Record<string, unknown>;
 }
 
+export interface SectorSummary {
+  index: number;
+  start_m: number;
+  end_m: number;
+  episodes_with_samples: number;
+  speed_samples: number;
+  mean_speed_mps: number | null;
+  mean_abs_lateral_m: number | null;
+  mean_lateral_fraction_of_half_width: number | null;
+  sector_time_samples: number;
+  mean_sector_time_s: number | null;
+  median_sector_time_s: number | null;
+  failure_count: number;
+}
+
+export interface ReplayAnalysis {
+  schema_version: number;
+  track: string;
+  track_uid: string | null;
+  track_length_m: number;
+  closed: boolean;
+  num_replays: number;
+  num_samples: number;
+  sector_count: number;
+  sectors: SectorSummary[];
+  slowest_sectors: number[];
+  failure_reasons: Record<string, number>;
+  failure_heatmap: {
+    station_edges_m: number[];
+    normalized_lateral_edges: number[];
+    lateral_labels: string[];
+    counts: number[][];
+    events_with_location: number;
+  };
+}
+
 export interface ReplayComparison {
   track: string;
   stations: number[];
@@ -231,6 +277,7 @@ export interface BenchmarkRow {
   created_utc: string;
   ranking: string[];
   splits: string[];
+  seed_repeats: number;
 }
 
 export interface ConfigDoc {
@@ -343,6 +390,10 @@ export const api = {
     get<EpisodeReplay>(`/api/replays/${encodeURIComponent(run)}/${encodeURIComponent(file)}`),
   replayCompare: (payload: { run: string; a: string; b: string; track?: string }) =>
     post<ReplayComparison>("/api/replays/compare", payload),
+  runAnalysis: (run: string, track: string, sectors = 20) =>
+    get<ReplayAnalysis>(
+      `/api/runs/${encodeURIComponent(run)}/analysis?track=${encodeURIComponent(track)}&sectors=${sectors}`
+    ),
 
   config: () => get<ConfigDoc>("/api/config"),
   configValidate: (yaml: string) =>
@@ -376,18 +427,48 @@ export const api = {
     post<{ job: Job }>("/api/doctor", payload),
 };
 
-/** Open the live-update WebSocket. Returns a disposer. */
+/** Open the live-update WebSocket with a bounded exponential reconnect policy. */
 export function connectWebSocket(onTick: (tick: Tick) => void): () => void {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${window.location.host}/api/ws`);
-  socket.onmessage = (event) => {
-    try {
-      onTick(JSON.parse(event.data) as Tick);
-    } catch {
-      /* ignore malformed frames */
-    }
+  const url = `${protocol}//${window.location.host}/api/ws`;
+  let socket: WebSocket | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let retryDelay = 750;
+  let closed = false;
+
+  const connect = () => {
+    if (closed) return;
+    const candidate = new WebSocket(url);
+    socket = candidate;
+    candidate.onopen = () => {
+      if (socket === candidate) retryDelay = 750;
+    };
+    candidate.onmessage = (event) => {
+      if (socket !== candidate || closed) return;
+      try {
+        onTick(JSON.parse(event.data) as Tick);
+      } catch {
+        /* ignore malformed frames */
+      }
+    };
+    candidate.onclose = () => {
+      if (socket !== candidate || closed) return;
+      socket = null;
+      retryTimer = setTimeout(connect, retryDelay);
+      retryDelay = Math.min(15_000, Math.round(retryDelay * 1.8));
+    };
+    candidate.onerror = () => candidate.close();
   };
-  return () => socket.close();
+
+  connect();
+  return () => {
+    closed = true;
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
+    const current = socket;
+    socket = null;
+    current?.close();
+  };
 }
 
 /** Poll a job until it reaches a terminal state. Returns the final job. */

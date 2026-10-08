@@ -151,7 +151,12 @@ def _track_payload(track) -> dict[str, Any]:
     """Centreline + corridor + curvature, decimated for the 3D view."""
     from tmai.tracks.stats import compute_stats
 
-    stations = np.linspace(0.0, track.length, num=min(track.num_points, 1500), endpoint=False)
+    stations = np.linspace(
+        0.0,
+        track.length,
+        num=min(track.num_points, 1500),
+        endpoint=not track.closed,
+    )
     points = np.array([track.point_at(float(s)) for s in stations])
     headings = np.array([track.heading_at(float(s)) for s in stations])
     # Ground-plane left/right normals, matching TrackView._build_corridor: Trackmania's
@@ -165,11 +170,12 @@ def _track_payload(track) -> dict[str, Any]:
     return {
         "name": track.name,
         "length": float(track.length),
+        "closed": bool(track.closed),
         "num_points": int(track.num_points),
         "points": points.tolist(),
         "edges": {
-            "left": (points + right * widths[:, None]).tolist(),
-            "right": (points - right * widths[:, None]).tolist(),
+            "left": (points - right * widths[:, None]).tolist(),
+            "right": (points + right * widths[:, None]).tolist(),
         },
         "curvature": curvature.tolist(),
         "corridor_half_width": widths.tolist(),
@@ -188,10 +194,21 @@ def _resolve_track(state: ServerState, name: str):
 
     if not name:
         return None
+    name = _safe_name(name, what="track name")
     base = state.config.resolve(state.config.tracks_dir)
     for candidate in (base / f"{name}.json", base / name):
         if candidate.is_file():
             return CenterlineTrack.load(candidate)
+    # Files can be named independently of the embedded track name. Resolve the public name
+    # from metadata as a fallback so replay analysis and the viewer agree with the library.
+    if base.is_dir():
+        for candidate in sorted(base.rglob("*.json")):
+            try:
+                track = CenterlineTrack.load(candidate)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if track.name == name or track.uid == name:
+                return track
     if name in SYNTHETIC_TRACKS:
         return SYNTHETIC_TRACKS[name]()
     return None
@@ -303,7 +320,13 @@ def _train_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict[str
         config_path = str(cfg_file)
     if config_path:
         argv += ["-c", str(config_path)]
-    overrides = params.get("overrides") or {}
+    overrides = dict(params.get("overrides") or {})
+    if "allow_simulated_driver" in params:
+        allow_simulated = params["allow_simulated_driver"]
+        if not isinstance(allow_simulated, bool):
+            raise ValueError("allow_simulated_driver must be a boolean")
+        # The explicit GUI safety switch must override config YAML in either direction.
+        overrides["driver.allow_simulated"] = str(allow_simulated).lower()
     if overrides:
         parsed = parse_overrides([f"{k}={v}" for k, v in overrides.items()])
         for key, value in parsed.items():
@@ -314,11 +337,6 @@ def _train_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict[str
         argv += ["--steps", str(int(params["steps"]))]
     if params.get("resume"):
         argv += ["--resume", str(params["resume"])]
-    # A simulated-driver config is legal for local experiments; say so explicitly rather
-    # than failing the job on the CLI's safety gate.
-    if params.get("allow_simulated_driver"):
-        argv += ["--allow-simulated-driver"]
-
     runs_dir = state.config.resolve(state.config.runs_dir)
     before = {p.name for p in runs_dir.iterdir()} if runs_dir.is_dir() else set()
     result = _subprocess_job(state, job, argv)
@@ -417,10 +435,7 @@ def _benchmark_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict
     from tmai.training.benchmark import run_benchmark
 
     config = _config_for_params(state, params)
-    models = [
-        (str(m["label"]), str(m["checkpoint"]))
-        for m in params.get("models") or []
-    ]
+    models = [(str(m["label"]), str(m["checkpoint"])) for m in params.get("models") or []]
     if not models:
         raise ValueError("benchmark needs at least one model")
     splits = params.get("splits") or ["validation", "test"]
@@ -432,10 +447,19 @@ def _benchmark_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict
         splits=list(splits),
         episodes_per_track=int(params.get("episodes", 3)),
         name=name,
+        seed_repeats=int(params.get("seed_repeats", 3)),
     )
+    job.log(f"paired evaluation seeds: {report.evaluation_seeds}")
     for model in report.models:
-        job.log(f"{model.label}: score {model.score:.3f}")
+        kind = f" ({model.baseline_kind} heuristic)" if model.baseline_kind else ""
+        job.log(f"{model.label}{kind}: score {model.score:.3f}")
     job.log(f"ranking: {' > '.join(report.ranking)}")
+    for comparison in report.head_to_head:
+        job.log(
+            f"{comparison.split} {comparison.model_a} vs {comparison.model_b}: "
+            f"{comparison.wins_a}-{comparison.wins_b}-{comparison.ties} over "
+            f"{comparison.episodes} paired episodes"
+        )
 
     out_dir = state.config.resolve(state.config.benchmarks_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -551,9 +575,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         history = status_api.run_history(
             _run_dir(state, name),
             max_points=max_points,
-            metrics_filter=(
-                [m.strip() for m in metrics.split(",") if m.strip()] if metrics else None
-            ),
+            metrics_filter=([m.strip() for m in metrics.split(",") if m.strip()] if metrics else None),
         ).as_dict()
         return {"run": name, "history": history}
 
@@ -576,8 +598,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         return {
             "run": name,
             "checkpoints": [
-                {"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime}
-                for p in files
+                {"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime} for p in files
             ],
             "best": {"name": best.name, "size": best.stat().st_size} if best.is_file() else None,
         }
@@ -591,13 +612,21 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         base = Path(directory) if directory else config.resolve(config.tracks_dir)
         base = base if base.is_absolute() else (PROJECT_ROOT / base)
         if not base.is_dir():
-            return {"directory": str(base), "report": None, "error": "not found",
-                    "synthetic": ["straight", "oval", "s_curve", "figure_eight"]}
+            return {
+                "directory": str(base),
+                "report": None,
+                "error": "not found",
+                "synthetic": ["straight", "oval", "s_curve", "figure_eight"],
+            }
         try:
             library = TrackLibrary.from_directory(base)
         except TrackLibraryError as exc:
-            return {"directory": str(base), "report": None, "error": str(exc),
-                    "synthetic": ["straight", "oval", "s_curve", "figure_eight"]}
+            return {
+                "directory": str(base),
+                "report": None,
+                "error": str(exc),
+                "synthetic": ["straight", "oval", "s_curve", "figure_eight"],
+            }
         return {
             "directory": str(base),
             "report": library.report(),
@@ -620,9 +649,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             return _track_payload(track)
         if not name:
             raise HTTPException(400, "pass ?name=<track> or ?synthetic=<name>")
+        safe_track_name = _safe_name(name, what="track name")
+        if not directory:
+            track = _resolve_track(state, safe_track_name)
+            if track is not None:
+                return _track_payload(track)
         base = Path(directory) if directory else config.resolve(config.tracks_dir)
         base = base if base.is_absolute() else (PROJECT_ROOT / base)
-        path = base / _safe_name(name, what="track name")
+        path = base / safe_track_name
         candidates = [path] if path.suffix == ".json" else [path.with_suffix(".json"), path]
         for candidate in candidates:
             if candidate.is_file():
@@ -702,6 +736,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                         "created_utc": data.get("created_utc", ""),
                         "ranking": data.get("ranking", []),
                         "splits": data.get("splits", []),
+                        "seed_repeats": data.get("seed_repeats", 1),
                     }
                 )
         return {"benchmarks": out, "directory": str(base)}
@@ -790,6 +825,37 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             candidate = config.resolve(config.runs_dir) / run
             base = candidate if candidate.is_dir() else (PROJECT_ROOT / run)
         return ReplayStore(base / "replays")
+
+    @app.get("/api/runs/{name}/analysis")
+    def run_analysis(
+        name: str,
+        track: str = Query(..., min_length=1),
+        sectors: int = Query(20, ge=1, le=200),
+        lateral_bins: int = Query(7, ge=3, le=31),
+    ) -> dict[str, Any]:
+        from tmai.replay import ReplayStore
+        from tmai.training.analysis import analyze_replays
+
+        run_dir = _run_dir(state, name)
+        track_name = _safe_name(track, what="track name")
+        geometry = _resolve_track(state, track_name)
+        if geometry is None:
+            raise HTTPException(status_code=404, detail=f"track {track_name!r} not found")
+        store = ReplayStore(run_dir / "replays")
+        matching = [
+            store.load(row["name"])
+            for row in store.list()
+            if not row.get("track") or row.get("track") == track_name
+        ]
+        try:
+            return analyze_replays(
+                matching,
+                geometry,
+                sector_count=sectors,
+                lateral_bin_count=lateral_bins,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/replays")
     def replays(run: str = Query(...)) -> dict[str, Any]:

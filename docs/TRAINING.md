@@ -25,7 +25,7 @@ being silently ignored.
 | Section | Contents |
 |---|---|
 | `driver` | `kind`, `server_name`, `position_scale`, `speed_ratio`, reset strategy, timeouts |
-| `track` | `path` (one centreline), `directory` (a multi-track library), `synthetic`/`synthetic_suite`, plus `split_weights` and `explicit_splits` |
+| `track` | `path` (one centreline), `directory` (a multi-track library), `synthetic`/`synthetic_suite`, plus `split_weights` and `explicit_splits`; related maps can share `metadata.family` |
 | `multi` | Track sampling and start-condition randomisation. See [GENERALIZATION.md](GENERALIZATION.md) |
 | `normalize` | Online observation normalisation: `enabled`, `clip`, `warmup_steps` |
 | `env` | `control_dt`, `action_repeat`, observation spec, reward weights, termination thresholds |
@@ -45,8 +45,11 @@ Three shipped configs, all of which pass `tmai validate-config`:
 * `multitrack_smoke.yaml` — the toy model across four synthetic tracks and two splits, with
   held-out evaluation. Exercises the whole generalisation path in a few seconds.
 * `pipeline_smoke.yaml` — the toy model with the full pipeline on: temporal observations
-  (`history_length: 3`), curriculum (track reveal + episode caps), behaviour cloning from a
-  recorded demonstration, and replay recording.
+  (`history_length: 3`), curriculum (track reveal + episode caps), behavior cloning from a
+  recorded demonstration, and replay recording. Generate its explicitly synthetic test demo
+  first with `tmai record-demo -c tmai/configs/pipeline_smoke.yaml
+  --allow-simulated-driver --max-steps 400 --out data/demos/smoke.jsonl`; it is not human
+  driving data.
 
 ## The training loop
 
@@ -73,6 +76,11 @@ Properties worth knowing:
   easiest to hardest (by mean curvature + corner density) and can shorten early episodes;
   the trainer logs `curriculum_stage` events and a `curriculum/stage` metric. Held-out
   evaluation is **never** curriculum-filtered.
+* **The Training Director can focus practice on weak maps.** Set `director.enabled: true` to
+  update bounded per-track priorities from episode coverage and unfinished/failure outcomes.
+  Every active training track keeps a guaranteed slot in each weighted sampling block; the
+  director is attached only to the training environment, and its EMA state plus pending
+  sampler schedule are stored in checkpoints for resume.
 * **Behaviour cloning can warm-start the policy.** With `bc.enabled`, demonstrations are
   loaded and the actor is pretrained on them (logged as a `bc_pretrain` event) before RL
   begins. Skipped when resuming — the resumed checkpoint already carries its warm start.
@@ -90,8 +98,9 @@ tmai train --resume runs/.../checkpoint_000200000.pt
 ```
 
 A checkpoint carries the network, both optimisers, the entropy temperature, the gradient-step
-counter, RNG state (Python, NumPy, PyTorch and CUDA) and the config. A resumed run continues
-the counters rather than restarting them, and records `resumed_from` in its manifest.
+counter, RNG state (Python, NumPy, PyTorch and CUDA), the adaptive Training Director state and
+multi-track sampling schedule when present, and the config. A resumed run continues the
+counters rather than restarting them, and records `resumed_from` in its manifest.
 
 The replay buffer is **not** restored: it would dominate checkpoint size for a 1 M-transition
 buffer. A resumed run refills it during warm-up. This is a deliberate trade-off, and it means
@@ -141,10 +150,12 @@ trailing line (Ctrl-C mid-recording) is skipped on load, so an interrupted recor
 leaves a usable dataset.
 
 `pretrain_policy` fits the policy's deterministic action to the recorded actions (MSE in the
-bounded action space) and, when the learner is normalisation-wrapped, first fits the
-normaliser's statistics on the demonstrations so the network trains on the same
-representation it will see during RL. It is a **warm start**, not an imitation objective:
-SAC takes over afterwards and can improve on the demonstrations.
+bounded action space). When the learner is normalisation-wrapped, statistics are fitted only
+on the training partition and then applied to both training and validation data. Validation
+holds out whole files when multiple demonstrations are supplied; a single file uses a
+chronological holdout with a small purge gap to reduce leakage from adjacent frames. It is a
+**warm start**, not an imitation objective: SAC takes over afterwards and can improve on the
+demonstrations.
 
 Two guards are deliberate: a demonstration whose observation/action dimensions do not match
 the learner is rejected (a demo recorded against a different observation layout is a
@@ -172,6 +183,19 @@ invariant to random start stations, so it is the honest answer for a partial lap
 arc length both replays actually drove is compared, so an early crash shortens the comparison
 instead of faking gaps over the rest of the track.
 
+Sector pace and failure locations can be summarized from saved replays against a matching
+centreline:
+
+```bash
+tmai analyze runs/<run> --track data/tracks/my_map.json --sectors 20 --json-out analysis.json
+```
+
+`analyze` reports observed speed and lateral offset per equal-distance sector, interpolated
+sector times where consecutive boundary crossings are available, end-reason counts, and a
+station-by-lateral failure grid. The GUI exposes the same summary on Replays & Ghosts. Treat
+slow sectors and lateral excursions as review cues; they do not prove a particular line is
+suboptimal without a valid ghost/baseline and calibrated real telemetry.
+
 ## The model registry
 
 ```bash
@@ -191,14 +215,25 @@ same store.
 
 ```bash
 tmai benchmark --model v1=runs/<run-a> --model v2=runs/<run-b> \
-        --split validation,test --episodes 3 --name my-benchmark --out benchmarks/my-benchmark.json
+        --split validation,test --episodes 3 --seed-repeats 3 \
+        --name my-benchmark --out benchmarks/my-benchmark.json
 ```
 
 Every model is evaluated on every split under one identical protocol — same tracks, same
-episode count, same determinism — so differences are the models, not the measurement. The
-report carries per-split numbers (a model that wins on validation but loses on test is
-visible, not averaged away), a single ranking score, and a printable table. Reports are JSON
-in `benchmarks/`; the GUI lists them and can start one as a job.
+seed schedule, same episode count and same determinism — so differences are the models, not the
+measurement. `--seed-repeats 3` is paired across models and multiplies the episode count per
+track; use `--seed-repeats 1` for a quick smoke check. Reports include the exact seeds,
+approximate 95% bootstrap intervals for finish/progress/crash metrics and paired win-share /
+progress-delta intervals. The bootstrap resamples explicit family clusters together, or
+individual tracks when no family metadata is supplied, rather than treating every episode on a
+map as independent. A single cluster falls back to episode-level intervals; one sample has no
+interval.
+These are descriptive percentile intervals, not formal significance tests, and the ranking
+still sorts point scores. Random seeds only produce different starts if the driver supports
+start randomisation; this is not available for the real game. Add `--model pilot=baseline:curvature` to include the
+geometry-grounded heuristic controller. That baseline is not a learned policy and has not been
+validated in a live Windows Trackmania/TMInterface session; simulated runs only test the
+pipeline. Reports are JSON in `benchmarks/`; the GUI lists the intervals and can start one as a job.
 
 ## Reward tuning
 
@@ -310,8 +345,9 @@ The policy runs deterministically (no exploration noise) and no gradient steps o
 
 `score` is track fraction completed with a bonus for finishing quickly, bounded in `[0, 2)`,
 so `best.pt` selection cannot be gamed by finishing slowly. A "finish" that did not collect the
-map's checkpoints is flagged `invalid_finish`, excluded from lap-time statistics and logged as
-a warning — the game's own checkpoint counter is authoritative.
+map's checkpoints is flagged `invalid_finish`, earns no finish bonus during training, and is
+excluded from lap-time statistics. Events and saved replays preserve the raw finish flag and
+checkpoint counts; evaluation also emits a warning.
 
 During training, set `train.held_out_eval_interval` to evaluate on the validation split
 periodically. It runs on a separate environment so the training episode and driver are

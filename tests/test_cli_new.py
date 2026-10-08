@@ -124,6 +124,51 @@ class TestValidateConfig:
 # -- list-tracks --------------------------------------------------------------------
 
 
+class TestRacingAnalysis:
+    def test_analyze_replay_directory_writes_machine_readable_report(self, tmp_path, capsys):
+        import numpy as np
+
+        from tmai.replay import EpisodeReplay, ReplayStore
+        from tmai.tracks.centerline import CenterlineTrack
+
+        track = CenterlineTrack([[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]], name="analysis-track")
+        track_path = track.save(tmp_path / "track.json")
+        positions = np.column_stack([np.zeros(101), np.zeros(101), np.linspace(0.0, 100.0, 101)])
+        replay = EpisodeReplay(
+            episode=1,
+            step=100,
+            track=track.name,
+            end_reason="crash",
+            positions=positions,
+            speeds=np.full(101, 20.0),
+            progress=np.linspace(0.0, 100.0, 101),
+            race_times=np.linspace(0.0, 5.0, 101),
+        )
+        store = ReplayStore(tmp_path / "run" / "replays")
+        store.save(replay)
+        report_path = tmp_path / "analysis.json"
+
+        assert (
+            main(
+                [
+                    "analyze",
+                    str(tmp_path / "run"),
+                    "--track",
+                    str(track_path),
+                    "--sectors",
+                    "4",
+                    "--json-out",
+                    str(report_path),
+                ]
+            )
+            == 0
+        )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert report["num_replays"] == 1
+        assert report["failure_reasons"] == {"crash": 1}
+        assert "failure heatmap" in capsys.readouterr().out
+
+
 class TestListTracks:
     def test_lists_tracks_with_geometry(self, track_dir, capsys):
         assert main(["list-tracks", str(track_dir)]) == 0
@@ -272,11 +317,17 @@ class TestCompareCommand:
 # -- parser -------------------------------------------------------------------------
 
 
+class TestValidateConfigCLI:
+    def test_reports_effective_dimension_after_temporal_stacking(self, capsys):
+        assert main(["validate-config", "-c", "tmai/configs/pipeline_smoke.yaml"]) == 0
+        assert "observation dim 60" in capsys.readouterr().out
+
+
 class TestParser:
     def test_every_new_command_is_registered(self):
         parser = build_parser()
         choices = parser._subparsers._group_actions[0].choices  # noqa: SLF001
-        for name in ("status", "list-tracks", "validate-config", "compare"):
+        for name in ("status", "list-tracks", "validate-config", "compare", "analyze", "play"):
             assert name in choices
 
     def test_every_command_has_a_handler(self):
@@ -285,6 +336,15 @@ class TestParser:
         for name, sub in choices.items():
             args = sub.parse_args(_minimal_args(name))
             assert callable(getattr(args, "func", None)), f"{name} has no handler"
+
+    def test_benchmark_seed_and_track_family_options_parse(self):
+        parser = build_parser()
+        benchmark = parser.parse_args(
+            ["benchmark", "--model", "pilot=baseline:curvature", "--seed-repeats", "5"]
+        )
+        assert benchmark.seed_repeats == 5
+        record = parser.parse_args(["record-track", "--out", "track.json", "--family", "author-pack"])
+        assert record.family == "author-pack"
 
 
 def _minimal_args(command: str) -> list[str]:
@@ -297,6 +357,7 @@ def _minimal_args(command: str) -> list[str]:
         "pretrain": ["--demo", "x.jsonl", "--out", "x.pt"],
         "models": ["list"],
         "replay": ["list"],
+        "analyze": ["some/run", "--track", "some/track.json"],
     }
     return required.get(command, [])
 
@@ -327,9 +388,12 @@ class TestEvalCoversTheLibrary:
         main(
             [
                 "eval",
-                "--checkpoint", str(run),
-                "--episodes", "1",
-                "--split", "train,validation",
+                "--checkpoint",
+                str(run),
+                "--episodes",
+                "1",
+                "--split",
+                "train,validation",
             ]
         )
         text = capsys.readouterr().out
@@ -353,10 +417,14 @@ class TestEvalCoversTheLibrary:
         main(
             [
                 "eval",
-                "--checkpoint", str(run),
-                "--episodes", "1",
-                "--split", "train,validation",
-                "--json-out", str(json_out),
+                "--checkpoint",
+                str(run),
+                "--episodes",
+                "1",
+                "--split",
+                "train,validation",
+                "--json-out",
+                str(json_out),
             ]
         )
         payload = json.loads(json_out.read_text(encoding="utf-8"))
@@ -478,15 +546,22 @@ class TestConfigDiscoveryForResumeAndEval:
         first = train_from_config(config).run_dir
 
         # The command under test: resume with no -c, exactly as documented.
-        assert main(
-            [
-                "train",
-                "--resume", str(first),
-                "--set", "train.total_steps=60",
-                "--set", "train.checkpoint_interval=30",
-                "--set", f"train.output_dir={tmp_path / 'second'}",
-            ]
-        ) == 0
+        assert (
+            main(
+                [
+                    "train",
+                    "--resume",
+                    str(first),
+                    "--set",
+                    "train.total_steps=60",
+                    "--set",
+                    "train.checkpoint_interval=30",
+                    "--set",
+                    f"train.output_dir={tmp_path / 'second'}",
+                ]
+            )
+            == 0
+        )
 
         second = sorted(p for p in (tmp_path / "second").iterdir() if p.is_dir())[0]
         manifest = read_manifest(second)
@@ -539,9 +614,7 @@ class TestDoctorCalibrateIsNotSilent:
         out = capsys.readouterr().out
         assert "simulated (NOT the real game)" in out
 
-    def test_failed_driver_does_not_send_calibration_into_a_closed_driver(
-        self, tmp_path, capsys
-    ):
+    def test_failed_driver_does_not_send_calibration_into_a_closed_driver(self, tmp_path, capsys):
         """A driver whose open() raised must be treated as absent, not as connected.
 
         On a non-Windows host TMInterface cannot open, so `doctor` reports the driver as a
@@ -585,8 +658,12 @@ class TestStatusGapColumnIsPopulated:
         config = RunConfig()
         config.driver.kind = "simulated"
         config.driver.allow_simulated = True
-        config.track.synthetic_suite = [{"name": "straight"}, {"name": "oval"},
-                                        {"name": "s_curve"}, {"name": "figure_eight"}]
+        config.track.synthetic_suite = [
+            {"name": "straight"},
+            {"name": "oval"},
+            {"name": "s_curve"},
+            {"name": "figure_eight"},
+        ]
         config.track.split_weights = {"train": 0.5, "validation": 0.5, "test": 0.0}
         config.train.output_dir = str(tmp_path)
         config.train.run_name = "gap-status"
@@ -611,9 +688,7 @@ class TestStatusGapColumnIsPopulated:
         rows = [line for line in table.splitlines() if "training" in line]
         assert rows, "precondition: a training evaluation row exists"
         # The gap must be a signed number, not the '--' placeholder.
-        assert any("--" not in row.split()[-1] for row in rows), (
-            f"gap column still blank: {rows}"
-        )
+        assert any("--" not in row.split()[-1] for row in rows), f"gap column still blank: {rows}"
 
     def test_gap_is_not_duplicated_across_both_rows(self, tmp_path, capsys):
         """Printing the same gap on both rows would read as two independent measurements."""
@@ -626,6 +701,78 @@ class TestStatusGapColumnIsPopulated:
         assert held
         for row in held:
             assert row.split()[-1] == "--", f"held-out row should not repeat the gap: {row}"
+
+
+class TestRecordDemoCli:
+    def test_simulated_pipeline_recording_resolves_library_track(self, tmp_path, capsys):
+        from tmai.training.demos import Demonstration
+
+        output = tmp_path / "demo.jsonl"
+        assert (
+            main(
+                [
+                    "record-demo",
+                    "-c",
+                    "tmai/configs/smoke.yaml",
+                    "--out",
+                    str(output),
+                    "--max-steps",
+                    "3",
+                    "--allow-simulated-driver",
+                ]
+            )
+            == 0
+        )
+        demo = Demonstration.load(output)
+        # The initial reset frame plus three control transitions are recorded.
+        assert len(demo) == 4
+        assert demo.metadata["steps"] == 3
+        assert demo.metadata["track"] == "s_curve"
+        assert demo.metadata["not_human_driving"] is True
+        assert "SIMULATED PIPELINE TEST" in capsys.readouterr().out
+
+
+class TestReplayShowCli:
+    def test_show_renders_replay_trajectory(self, tmp_path, capsys):
+        import numpy as np
+
+        from tmai.replay import EpisodeReplay, ReplayStore
+        from tmai.tracks.synthetic import straight
+
+        run_dir = tmp_path / "run"
+        store = ReplayStore(run_dir / "replays")
+        replay = EpisodeReplay(
+            episode=1,
+            step=5,
+            track="straight",
+            positions=np.array([straight().point_at(station) for station in (0.0, 10.0, 20.0)]),
+        )
+        store.save(replay)
+        track_path = tmp_path / "straight.json"
+        straight().save(track_path)
+        output = tmp_path / "replay.png"
+
+        assert (
+            main(
+                [
+                    "replay",
+                    "show",
+                    "--run",
+                    str(run_dir),
+                    "--replay",
+                    "episode_000001.json",
+                    "--track",
+                    str(track_path),
+                    "--out",
+                    str(output),
+                ]
+            )
+            == 0
+        )
+        assert output.is_file()
+        assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert "wrote" in capsys.readouterr().out
+
 
 class TestReplayCompareCli:
     """`tmai replay compare` accepts a human demonstration (JSONL) as the ghost."""
@@ -683,11 +830,16 @@ class TestReplayCompareCli:
         assert (
             main(
                 [
-                    "replay", "compare",
-                    "--run", str(run_dir),
-                    "--replay", replay_name,
-                    "--other", str(demo_path),
-                    "--out", str(tmp_path / "gaps.json"),
+                    "replay",
+                    "compare",
+                    "--run",
+                    str(run_dir),
+                    "--replay",
+                    replay_name,
+                    "--other",
+                    str(demo_path),
+                    "--out",
+                    str(tmp_path / "gaps.json"),
                 ]
             )
             == 0
@@ -704,10 +856,14 @@ class TestReplayCompareCli:
         assert (
             main(
                 [
-                    "replay", "compare",
-                    "--run", str(run_dir),
-                    "--replay", replay_name,
-                    "--other", str(tmp_path / "nope.jsonl"),
+                    "replay",
+                    "compare",
+                    "--run",
+                    str(run_dir),
+                    "--replay",
+                    replay_name,
+                    "--other",
+                    str(tmp_path / "nope.jsonl"),
                 ]
             )
             == 1
@@ -744,10 +900,14 @@ class TestPretrainCli:
             main(
                 [
                     "pretrain",
-                    "-c", "tmai/configs/pipeline_smoke.yaml",
-                    "--demo", str(demo_path),
-                    "--out", str(out),
-                    "--epochs", "2",
+                    "-c",
+                    "tmai/configs/pipeline_smoke.yaml",
+                    "--demo",
+                    str(demo_path),
+                    "--out",
+                    str(out),
+                    "--epochs",
+                    "2",
                 ]
             )
             == 0
@@ -772,10 +932,152 @@ class TestPretrainCli:
             main(
                 [
                     "pretrain",
-                    "-c", "tmai/configs/pipeline_smoke.yaml",
-                    "--demo", str(demo_path),
-                    "--out", str(tmp_path / "x.pt"),
+                    "-c",
+                    "tmai/configs/pipeline_smoke.yaml",
+                    "--demo",
+                    str(demo_path),
+                    "--out",
+                    str(tmp_path / "x.pt"),
                 ]
             )
             == 1
         )
+
+
+class TestPlayCli:
+    """The direct-drive loop works offline and does not masquerade as real game control."""
+
+    @staticmethod
+    def _write_config(path: Path, *, simulated: bool = True) -> Path:
+        from tmai.config import RunConfig
+
+        config = RunConfig()
+        config.driver.kind = "simulated" if simulated else "tminterface"
+        config.driver.allow_simulated = False
+        config.track.synthetic = "straight" if simulated else None
+        config.track.synthetic_kwargs = {"length": 100.0}
+        config.track.directory = None
+        config.multi.random_start_station = False
+        config.multi.start_lateral_std = 0.0
+        config.env.termination.max_steps = 4
+        config.train.output_dir = str(path.parent / "runs")
+        path.write_text(config.to_yaml(), encoding="utf-8")
+        return path
+
+    def test_curvature_pilot_drives_simulator_and_records_replay(self, tmp_path, capsys):
+        config_path = self._write_config(tmp_path / "play.yaml")
+        assert (
+            main(
+                [
+                    "play",
+                    "-c",
+                    str(config_path),
+                    "--allow-simulated-driver",
+                    "--record-replay",
+                    "--log-interval",
+                    "1",
+                ]
+            )
+            == 0
+        )
+        output = capsys.readouterr().out
+        assert "SIMULATED DRIVER" in output
+        assert "CurvaturePilot heuristic (not a trained policy)" in output
+        assert "Episode result:" in output
+        assert "cmd=(" in output
+        replays = list((tmp_path / "runs" / "play-replays").rglob("episode_*.json"))
+        assert len(replays) == 1
+        assert json.loads(replays[0].read_text(encoding="utf-8"))["source"] == "play"
+
+    def test_simulated_driver_requires_explicit_opt_in(self, tmp_path, capsys):
+        config_path = self._write_config(tmp_path / "play.yaml")
+        assert main(["play", "-c", str(config_path)]) == 2
+        assert "allow_simulated=true" in capsys.readouterr().err
+
+    def test_real_direct_drive_refuses_a_multi_track_library(self, tmp_path, capsys):
+        from tmai.tracks.synthetic import build_synthetic
+
+        config_path = self._write_config(tmp_path / "play.yaml", simulated=False)
+        tracks = tmp_path / "tracks"
+        tracks.mkdir()
+        for name in ("oval", "s_curve"):
+            build_synthetic(name).save(tracks / f"{name}.json")
+        from tmai.config import RunConfig
+
+        config = RunConfig.from_yaml(config_path)
+        config.track.path = None
+        config.track.synthetic = None
+        config.track.directory = str(tracks)
+        config_path.write_text(config.to_yaml(), encoding="utf-8")
+
+        assert main(["play", "-c", str(config_path)]) == 2
+        assert "requires exactly one configured track" in capsys.readouterr().err
+
+    def test_interrupt_closes_the_environment(self, tmp_path, monkeypatch, capsys):
+        from tmai.env.tm_env import TrackmaniaEnv
+        from tmai.training import evaluate
+
+        config_path = self._write_config(tmp_path / "play.yaml")
+        closed = []
+        original_close = TrackmaniaEnv.close
+
+        def tracked_close(env):
+            closed.append(True)
+            original_close(env)
+
+        def interrupt(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(TrackmaniaEnv, "close", tracked_close)
+        monkeypatch.setattr(evaluate, "run_episode", interrupt)
+        assert (
+            main(["play", "-c", str(config_path), "--allow-simulated-driver"]) == 130
+        )
+        assert closed == [True]
+        assert "interrupted" in capsys.readouterr().err
+
+    def test_checkpoint_drives_through_the_same_play_loop(self, tmp_path, capsys):
+        from tmai.config import RunConfig
+        from tmai.training.checkpoint import save_checkpoint
+        from tmai.training.factory import build_learner, build_library, build_multi_track_env
+
+        config_path = self._write_config(tmp_path / "play.yaml")
+        config = RunConfig.from_yaml(config_path)
+        config.driver.allow_simulated = True
+        config_path.write_text(config.to_yaml(), encoding="utf-8")
+        library = build_library(config)
+        env = build_multi_track_env(config, library, split="train", seed=0)
+        try:
+            learner = build_learner(env, config)
+            checkpoint_dir = tmp_path / "saved-run"
+            checkpoint_dir.mkdir()
+            checkpoint = save_checkpoint(
+                checkpoint_dir,
+                step=17,
+                learner=learner,
+                config=config.to_dict(),
+                keep=1,
+                rng_state=False,
+            )
+        finally:
+            env.close()
+
+        assert (
+            main(
+                [
+                    "play",
+                    "-c",
+                    str(config_path),
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--allow-simulated-driver",
+                    "--max-steps",
+                    "3",
+                ]
+            )
+            == 0
+        )
+        output = capsys.readouterr().out
+        assert "checkpoint" in output
+        assert "step 17" in output
+        assert "Episode result:" in output

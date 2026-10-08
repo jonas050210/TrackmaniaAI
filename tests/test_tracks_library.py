@@ -22,10 +22,15 @@ from tmai.tracks.stats import compute_stats
 from tmai.tracks.synthetic import build_synthetic, figure_eight, oval, s_curve, straight
 
 
-def _track(name: str = "t", length: float = 100.0, uid: str | None = None) -> CenterlineTrack:
+def _track(
+    name: str = "t",
+    length: float = 100.0,
+    uid: str | None = None,
+    metadata: dict | None = None,
+) -> CenterlineTrack:
     pts = np.zeros((int(length) + 1, 3))
     pts[:, 2] = np.arange(len(pts))
-    return CenterlineTrack(pts, name=name, uid=uid, corridor_half_width=5.0)
+    return CenterlineTrack(pts, name=name, uid=uid, corridor_half_width=5.0, metadata=metadata)
 
 
 # -- identity -----------------------------------------------------------------------
@@ -107,6 +112,33 @@ class TestTrackLibrary:
         with pytest.raises(TrackLibraryError, match="unknown split"):
             TrackLibrary().add(_track(), split="holdout")
 
+    def test_related_families_share_one_deterministic_split(self):
+        library = TrackLibrary(split_weights={"train": 0.5, "validation": 0.5, "test": 0.0})
+        first = library.add(_track("layout-a", length=80, uid="map-a", metadata={"family": "Maker Pack 7"}))
+        second = library.add(_track("layout-b", length=120, uid="map-b", metadata={"family": "maker pack 7"}))
+        assert first.split == second.split
+        assert first.family == "Maker Pack 7"
+        assert second.split_group == first.split_group
+        assert library.report()["num_split_groups"] == 1
+
+    def test_explicit_family_split_propagates_and_conflicts_are_rejected(self):
+        library = TrackLibrary()
+        first = library.add(
+            _track("layout-a", uid="map-a", metadata={"family": "series-x"}),
+            split="test",
+        )
+        second = library.add(_track("layout-b", uid="map-b", metadata={"family": "series-x"}))
+        assert first.split == second.split == "test"
+        with pytest.raises(TrackLibraryError, match="family 'series-x' is already in the 'test' split"):
+            library.add(
+                _track("layout-c", uid="map-c", metadata={"family": "series-x"}),
+                split="train",
+            )
+
+    def test_family_metadata_must_be_a_string(self):
+        with pytest.raises(TrackLibraryError, match="family must be a string"):
+            TrackLibrary().add(_track(metadata={"family": 42}))
+
     def test_same_track_twice_is_deduplicated(self):
         library = TrackLibrary()
         first = library.add(_track(), split="train")
@@ -167,6 +199,31 @@ class TestLibraryFromDirectory:
         assert [e.name for e in library.by_split("test")] == ["oval"]
         assert [e.name for e in library.by_split("validation")] == ["s_curve"]
         assert [e.name for e in library.by_split("train")] == ["straight"]
+
+    def test_pinning_one_family_member_pins_the_whole_family(self, tmp_path):
+        _track("family-a", length=90, uid="family-map-a", metadata={"family": "author-pack"}).save(
+            tmp_path / "a.json"
+        )
+        _track("family-b", length=120, uid="family-map-b", metadata={"family": "author-pack"}).save(
+            tmp_path / "b.json"
+        )
+        library = TrackLibrary.from_directory(
+            tmp_path,
+            split_weights={"train": 1.0, "validation": 0.0, "test": 0.0},
+            explicit_splits={"b": "test"},
+        )
+        assert {entry.split for entry in library.entries} == {"test"}
+        assert library.report()["families_by_split"]["test"] == 1
+
+    def test_conflicting_explicit_splits_for_one_family_are_rejected(self, tmp_path):
+        _track("family-a", length=90, uid="family-map-a", metadata={"family": "author-pack"}).save(
+            tmp_path / "a.json"
+        )
+        _track("family-b", length=120, uid="family-map-b", metadata={"family": "author-pack"}).save(
+            tmp_path / "b.json"
+        )
+        with pytest.raises(TrackLibraryError, match="assign family 'author-pack' to both"):
+            TrackLibrary.from_directory(tmp_path, explicit_splits={"a": "train", "b": "test"})
 
     def test_missing_directory(self, tmp_path):
         with pytest.raises(TrackLibraryError, match="not a directory"):
@@ -377,7 +434,8 @@ class TestDuplicateGeometryIsReported:
             library = TrackLibrary.from_directory(tmp_path)
 
         loaded = [
-            r.getMessage() for r in caplog.records
+            r.getMessage()
+            for r in caplog.records
             if r.levelno == logging.INFO and "loaded track" in r.getMessage()
         ]
         assert len(loaded) == len(library), (

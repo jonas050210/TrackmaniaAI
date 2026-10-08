@@ -43,6 +43,8 @@ class TestConfigRoundtrip:
         config.sac.network.hidden_sizes = (128, 64)
         config.env.reward.progress_weight = 2.5
         config.driver.position_scale = 0.125
+        config.driver.forward_axis = 2
+        config.driver.forward_sign = -1.0
         path = config.save(tmp_path / "cfg.yaml")
         loaded = RunConfig.from_yaml(path)
         assert loaded.train.total_steps == 12345
@@ -50,6 +52,8 @@ class TestConfigRoundtrip:
         assert tuple(loaded.sac.network.hidden_sizes) == (128, 64)
         assert loaded.env.reward.progress_weight == pytest.approx(2.5)
         assert loaded.driver.position_scale == pytest.approx(0.125)
+        assert loaded.driver.forward_axis == 2
+        assert loaded.driver.forward_sign == -1.0
 
     def test_shipped_default_config_loads(self):
         from pathlib import Path
@@ -119,6 +123,52 @@ class TestConfigRoundtrip:
     def test_to_dict_is_json_serialisable(self):
         payload = json.dumps(RunConfig().to_dict())
         assert "tminterface" in payload
+
+    def test_invalid_forward_convention_is_reported(self):
+        config = RunConfig()
+        config.driver.forward_axis = 3
+        config.driver.forward_sign = 0.0
+        problems = config.validate()
+        assert any("driver.forward_axis" in problem for problem in problems)
+        assert any("driver.forward_sign" in problem for problem in problems)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("speed_ratio", float("nan")),
+            ("position_scale", float("inf")),
+            ("physics_hz", 0.0),
+            ("connect_timeout_s", -1.0),
+            ("frame_timeout_s", float("nan")),
+        ],
+    )
+    def test_invalid_driver_timing_and_scale_values_are_reported(self, field, value):
+        config = RunConfig()
+        setattr(config.driver, field, value)
+        assert any(f"driver.{field}" in problem for problem in config.validate())
+
+    def test_zero_settle_ticks_is_rejected(self):
+        config = RunConfig()
+        config.driver.settle_ticks = 0
+        assert any("driver.settle_ticks" in problem for problem in config.validate())
+
+    @pytest.mark.parametrize(
+        ("section", "field", "value", "problem_name"),
+        [
+            ("env", "control_dt", float("nan"), "env.control_dt"),
+            ("sac", "gamma", float("nan"), "sac.gamma"),
+            ("track", "split_weights", float("nan"), "track.split_weights"),
+        ],
+    )
+    def test_nonfinite_control_and_training_values_are_rejected(
+        self, section, field, value, problem_name
+    ):
+        config = RunConfig()
+        if field == "split_weights":
+            config.track.split_weights["train"] = value
+        else:
+            setattr(getattr(config, section), field, value)
+        assert any(problem_name in problem for problem in config.validate())
 
 
 class TestOverrides:
@@ -297,7 +347,11 @@ class TestCheckpoints:
         rng = np.random.default_rng(0)
         batch = Batch(
             observations=rng.normal(size=(16, 4)).astype(np.float32),
-            actions=rng.uniform(-1, 1, size=(16, 3)).astype(np.float32),
+            actions=rng.uniform(
+                low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+                high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+                size=(16, 3),
+            ).astype(np.float32),
             rewards=rng.normal(size=(16,)).astype(np.float32),
             next_observations=rng.normal(size=(16, 4)).astype(np.float32),
             terminated=np.zeros(16, dtype=np.float32),

@@ -56,18 +56,21 @@ class Action:
     brake: float = 0.0
 
     def clipped(self) -> Action:
-        """Return an equivalent action with every component inside its legal range."""
+        """Return an equivalent action inside the legal range; reject non-finite controls."""
+        values = np.asarray([self.steer, self.throttle, self.brake], dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"action controls must all be finite, got {values.tolist()}")
         return Action(
-            steer=float(np.clip(self.steer, -1.0, 1.0)),
-            throttle=float(np.clip(self.throttle, 0.0, 1.0)),
-            brake=float(np.clip(self.brake, 0.0, 1.0)),
+            steer=float(np.clip(values[0], -1.0, 1.0)),
+            throttle=float(np.clip(values[1], 0.0, 1.0)),
+            brake=float(np.clip(values[2], 0.0, 1.0)),
         )
 
     def as_array(self) -> np.ndarray:
         return np.array([self.steer, self.throttle, self.brake], dtype=np.float32)
 
     @staticmethod
-    def from_array(values: np.ndarray | Sequence[float]) -> Action:  # type: ignore[name-defined]
+    def from_array(values: np.ndarray | Sequence[float]) -> Action:
         arr = np.asarray(values, dtype=np.float64).reshape(-1)
         if arr.size != 3:
             raise ValueError(f"Action.from_array expects 3 values, got {arr.size}")
@@ -108,6 +111,16 @@ class VehicleState:
     input_steer: float = 0.0
     input_gas: float = 0.0
     input_brake: float = 0.0
+    #: Rotation-matrix column calibrated as vehicle forward; must be in ``[0, 2]``.
+    forward_axis: int = 0
+    #: Sign for the calibrated forward column (``-1`` or ``+1``).
+    forward_sign: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.forward_axis not in (0, 1, 2):
+            raise ValueError(f"forward_axis must be 0, 1 or 2, got {self.forward_axis}")
+        if self.forward_sign not in (-1.0, 1.0):
+            raise ValueError(f"forward_sign must be -1 or +1, got {self.forward_sign}")
 
     def yaw(self) -> float:
         """Heading around the world up axis, radians, from the vehicle's forward vector.
@@ -122,7 +135,10 @@ class VehicleState:
 
     def forward_vector(self) -> np.ndarray:
         """Unit forward vector of the car in world space."""
-        fwd = np.asarray(self.rotation, dtype=np.float64).reshape(3, 3)[:, 0]
+        fwd = (
+            np.asarray(self.rotation, dtype=np.float64).reshape(3, 3)[:, self.forward_axis]
+            * self.forward_sign
+        )
         norm = float(np.linalg.norm(fwd))
         if norm < 1e-9:
             return np.array([0.0, 0.0, 1.0])
@@ -238,7 +254,10 @@ class GameDriver(Protocol):
     #: Short, stable, lowercase identifier used in configuration (e.g. ``"tminterface"``).
     name: str
 
-    capabilities: DriverCapabilities
+    @property
+    def capabilities(self) -> DriverCapabilities:
+        """Capabilities reported by this driver implementation."""
+        ...
 
     def open(self) -> None:
         """Establish the connection to the game. Raises on failure."""
@@ -261,8 +280,12 @@ class GameDriver(Protocol):
         discovering at runtime that their "randomised start" was silently the start line.
         """
 
-    def step(self, action: Action) -> GameFrame:
-        """Apply ``action`` and advance the game by one control tick."""
+    def step(self, action: Action | None) -> GameFrame:
+        """Advance one control interval.
+
+        ``None`` is observation-only mode: advance without changing the game's current
+        inputs. It is used for telemetry recording while a human drives with normal controls.
+        """
 
     def set_speed_ratio(self, ratio: float) -> float:
         """Ask the game to run at ``ratio`` times real time; return the ratio applied."""

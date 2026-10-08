@@ -73,6 +73,7 @@ def make_frame(
     checkpoint_index: int = 0,
     checkpoint_total: int = 0,
     finished: bool = False,
+    respawn_count: int = 0,
     wall_time: float = 0.0,
     **vehicle_kwargs,
 ) -> GameFrame:
@@ -84,6 +85,7 @@ def make_frame(
             checkpoint_index=checkpoint_index,
             checkpoint_total=checkpoint_total,
             finished=finished,
+            respawn_count=respawn_count,
         ),
         wall_time=wall_time,
     )
@@ -101,7 +103,7 @@ class ScriptedTickSource:
                  repeat_last: bool = False):
         self._frames = list(frames)
         self._index = 0
-        self.actions: list[Action] = []
+        self.actions: list[Action | None] = []
         self.ops: list = []
         self.alive = alive
         self._checkpoint_total = checkpoint_total
@@ -136,7 +138,7 @@ class ScriptedTickSource:
         if isinstance(op, SetSpeedOp):
             self._speed_ratio = op.ratio
 
-    def push_action(self, action: Action) -> None:
+    def push_action(self, action: Action | None) -> None:
         self.actions.append(action)
 
     def next_frame(self, timeout: float | None = None) -> GameFrame:

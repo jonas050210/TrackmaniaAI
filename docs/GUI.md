@@ -8,9 +8,13 @@ tracks, replays/ghosts, configuration and diagnostics.
 
 ```bash
 pip install -e ".[gui]"          # fastapi, uvicorn, websockets
-cd gui && npm install && npm run build
+cd gui && npm ci && npm run build
 tmai serve                       # http://localhost:8765
 ```
+
+The frontend uses Vite 8 and requires Node.js `^20.19.0` or `>=22.12.0` (the same range is
+recorded in `gui/package.json`). Route pages and the three.js viewer are loaded on demand so
+the initial dashboard bundle does not download the 3D renderer.
 
 In development you can also run the Vite dev server (`npm run dev` in `gui/`), which proxies
 `/api` (and the WebSocket) to `http://127.0.0.1:8765`.
@@ -49,12 +53,12 @@ before they are joined onto a directory.
 |---|---|
 | **Overview** | Headline stats (runs, models, tracks, best progress), live system resources, recent runs, quick actions. |
 | **Runs** | Every run with step/progress/driver/status; click through to the run detail. |
-| **Run detail** | Metric charts (reward, progress, learner losses, system resources), episodes with end reasons, evaluations, checkpoints, log tail. Auto-refreshes. |
-| **Training** | Start a run from a config preset or a full YAML editor (validated before starting), run options (name, steps, resume), live job log, cancel, job history. |
-| **Evaluate & Benchmark** | Evaluate a checkpoint/run on chosen splits; benchmark several models at once; ranking tables; benchmark report history. |
+| **Run detail** | Metric charts (reward, progress, learner losses, system resources, Training Director), per-track episodes with valid/invalid finish outcomes, evaluations, checkpoints, log tail. Auto-refreshes. |
+| **Training** | Start a run from a config preset or a full YAML editor (validated before starting), opt in to the training-only Training Director or explicitly allow the toy simulated driver, use run options (name, steps, resume), follow logs, cancel, and browse job history. |
+| **Evaluate & Benchmark** | Evaluate checkpoints/runs on chosen splits; benchmark models across paired seed repeats; inspect per-model and head-to-head bootstrap intervals for finish rate, progress, crash rate and win share; browse report history. |
 | **Models** | The model registry: register a checkpoint as a named model, inspect metadata and tags, delete. |
-| **Tracks** | Library table (split, geometry fingerprint) + interactive 3D viewer: centreline, corridor ribbon, curvature colouring, orbit/zoom/pan. |
-| **Replays & Ghosts** | Pick a run and episode; replay the trajectory in 3D with playback; speed/reward profiles; compare against a human demonstration (ghost) station by station. |
+| **Tracks** | Library table (family label, split, geometry fingerprint) + interactive 3D viewer: centreline, corridor ribbon, curvature colouring, orbit/zoom/pan. |
+| **Replays & Ghosts** | Pick a run and episode; replay the trajectory in 3D with playback; inspect speed/reward profiles and sector/failure analytics; compare against a human ghost or another AI replay from the same track, including across runs. |
 | **Configuration** | View and edit the default config YAML with live validation. |
 | **Diagnostics** | Live resources, environment table, paths, doctor report, telemetry calibration (game host only). |
 
@@ -83,6 +87,7 @@ GET  /api/runs/{name}               full run snapshot (metrics, episodes, evals,
 GET  /api/runs/{name}/metrics       downsampled curves (?metrics=a,b&max_points=)
 GET  /api/runs/{name}/log           log tail (?lines=)
 GET  /api/runs/{name}/checkpoints
+GET  /api/runs/{name}/analysis       ?track=&sectors= → sector pace + failure heatmap
 GET  /api/tracks                    library report (+ synthetic list)
 GET  /api/tracks/geometry           ?name= or ?synthetic= → 3D payload
 GET  /api/models                    registry list

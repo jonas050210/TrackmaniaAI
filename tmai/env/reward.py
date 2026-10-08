@@ -37,9 +37,9 @@ The real risk is not a wrong weight but a loophole, so each is closed explicitly
   without penalising genuinely slow cornering.
 * **Off-track shortcuts.** Excursion beyond the corridor is charged per metre per second, so
   cutting across grass costs more the longer it lasts.
-* **Invalid finishes.** The game's own checkpoint counter is authoritative: an episode that
-  reports ``finished`` without collecting the map's checkpoints is flagged by the evaluation
-  layer and never counted as a lap.
+* **Invalid finishes.** The game's own checkpoint counter is authoritative: crossing the
+  finish without collecting every checkpoint ends the episode but earns no finish bonus, is
+  logged as an invalid finish, and is never counted as a completed lap.
 
 Every weight is configuration and every component is returned in :class:`RewardBreakdown`, so
 a long run can be diagnosed from its metrics alone rather than by re-running it.
@@ -91,7 +91,7 @@ class RewardConfig:
 
     # -- episode end ----------------------------------------------------------------
 
-    #: One-off bonus for crossing the finish line.
+    #: One-off bonus for crossing the finish line after collecting every checkpoint.
     finish_bonus: float = 20.0
 
     # -- failure penalties, one-off and terminal -------------------------------------
@@ -224,6 +224,15 @@ class ProgressReward:
         """Reward one control step of duration ``dt`` seconds."""
         cfg = self.config
         vehicle = frame.vehicle
+        # Defend the reward boundary too: callers cannot accidentally pay the finish bonus
+        # for a raw finish flag that skipped a known checkpoint.
+        finished = bool(
+            finished
+            and (
+                frame.race.checkpoint_total <= 0
+                or frame.race.checkpoint_index >= frame.race.checkpoint_total
+            )
+        )
         if dt <= 0:
             raise ValueError(f"dt must be positive, got {dt}")
 

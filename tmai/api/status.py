@@ -55,6 +55,9 @@ HEADLINE_METRICS: tuple[str, ...] = (
     "eval/mean_progress_fraction",
     "eval/finish_rate",
     "heldout/mean_progress_fraction",
+    "director/weakest_score",
+    "director/failure_rate",
+    "director/mean_weight",
     "throughput/env_steps_per_second",
     "buffer/size",
     "learner/temperature",
@@ -71,6 +74,7 @@ METRIC_GROUPS: tuple[tuple[str, str], ...] = (
     ("throughput/", "Throughput"),
     ("normalizer/", "Normalisation"),
     ("curriculum/", "Curriculum"),
+    ("director/", "Training Director"),
     ("system/", "System resources"),
 )
 
@@ -164,6 +168,8 @@ class EpisodeRecord:
     max_speed: float = 0.0
     end_reason: str = ""
     finished: bool = False
+    game_finished: bool = False
+    invalid_finish: bool = False
     race_time: float = 0.0
     track: str = ""
     steps_per_second: float = 0.0
@@ -362,6 +368,8 @@ def run_episodes(run_dir: str | Path, *, limit: int | None = None) -> list[Episo
                 max_speed=float(event.get("max_speed", 0.0)),
                 end_reason=str(event.get("end_reason", "")),
                 finished=bool(event.get("finished", False)),
+                game_finished=bool(event.get("game_finished", event.get("finished", False))),
+                invalid_finish=bool(event.get("invalid_finish", False)),
                 race_time=float(event.get("race_time", 0.0)),
                 track=str(event.get("track", "")),
                 steps_per_second=float(event.get("steps_per_second", 0.0)),

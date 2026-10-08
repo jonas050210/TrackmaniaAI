@@ -11,10 +11,13 @@ On a Windows host with Trackmania + TMInterface:
 
 - [ ] `tmai doctor` reports a connected driver and a non-zero checkpoint count.
 - [ ] `tmai doctor --calibrate` passes all four checks; apply the measured `position_scale`.
-- [ ] Confirm the forward axis. `VehicleState.forward_vector` currently reads rotation
-      column 0. If calibration says otherwise, make the axis configurable rather than
-      hard-coded, and cover it with a test.
+- [x] Make the rotation forward axis/sign configurable and propagate the calibrator's
+      recommendation through telemetry, yaw and track-relative observations.
+- [ ] Confirm the configured forward axis/sign on a real Trackmania session.
 - [ ] Drive the car manually and watch `tmai`'s telemetry agree with what the car is doing.
+- [x] Add a bounded `tmai play` path for a checkpoint or labelled baseline, with live progress,
+      optional replay capture and shutdown cleanup (offline-tested only; live steering remains
+      unverified here).
 - [ ] Confirm `iface.respawn()` restarts an episode usefully. If it does not, switch to
       `ResetStrategy.COMMAND` with the right console command.
 - [ ] Record a human lap with `tmai record-demo` and pretrain from it (`tmai pretrain`) — the
@@ -100,6 +103,9 @@ three.js frontend. See [`GUI.md`](GUI.md) for the full map.
       colouring, trajectory playback with a car marker, checkpoints/start marker.
 - [x] Human-vs-AI: ghost comparison of an AI replay against a recorded human lap
       (`tmai replay compare`, GUI Replays page), station-by-station and per-segment.
+- [x] Sector pace/lateral-position summaries and station-by-lateral failure heatmaps from
+      saved replays (`tmai analyze`, API and Replays GUI). These are descriptive and still
+      need real-game replay data before they can reveal real racing weaknesses.
 - [ ] Live overlay of the agent's observation and reward during a real run (needs the game).
 - [ ] Block-level 3D meshes in the viewer (depends on item 5).
 - [ ] Real-time pacing wrapper over `GameDriver` for a true race against the human.

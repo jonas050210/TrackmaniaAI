@@ -21,10 +21,10 @@ from tmai.env.termination import (
     TerminationTracker,
 )
 from tmai.env.tm_env import EnvConfig, TrackmaniaEnv
-from tmai.game.protocol import Action
+from tmai.game.protocol import Action, RacePhase
 from tmai.game.simulated import SimulatedGameDriver
 from tmai.tracks.centerline import CenterlineTrack
-from tmai.tracks.synthetic import build_synthetic
+from tmai.tracks.synthetic import build_synthetic, oval
 
 
 def build_env(track, config=None, *, throttle=1.0):
@@ -195,6 +195,24 @@ class TestReward:
         assert breakdown.progress_metres == pytest.approx(1.0)
         assert breakdown.total > 0
 
+    def test_forward_progress_reward_remains_positive_across_closed_track_seam(self):
+        track = oval(length=120.0, width=60.0, spacing=1.0)
+        previous = track.project(track.point_at(track.length - 1.0))
+        current = track.project(
+            track.point_at(0.5), hint_s=previous.progress, search_window=3.0
+        )
+        frame = make_frame(position=current.centre, speed_forward=30.0)
+        breakdown = ProgressReward(track).compute(
+            frame=frame,
+            projection=current,
+            prev_progress=previous.progress,
+            finished=False,
+            dt=self.DT,
+        )
+        assert breakdown.raw_progress_metres == pytest.approx(1.5, abs=1e-3)
+        assert breakdown.progress_metres == pytest.approx(1.5, abs=1e-3)
+        assert breakdown.clamped is False
+
     def test_cut_detector_blocks_teleport_scale_jumps(self, straight_track):
         """A jump far beyond what the car can physically cover is not credited."""
         config = RewardConfig(max_speed_for_progress=95.0, cut_margin=1.15)
@@ -268,6 +286,26 @@ class TestReward:
         )
         assert breakdown.finish == pytest.approx(20.0)
         assert breakdown.total > 20.0
+
+    def test_reward_boundary_rejects_incomplete_checkpoint_finish(self, straight_track):
+        fn = ProgressReward(straight_track, RewardConfig(finish_bonus=20.0))
+        position = straight_track.point_at(60.0)
+        frame = make_frame(
+            position=position,
+            speed_forward=10.0,
+            finished=True,
+            checkpoint_index=2,
+            checkpoint_total=5,
+        )
+        breakdown = fn.compute(
+            frame=frame,
+            projection=straight_track.project(position),
+            prev_progress=59.0,
+            finished=True,
+            dt=self.DT,
+        )
+
+        assert breakdown.finish == pytest.approx(0.0)
 
     def test_speed_term_is_bounded(self, straight_track):
         config = RewardConfig(speed_weight=1.0, speed_ref=70.0)
@@ -515,9 +553,31 @@ class TestEnvContract:
         env.reset(seed=0)
         before = env.driver._time
         env.step(np.array([0.0, 1.0, 0.0], dtype=np.float32))
-        # Three control ticks of dt each.
+        # Three simulated driver intervals, each using the simulator's configured dt.
         assert env.driver._time - before == pytest.approx(3 * config.control_dt)
         env.close()
+
+    def test_elapsed_time_uses_game_clock_instead_of_nominal_config(self, straight_track):
+        from tmai.game.simulated import SimulatedDriverConfig
+
+        driver = SimulatedGameDriver(straight_track, SimulatedDriverConfig(dt=0.01))
+        driver.open()
+        env = TrackmaniaEnv(
+            driver,
+            straight_track,
+            EnvConfig(control_dt=0.05, action_repeat=2),
+        )
+        try:
+            _, reset_info = env.reset(seed=0)
+            observation, _, _, _, info = env.step(Action(throttle=0.5))
+            assert info["elapsed_seconds"] == pytest.approx(0.02)
+            progress_index = env.observation_names.index("progress_rate")
+            expected_rate = (
+                info["progress"] - reset_info["progress"]
+            ) / info["elapsed_seconds"] / env.config.observation.scales.progress_delta
+            assert observation[progress_index] == pytest.approx(expected_rate)
+        finally:
+            env.close()
 
     def test_accepts_action_dataclass(self, straight_track):
         env = build_env(straight_track)
@@ -525,6 +585,32 @@ class TestEnvContract:
         obs, *_ = env.step(Action(throttle=1.0))
         assert obs.shape == (env.observation_dim,)
         env.close()
+
+    def test_passive_step_uses_game_input_readback_as_last_action(self, straight_track):
+        from dataclasses import replace
+
+        env = build_env(straight_track, EnvConfig(action_repeat=1))
+        try:
+            env.reset(seed=0)
+            original_step = env.driver.step
+
+            def report_human_input(action):
+                assert action is None
+                frame = original_step(action)
+                vehicle = replace(
+                    frame.vehicle,
+                    input_steer=0.2,
+                    input_gas=0.6,
+                    input_brake=0.0,
+                )
+                return replace(frame, vehicle=vehicle)
+
+            env.driver.step = report_human_input
+            _, _, _, _, info = env.step(None)
+            assert env._last_action == Action(steer=0.2, throttle=0.6)
+            assert info["elapsed_seconds"] > 0
+        finally:
+            env.close()
 
     def test_rejects_wrong_action_size(self, straight_track):
         env = build_env(straight_track)
@@ -570,6 +656,71 @@ class TestEnvContract:
                 break
         assert finished is True
         env.close()
+
+    def test_finish_event_stops_action_repeat_and_bonus_is_not_multiplied(self, straight_track):
+        from dataclasses import replace
+
+        config = EnvConfig(action_repeat=4, reward=RewardConfig(finish_bonus=9.0))
+        env = build_env(straight_track, config)
+        env.reset(seed=0)
+        original_step = env.driver.step
+        calls = 0
+
+        def finish_first_tick(action):
+            nonlocal calls
+            calls += 1
+            frame = original_step(action)
+            race = replace(
+                frame.race,
+                phase=RacePhase.FINISHED,
+                finished=True,
+                checkpoint_index=frame.race.checkpoint_total,
+            )
+            return replace(frame, race=race)
+
+        env.driver.step = finish_first_tick
+        try:
+            _, _, terminated, _, info = env.step(Action(throttle=1.0))
+            assert terminated is True
+            assert calls == 1
+            assert info["reward/finish"] == pytest.approx(9.0)
+        finally:
+            env.close()
+
+    def test_invalid_checkpoint_finish_ends_without_finish_bonus(self, straight_track):
+        from dataclasses import replace
+
+        config = EnvConfig(action_repeat=4, reward=RewardConfig(finish_bonus=9.0))
+        env = build_env(straight_track, config)
+        env.reset(seed=0)
+        original_step = env.driver.step
+        calls = 0
+
+        def skip_checkpoints(action):
+            nonlocal calls
+            calls += 1
+            frame = original_step(action)
+            total = max(1, frame.race.checkpoint_total)
+            race = replace(
+                frame.race,
+                phase=RacePhase.FINISHED,
+                finished=True,
+                checkpoint_index=total - 1,
+                checkpoint_total=total,
+            )
+            return replace(frame, race=race)
+
+        env.driver.step = skip_checkpoints
+        try:
+            _, _, terminated, _, info = env.step(Action(throttle=1.0))
+            assert terminated is True
+            assert calls == 1
+            assert info["finished"] is True  # raw game flag remains available for auditing
+            assert info["valid_finish"] is False
+            assert info["invalid_finish"] is True
+            assert info["reward/finish"] == pytest.approx(0.0)
+        finally:
+            env.close()
 
     def test_describe_is_json_serialisable(self, straight_track):
         import json

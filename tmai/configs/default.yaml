@@ -2,9 +2,12 @@ driver:
   kind: tminterface
   server_name: TMInterface0
   position_scale: 1.0
+  forward_axis: 0
+  forward_sign: 1.0
   speed_ratio: 8.0
-  reset_strategy: respawn
-  reset_command: respawn
+  physics_hz: 100.0
+  reset_strategy: restart
+  reset_command: restart
   settle_ticks: 5
   connect_timeout_s: 20.0
   frame_timeout_s: 30.0
@@ -122,6 +125,13 @@ sac:
 replay:
   capacity: 1000000
   seed: null
+director:
+  enabled: false
+  ema_alpha: 0.25
+  warmup_episodes_per_track: 3
+  focus_strength: 2.0
+  max_weight: 3.0
+  failure_penalty: 0.15
 train:
   total_steps: 2000000
   warmup_steps: 5000

@@ -61,7 +61,12 @@ class TrackView:
     def _build_corridor(self) -> tuple[np.ndarray, np.ndarray]:
         """Left and right corridor edges, each ``(N, 3)``, in that order."""
         points = self.track.points
-        tangents = np.gradient(points, axis=0)
+        if self.track.closed:
+            # Central differences wrap over the seam instead of treating the start/finish
+            # point as an endpoint with a one-sided tangent.
+            tangents = np.roll(points, -1, axis=0) - np.roll(points, 1, axis=0)
+        else:
+            tangents = np.gradient(points, axis=0)
         norms = np.linalg.norm(tangents, axis=1, keepdims=True)
         tangents = tangents / np.maximum(norms, 1e-9)
         # Must match CenterlineTrack.project(): Trackmania's world frame is left-handed with
@@ -87,8 +92,9 @@ class TrackView:
         left, right = self._corridor
         vertices = np.concatenate([left, right], axis=0)
         faces: list[tuple[int, int, int]] = []
-        for i in range(n - 1):
-            a, b, c, d = i, i + 1, n + i + 1, n + i
+        for i in range(n if self.track.closed else n - 1):
+            next_i = (i + 1) % n
+            a, b, c, d = i, next_i, n + next_i, n + i
             faces.append((a, b, c))
             faces.append((a, c, d))
         return vertices, np.asarray(faces, dtype=np.int64)
@@ -108,7 +114,10 @@ class TrackView:
         # Centreline as a polyline for reference.
         offset = len(vertices)
         lines += [f"v {x:.4f} {y:.4f} {z:.4f}" for x, y, z in self.track.points]
-        lines.append("l " + " ".join(str(offset + i + 1) for i in range(self.track.num_points)))
+        polyline = list(range(self.track.num_points))
+        if self.track.closed:
+            polyline.append(0)
+        lines.append("l " + " ".join(str(offset + i + 1) for i in polyline))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         logger.info("wrote track mesh: %s (%d vertices, %d faces)", path, len(vertices), len(faces))
         return path
@@ -121,7 +130,7 @@ class TrackView:
         *,
         frame: GameFrame | None = None,
         projection: TrackProjection | None = None,
-        trajectory: Sequence[np.ndarray] | None = None,
+        trajectory: Sequence[np.ndarray] | np.ndarray | None = None,
         title: str | None = None,
     ) -> Path:
         """Render to a PNG. Safe headless: forces the non-interactive matplotlib backend."""
@@ -136,32 +145,40 @@ class TrackView:
         ax = fig.add_subplot(111, projection="3d")
 
         points = self.track.points
-        ax.plot(points[:, 0], points[:, 2], points[:, 1], color="tab:blue", lw=1.6,
+        line_points = np.vstack([points, points[0]]) if self.track.closed else points
+        ax.plot(line_points[:, 0], line_points[:, 2], line_points[:, 1], color="tab:blue", lw=1.6,
                 label="centreline")
 
         if cfg.show_corridor:
             left, right = self._corridor
             verts = []
-            for i in range(len(points) - 1):
+            for i in range(len(points) if self.track.closed else len(points) - 1):
+                next_i = (i + 1) % len(points)
                 verts.append(
                     [
                         (left[i, 0], left[i, 2], left[i, 1]),
-                        (left[i + 1, 0], left[i + 1, 2], left[i + 1, 1]),
-                        (right[i + 1, 0], right[i + 1, 2], right[i + 1, 1]),
+                        (left[next_i, 0], left[next_i, 2], left[next_i, 1]),
+                        (right[next_i, 0], right[next_i, 2], right[next_i, 1]),
                         (right[i, 0], right[i, 2], right[i, 1]),
                     ]
                 )
             surface = Poly3DCollection(verts, alpha=0.12, facecolor="tab:gray", edgecolor="none")
             ax.add_collection3d(surface)
-            ax.plot(left[:, 0], left[:, 2], left[:, 1], color="tab:red", lw=0.7, label="corridor")
-            ax.plot(right[:, 0], right[:, 2], right[:, 1], color="tab:red", lw=0.7)
+            left_line = np.vstack([left, left[0]]) if self.track.closed else left
+            right_line = np.vstack([right, right[0]]) if self.track.closed else right
+            ax.plot(left_line[:, 0], left_line[:, 2], left_line[:, 1], color="tab:red", lw=0.7,
+                    label="corridor")
+            ax.plot(right_line[:, 0], right_line[:, 2], right_line[:, 1], color="tab:red", lw=0.7)
 
         if cfg.show_curvature:
             curvature = self.track._curvature  # noqa: SLF001 - internal but stable geometry
             scaled = np.clip(curvature / max(np.abs(curvature).max(), 1e-9), -1.0, 1.0)
+            sample_count = len(points) if self.track.closed else len(points) - 1
+            curve_points = points[:sample_count]
             ax.scatter(
-                points[:-1, 0], points[:-1, 2], points[:-1, 1],
-                c=scaled, cmap="coolwarm", s=6, vmin=-1, vmax=1, label="curvature",
+                curve_points[:, 0], curve_points[:, 2], curve_points[:, 1],
+                c=scaled[:sample_count], cmap="coolwarm", s=6, vmin=-1, vmax=1,
+                label="curvature",
             )
 
         if trajectory is not None and cfg.show_trajectory and len(trajectory) > 0:

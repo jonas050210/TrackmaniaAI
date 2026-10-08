@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+
+import numpy as np
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -98,8 +100,8 @@ class GaussianPolicy(nn.Module):
         action_dim: int,
         config: NetworkConfig | None = None,
         *,
-        action_low: Sequence[float] | None = None,
-        action_high: Sequence[float] | None = None,
+        action_low: Sequence[float] | np.ndarray | None = None,
+        action_high: Sequence[float] | np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self.config = config or NetworkConfig()
@@ -113,6 +115,10 @@ class GaussianPolicy(nn.Module):
         )
         if torch.any(high <= low):
             raise ValueError("action_high must be strictly greater than action_low")
+        self.action_low: Tensor
+        self.action_high: Tensor
+        self.action_scale: Tensor
+        self.action_offset: Tensor
         self.register_buffer("action_low", low)
         self.register_buffer("action_high", high)
         self.register_buffer("action_scale", (high - low) / 2.0)
@@ -127,7 +133,10 @@ class GaussianPolicy(nn.Module):
             dropout=self.config.dropout,
         )
         # A slightly optimistic initial policy: zero mean, moderate exploration.
-        nn.init.zeros_(self.trunk[-1].bias)
+        final_layer = self.trunk[-1]
+        if not isinstance(final_layer, nn.Linear):
+            raise TypeError("the actor MLP must end in a Linear layer")
+        nn.init.zeros_(final_layer.bias)
 
     def forward(self, obs: Tensor) -> tuple[Tensor, Tensor]:
         out = self.trunk(obs)
@@ -230,8 +239,8 @@ class ActorCriticNetwork(nn.Module):
         action_dim: int,
         config: NetworkConfig | None = None,
         *,
-        action_low: Sequence[float] | None = None,
-        action_high: Sequence[float] | None = None,
+        action_low: Sequence[float] | np.ndarray | None = None,
+        action_high: Sequence[float] | np.ndarray | None = None,
     ) -> None:
         super().__init__()
         if obs_dim <= 0:
