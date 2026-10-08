@@ -52,24 +52,24 @@ prerequisite.
 `tmai/tracks/library.py` holds many tracks and partitions them into `train`, `validation` and
 `test`.
 
-**Splits are a function of track identity, not of insertion order.** A track's identity is its
-map UID, or — when there is no UID — a SHA-256 hash of its geometry. The split is derived from
-a stable hash of that identity, so:
+**Splits are deterministic and group-aware.** Without family metadata, a track's assignment
+is a stable hash of its map UID, or — when there is no UID — a SHA-256 hash of its geometry.
+For related maps, set the same `metadata.family` string in each centreline JSON (or record
+with `tmai record-track --family "author-pack"`). A family's split is derived from the family
+label, so parameter variants and related layouts stay together instead of leaking across
+train/validation/test. Family labels are case- and whitespace-normalized.
 
-* The assignment is identical across runs, machines and Python versions (it does *not* use
-  `hash()`, which is salted per process).
-* Adding a map to the library never moves another map between splits, so results stay
-  comparable over time.
-* Two recordings of the same line hash identically and are therefore *the same track*.
+* Assignments do not depend on file order, machines, or Python's salted `hash()`.
+* Adding a member to an already assigned family inherits its split.
+* `track.explicit_splits` can pin one family member by filename stem; when loading a directory,
+  that assignment is propagated to the whole family. Conflicting explicit family assignments
+  fail with an actionable error.
+* Exact map duplicates remain deduplicated by track identity.
 
-That last property is the point. The easiest way to publish an inflated generalisation number
-is to record the same map twice, put one copy in `train` and the other in `test`, and report
-the result. The library makes that structurally impossible: a track identity can only ever
-belong to one split, and attempting otherwise raises `TrackLibraryError` rather than quietly
-proceeding.
-
-`track.explicit_splits` pins particular maps to a split by filename stem, which is how an
-operator reserves specific maps for final held-out testing.
+The library **does not guess family similarity from geometry**: a centreline alone cannot
+reliably tell an author pack from two unrelated maps with similar curvature. For strong
+unseen-family results, label related tracks consistently. `tmai list-tracks --json` reports
+family labels and split-group counts so the partition can be audited before training.
 
 ---
 
@@ -192,6 +192,18 @@ Metrics that matter, all in the JSON output and the metrics stream:
 `generalization_gap` is `None` when either side is missing, which is the honest answer rather
 than `0`.
 
+Model benchmarks repeat every model on the same set of evaluation seeds (three by default;
+`tmai benchmark --seed-repeats 1` is available for a quick smoke check). Reports store the
+seed list and approximate percentile 95% bootstrap intervals for finish rate, progress and
+crash rate. The bootstrap resamples explicit family clusters together, or whole tracks when
+no family labels are present, to avoid pretending that related maps or episodes on one map are
+independent. A single cluster falls back to episode-level intervals, and a single observation
+has no interval. Paired head-to-head reports
+also include intervals for model A's tie-adjusted win share and mean progress delta. Seed
+repeats only create different starts when the configured driver supports start randomisation;
+real TMInterface cannot reposition the vehicle, so real-game repeats should be interpreted
+accordingly.
+
 Held-out evaluation runs on a **separate environment** over the validation split, so the
 training episode and the training driver are untouched, and it is wrapped so a failure there
 can never kill a multi-day run.
@@ -213,11 +225,12 @@ width, length, closed flag and provenance metadata. `tmai validate-config` and
 `TrackLibrary.from_directory` both fail loudly on a malformed or empty directory rather than
 proceeding with a partial library.
 
-`tmai list-tracks` prints a geometry fingerprint per map — length, corner count, tightest
-corner radius, straight fraction, corridor width — plus **geometry coverage by split**. That
-last table is the cheap check on whether the held-out maps are even comparable to the training
-maps: a suite that trains on ovals and tests on a technical track is measuring a distribution
-shift, not generalisation.
+`tmai record-track --family "author-pack" --out data/tracks/map.json` can label a newly
+recorded map at capture time. Existing JSON files can carry the same label under `metadata.family`.
+`tmai list-tracks` prints explicit family labels and a geometry fingerprint per map — length,
+corner count, tightest corner radius, straight fraction, corridor width — plus **geometry
+coverage by split**. This is a practical audit for a map suite that trains on ovals and tests on
+a technical track: that measures a distribution shift, not generalisation.
 
 ---
 

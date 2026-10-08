@@ -2,9 +2,12 @@ driver:
   kind: simulated
   server_name: TMInterface0
   position_scale: 1.0
+  forward_axis: 0
+  forward_sign: 1.0
   speed_ratio: 1.0
-  reset_strategy: respawn
-  reset_command: respawn
+  physics_hz: 100.0
+  reset_strategy: restart
+  reset_command: restart
   settle_ticks: 5
   connect_timeout_s: 20.0
   frame_timeout_s: 30.0

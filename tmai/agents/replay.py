@@ -6,12 +6,14 @@ reused many times. A circular buffer of preallocated numpy arrays is the right s
 no per-insert allocation, O(1) add, and a single vectorised gather per minibatch.
 
 Memory is allocated up front because a buffer that grows during a multi-day run turns into a
-fragmentation problem at exactly the wrong moment.
+fragmentation problem at exactly the wrong moment. Inputs are fully validated before the
+cursor advances, so one malformed transition cannot partially corrupt a live slot.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -23,6 +25,41 @@ class ReplayBufferConfig:
     capacity: int = 1_000_000
     #: Seed for reproducible sampling. ``None`` uses fresh entropy.
     seed: int | None = None
+
+
+def _vector(value: Any, *, name: str, expected_dim: int) -> np.ndarray:
+    """Convert one transition field after enforcing its vector shape and finite storage."""
+    try:
+        raw = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a numeric vector with {expected_dim} features") from exc
+    if raw.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional, got shape {raw.shape}")
+    if raw.shape[0] != expected_dim:
+        raise ValueError(
+            f"{name} has {raw.shape[0]} features, buffer expects {expected_dim}"
+        )
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            result = raw.astype(np.float32, copy=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain numeric values") from exc
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must contain only finite float32 values")
+    return result
+
+
+def _flag(value: Any, *, name: str) -> bool:
+    """Accept boolean or explicit 0/1 scalar flags, rejecting ambiguous arrays/values."""
+    array = np.asarray(value)
+    if array.ndim != 0:
+        raise ValueError(f"{name} must be a scalar boolean flag")
+    scalar = array.item()
+    if isinstance(scalar, (bool, np.bool_)):
+        return bool(scalar)
+    if isinstance(scalar, (int, float, np.integer, np.floating)) and scalar in (0, 1):
+        return bool(scalar)
+    raise ValueError(f"{name} must be boolean or 0/1, got {scalar!r}")
 
 
 class ReplayBuffer:
@@ -52,6 +89,7 @@ class ReplayBuffer:
         self._next_observations = np.zeros((capacity, observation_dim), dtype=np.float32)
         self._terminated = np.zeros((capacity,), dtype=np.float32)
         self._truncated = np.zeros((capacity,), dtype=np.float32)
+        self._discount_exponents = np.ones((capacity,), dtype=np.float32)
 
         self._cursor = 0
         self._size = 0
@@ -61,26 +99,45 @@ class ReplayBuffer:
     # -- writing --------------------------------------------------------------------
 
     def add(self, transition: Transition) -> None:
-        obs = np.asarray(transition.observation, dtype=np.float32).reshape(-1)
-        if obs.shape[0] != self.observation_dim:
+        """Validate a complete transition, then atomically add it to the ring."""
+        obs = _vector(
+            transition.observation,
+            name="observation",
+            expected_dim=self.observation_dim,
+        )
+        action = _vector(transition.action, name="action", expected_dim=self.action_dim)
+        next_obs = _vector(
+            transition.next_observation,
+            name="next_observation",
+            expected_dim=self.observation_dim,
+        )
+        try:
+            reward = float(transition.reward)
+            discount_exponent = float(transition.discount_exponent)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("reward and discount_exponent must be numeric scalars") from exc
+        if not np.isfinite(reward) or abs(reward) > np.finfo(np.float32).max:
+            raise ValueError(f"reward must be finite and representable as float32, got {reward}")
+        if (
+            not np.isfinite(discount_exponent)
+            or discount_exponent < 0.0
+            or discount_exponent > np.finfo(np.float32).max
+        ):
             raise ValueError(
-                f"observation has {obs.shape[0]} features, buffer expects {self.observation_dim}"
+                "discount_exponent must be finite, non-negative and representable as float32, "
+                f"got {discount_exponent}"
             )
-        action = np.asarray(transition.action, dtype=np.float32).reshape(-1)
-        if action.shape[0] != self.action_dim:
-            raise ValueError(
-                f"action has {action.shape[0]} features, buffer expects {self.action_dim}"
-            )
+        terminated = _flag(transition.terminated, name="terminated")
+        truncated = _flag(transition.truncated, name="truncated")
 
         i = self._cursor
         self._observations[i] = obs
         self._actions[i] = action
-        self._rewards[i] = np.float32(transition.reward)
-        self._next_observations[i] = np.asarray(
-            transition.next_observation, dtype=np.float32
-        ).reshape(-1)
-        self._terminated[i] = 1.0 if transition.terminated else 0.0
-        self._truncated[i] = 1.0 if transition.truncated else 0.0
+        self._rewards[i] = np.float32(reward)
+        self._next_observations[i] = next_obs
+        self._terminated[i] = float(terminated)
+        self._truncated[i] = float(truncated)
+        self._discount_exponents[i] = np.float32(discount_exponent)
 
         self._cursor = (i + 1) % self.config.capacity
         self._size = min(self._size + 1, self.config.capacity)
@@ -120,6 +177,7 @@ class ReplayBuffer:
             next_observations=self._next_observations[idx],
             terminated=self._terminated[idx],
             truncated=self._truncated[idx],
+            discount_exponents=self._discount_exponents[idx],
         )
 
     def snapshot(self) -> Batch:
@@ -137,6 +195,7 @@ class ReplayBuffer:
                 next_observations=empty((self.observation_dim,)),
                 terminated=empty(()),
                 truncated=empty(()),
+                discount_exponents=empty(()),
             )
         if self._size < self.config.capacity:
             order = np.arange(self._size)
@@ -152,6 +211,7 @@ class ReplayBuffer:
             next_observations=self._next_observations[order],
             terminated=self._terminated[order],
             truncated=self._truncated[order],
+            discount_exponents=self._discount_exponents[order],
         )
 
     def statistics(self) -> dict[str, float]:

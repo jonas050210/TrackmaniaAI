@@ -16,10 +16,21 @@ from typing import Any, Protocol
 
 @dataclass(frozen=True)
 class RespawnOp:
-    """Respawn the car at the last checkpoint (``TMInterface.respawn``)."""
+    """Respawn at the nearest respawnable checkpoint (``TMInterface.respawn``).
+
+    This is not a full-episode reset when the player has passed a checkpoint.
+    """
 
     def execute(self, iface: Any) -> None:
         iface.respawn()
+
+
+@dataclass(frozen=True)
+class RestartRaceOp:
+    """Restart the current race in run mode (``TMInterface.give_up``)."""
+
+    def execute(self, iface: Any) -> None:
+        iface.give_up()
 
 
 @dataclass(frozen=True)
@@ -65,4 +76,11 @@ class _OpProtocol(Protocol):
 #: Any object exposing ``execute(iface)``.
 GameOp = _OpProtocol
 
-__all__ = ["CallableOp", "CommandOp", "GameOp", "RespawnOp", "SetSpeedOp"]
+__all__ = [
+    "CallableOp",
+    "CommandOp",
+    "GameOp",
+    "RespawnOp",
+    "RestartRaceOp",
+    "SetSpeedOp",
+]

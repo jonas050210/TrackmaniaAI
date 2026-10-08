@@ -372,8 +372,16 @@ class TestStartRepositioningIsHonest:
 
         track = straight(length=100.0)
         frames = [
-            make_frame(position=track.point_at(0.0), phase=RacePhase.RUNNING)
-            for _ in range(20)
+            make_frame(position=track.point_at(0.0), race_time=1.0, phase=RacePhase.RUNNING),
+            make_frame(position=track.point_at(0.0), race_time=0.0, phase=RacePhase.GAVE_UP),
+            *[
+                make_frame(
+                    position=track.point_at(0.0),
+                    race_time=0.05 * i,
+                    phase=RacePhase.RUNNING,
+                )
+                for i in range(1, 6)
+            ],
         ]
         env = TrackmaniaEnv(_tminterface_driver(track, frames), track, EnvConfig())
         observation, _ = env.reset()
@@ -388,7 +396,16 @@ def _tminterface_driver(track=None, frames=None):
 
     track = track or straight(length=100.0)
     frames = frames or [
-        make_frame(position=track.point_at(0.0), phase=RacePhase.RUNNING) for _ in range(20)
+        make_frame(position=track.point_at(0.0), race_time=1.0, phase=RacePhase.RUNNING),
+        make_frame(position=track.point_at(0.0), race_time=0.0, phase=RacePhase.GAVE_UP),
+        *[
+            make_frame(
+                position=track.point_at(0.0),
+                race_time=0.05 * i,
+                phase=RacePhase.RUNNING,
+            )
+            for i in range(1, 6)
+        ],
     ]
     return TMInterfaceDriver(ScriptedTickSource(frames, repeat_last=True))
 

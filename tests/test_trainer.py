@@ -11,7 +11,8 @@ from tmai.config import RunConfig
 from tmai.env.termination import TerminationConfig
 from tmai.game.errors import GameConnectionError
 from tmai.runlog import read_manifest, read_metrics
-from tmai.training.checkpoint import latest_checkpoint
+from tmai.training.checkpoint import latest_checkpoint, load_checkpoint
+from tmai.training.director import TrainingDirectorSpec
 from tmai.training.evaluate import EpisodeResult, EvaluationReport, evaluate_policy
 from tmai.training.factory import (
     ConfigError,
@@ -94,10 +95,14 @@ class TestFactory:
 
     def test_tminterface_driver_is_built_without_connecting(self):
         """Building must not touch the game; connecting happens in open()."""
+        from tmai.tracks.centerline import CenterlineTrack
+
         config = RunConfig()
         config.driver.kind = "tminterface"
-        config.track.synthetic = "straight"
-        driver = build_driver(config, build_track(config))
+        recorded_geometry = CenterlineTrack(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]], name="recorded-map"
+        )
+        driver = build_driver(config, recorded_geometry)
         assert driver.name == "tminterface"
         assert driver.is_connected() is False
 
@@ -254,6 +259,146 @@ class TestTrainer:
         # Work must be preserved even when the game is lost.
         assert latest_checkpoint(result.run_dir) is not None
         env.close()
+
+    def test_unexpected_exception_is_checkpointed_then_reraised(self, tmp_path, monkeypatch):
+        config = smoke_config(tmp_path, total_steps=10_000, checkpoint_interval=0)
+        env, learner, buffer, _ = build_all(config)
+        from tmai.runlog import RunLogger
+
+        calls = {"n": 0}
+        real_step = env.step
+
+        def broken_step(action):
+            calls["n"] += 1
+            if calls["n"] > 6:
+                raise ValueError("unexpected synthetic failure")
+            return real_step(action)
+
+        monkeypatch.setattr(env, "step", broken_step)
+        run_dir = tmp_path / "unexpected-run"
+        try:
+            with RunLogger(run_dir, config=config.to_dict()) as logger:
+                trainer = Trainer(config, env, learner, buffer, logger)
+                with pytest.raises(ValueError, match="unexpected synthetic failure"):
+                    trainer.train()
+        finally:
+            env.close()
+
+        checkpoint = latest_checkpoint(run_dir)
+        assert checkpoint is not None
+        payload = load_checkpoint(checkpoint)
+        assert payload["step"] >= 1
+        assert payload["extra"]["note"] == "unexpected_exception"
+
+    def test_training_director_state_is_checkpointed_and_logged(self, tmp_path):
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        config.track.synthetic_suite = [
+            {"name": "straight", "kwargs": {"length": 120.0}},
+            {"name": "oval"},
+            {"name": "s_curve", "kwargs": {"length": 180.0}},
+        ]
+        config.track.split_weights = {"train": 1.0, "validation": 0.0, "test": 0.0}
+        config.multi.random_start_station = False
+        config.multi.start_lateral_std = 0.0
+        config.env.termination.max_steps = 2
+        config.sac.network.hidden_sizes = (8,)
+        config.replay.capacity = 128
+        config.curriculum.enabled = False
+        config.director = TrainingDirectorSpec(
+            enabled=True,
+            ema_alpha=1.0,
+            warmup_episodes_per_track=1,
+            focus_strength=2.0,
+            max_weight=2.5,
+        )
+        config.train.total_steps = 12
+        config.train.warmup_steps = 4
+        config.train.batch_size = 4
+        config.train.eval_interval = 0
+        config.train.eval_episodes = 0
+        config.train.held_out_eval_interval = 0
+        config.train.checkpoint_interval = 4
+        config.train.log_interval = 4
+        config.train.output_dir = str(tmp_path / "director-runs")
+        config.train.run_name = "director-state"
+        result = train_from_config(config)
+
+        checkpoint = latest_checkpoint(result.run_dir)
+        assert checkpoint is not None
+        extra = load_checkpoint(checkpoint)["extra"]
+        state = extra["training_director"]
+        assert sum(track["episodes"] for track in state["tracks"].values()) >= 1
+        assert extra["training_env"]["sampling_weights"]
+        assert "director/failure_rate" in read_metrics(result.run_dir)[0]
+        manifest = read_manifest(result.run_dir)
+        assert manifest["training_director"]["strategy"] == "ema_failure_focused_track_sampling"
+
+        # Disabling the Director on resume must clear priorities restored from its checkpoint.
+        config.director.enabled = False
+        config.train.resume = str(result.run_dir)
+        config.train.output_dir = str(tmp_path / "director-disabled-resume")
+        config.train.total_steps = 16
+        resumed = train_from_config(config)
+        resumed_manifest = read_manifest(resumed.run_dir)
+        assert resumed_manifest["environment"]["multi_track"]["sampling_weights"] == {}
+
+    def test_director_does_not_count_missing_checkpoint_finish_as_success(self, tmp_path):
+        from tmai.replay import ReplayStore
+        from tmai.runlog import RunLogger
+        from tmai.training.director import TrainingDirector
+
+        config = smoke_config(tmp_path)
+        config.train.record_replays = True
+        env, learner, buffer, track = build_all(config)
+        director = TrainingDirector(TrainingDirectorSpec(enabled=True), [track.name])
+        run_dir = tmp_path / "invalid-finish"
+        try:
+            with RunLogger(run_dir, config=config.to_dict()) as logger:
+                trainer = Trainer(config, env, learner, buffer, logger, director=director)
+                env.reset(seed=0)
+                trainer._record_replay_step(
+                    np.zeros(3, dtype=np.float32),
+                    0.0,
+                    {"speed_forward": 0.0, "progress": 0.0, "race_time": 0.0},
+                )
+                trainer._on_episode_end(
+                    1,
+                    {
+                        "track": track.name,
+                        "progress_fraction": 0.6,
+                        "finished": True,
+                        "end_reason": "finished",
+                        "checkpoint_index": 2,
+                        "checkpoint_total": 5,
+                        "track_identity": "geom:fixture",
+                    },
+                )
+
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            episode = next(event for event in events if event["event"] == "episode_end")
+            update = next(
+                event for event in events if event["event"] == "training_director_update"
+            )
+            assert episode["game_finished"] is True
+            assert episode["finished"] is False
+            assert episode["invalid_finish"] is True
+            assert episode["end_reason"] == "invalid_finish"
+            assert update["summary"]["director/failure_rate"] == pytest.approx(1.0)
+            replay_rows = ReplayStore(run_dir / "replays").list()
+            assert len(replay_rows) == 1
+            replay = ReplayStore(run_dir / "replays").load(replay_rows[0]["name"])
+            assert replay.finished is False
+            assert replay.end_reason == "invalid_finish"
+            assert replay.metadata["game_finished"] is True
+            assert replay.metadata["invalid_finish"] is True
+            assert replay.metadata["track_identity"] == "geom:fixture"
+        finally:
+            env.close()
 
     def test_keyboard_interrupt_is_captured(self, tmp_path, monkeypatch):
         config = smoke_config(tmp_path, total_steps=10_000, checkpoint_interval=0)

@@ -27,7 +27,6 @@ which is testable against a scripted tick source.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import queue
 import sys
@@ -78,8 +77,11 @@ class TMInterfaceSessionConfig:
     connect_timeout_s: float = 20.0
     #: How long ``next_frame`` waits for the game to produce a tick before giving up.
     frame_timeout_s: float = 30.0
-    #: Game position units -> metres. Calibrate with ``tmai doctor --measure-units``.
+    #: Game position units -> metres. Calibrate with ``tmai doctor --calibrate``.
     position_scale: float = 1.0
+    #: Calibrated rotation-matrix column and sign for vehicle forward.
+    forward_axis: int = 0
+    forward_sign: float = 1.0
     #: Ticks to skip between publishing frames (thinning a 100 Hz stream).
     publish_every_n_ticks: int = 1
 
@@ -111,10 +113,14 @@ class TMInterfaceSession(TickSource):
         self._frame_available = threading.Condition(self._lock)
         self._latest_frame: Any = None
         self._frame_seq = 0
+        self._consumed_frame_seq = 0
 
         self._ops: queue.Queue[GameOp] = queue.Queue()
-        self._action_slot: queue.Queue[Action] = queue.Queue(maxsize=1)
+        self._action_pending = False
+        self._pending_action: Action | None = None
+        self._control_enabled = False
         self._last_action = Action()
+        self._shutdown_neutralized = threading.Event()
         self._checkpoint_total = 0
 
         self._tick_count = 0
@@ -157,11 +163,11 @@ class TMInterfaceSession(TickSource):
 
             def on_deregistered(self, iface):
                 logger.warning("TMInterface deregistered our client")
-                session._shutdown.set()
+                session._signal_shutdown()
 
             def on_shutdown(self, iface):
                 logger.warning("TMInterface server shut down (game closed?)")
-                session._shutdown.set()
+                session._signal_shutdown()
 
             def on_run_step(self, iface, race_time_ms):
                 session._on_tick(iface, int(race_time_ms))
@@ -172,7 +178,7 @@ class TMInterfaceSession(TickSource):
             def on_client_exception(self, iface, exception):
                 logger.error("tminterface client exception: %s", exception)
                 session._exception = exception
-                session._shutdown.set()
+                session._signal_shutdown()
 
         self._client = _Client()
         self._iface = tm_interface.TMInterface(
@@ -195,11 +201,15 @@ class TMInterfaceSession(TickSource):
         logger.info("registered with TMInterface server '%s'", self.config.server_name)
 
     def stop(self) -> None:
-        """Deregister from the game and stop the worker thread. Safe to call repeatedly."""
-        self._shutdown.set()
-        # Unblock anyone parked in next_frame().
-        with self._frame_available:
-            self._frame_available.notify_all()
+        """Deregister safely, asking the game-thread callback to release all controls first."""
+        was_controlled = self._control_enabled or self._action_pending
+        self._signal_shutdown()
+        # TMInterface calls share one request/response buffer and must stay on its worker
+        # thread. If a callback is parked at a published frame, let it apply neutral input
+        # there before closing the connection. This wait is bounded so shutdown still works
+        # if the game has already stopped producing callbacks.
+        if was_controlled and threading.current_thread() is not self._thread:
+            self._shutdown_neutralized.wait(timeout=min(0.5, self.config.frame_timeout_s))
         iface = self._iface
         if iface is not None:
             try:
@@ -209,29 +219,44 @@ class TMInterfaceSession(TickSource):
         self._iface = None
 
     def request_op(self, op: GameOp) -> None:
+        """Queue a game-thread operation and release a parked tick with neutral input."""
         self._raise_if_dead()
-        self._ops.put(op)
+        with self._frame_available:
+            self._consumed_frame_seq = self._frame_seq
+            self._ops.put(op)
+            # A reset must not carry held throttle/steer through the next race start.
+            self._pending_action = Action()
+            self._action_pending = True
+            self._frame_available.notify_all()
 
-    def push_action(self, action: Action) -> None:
+    def push_action(self, action: Action | None) -> None:
+        """Submit the newest control input, or ``None`` to observe without injection.
+
+        On a published frame the game thread waits for this command before replying to
+        TMInterface, keeping the simulation in lock-step with the policy. A new command
+        replaces any command not yet consumed.
+        """
         self._raise_if_dead()
-        try:
-            self._action_slot.put_nowait(action.clipped())
-        except queue.Full:
-            # The game has not consumed the previous action yet; the newest one wins.
-            with contextlib.suppress(queue.Empty):  # race with the tick thread
-                self._action_slot.get_nowait()
-            self._action_slot.put_nowait(action.clipped())
+        with self._frame_available:
+            # Any frame already published belongs to the preceding control interval.
+            self._consumed_frame_seq = self._frame_seq
+            self._pending_action = None if action is None else action.clipped()
+            self._action_pending = True
+            self._frame_available.notify_all()
 
     def next_frame(self, timeout: float | None = None):
-        """Block until the game publishes a new frame and return it."""
+        """Block until an as-yet-unconsumed game frame is available."""
         deadline = time.monotonic() + (
             timeout if timeout is not None else self.config.frame_timeout_s
         )
         with self._frame_available:
-            seen = self._frame_seq
             while True:
                 self._raise_if_dead()
-                if self._latest_frame is not None and self._frame_seq != seen:
+                if (
+                    self._latest_frame is not None
+                    and self._frame_seq > self._consumed_frame_seq
+                ):
+                    self._consumed_frame_seq = self._frame_seq
                     return self._latest_frame
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -257,24 +282,41 @@ class TMInterfaceSession(TickSource):
         if self._shutdown.is_set():
             raise GameConnectionError("TMInterface session is shut down")
 
+    def _signal_shutdown(self) -> None:
+        self._shutdown.set()
+        with self._frame_available:
+            self._frame_available.notify_all()
+
+    def _neutralize_controls(self, iface: Any) -> None:
+        """Release injected controls from the game callback thread (never from the caller)."""
+        try:
+            self._apply_action(iface, Action())
+        finally:
+            self._last_action = Action()
+            self._control_enabled = False
+            self._shutdown_neutralized.set()
+
     def _on_tick(self, iface: Any, race_time_ms: int) -> None:
         try:
+            if self._shutdown.is_set():
+                self._neutralize_controls(iface)
+                return
             self._tick_count += 1
             self._drain_ops(iface)
+            action_updated = self._apply_pending_action(iface)
+            if self._control_enabled and not action_updated:
+                self._apply_action(iface, self._last_action)
 
-            # Newest action wins; if the learner is slow we hold the previous input rather
-            # than stalling the game (TMInterface parks the simulation while we reply).
-            with contextlib.suppress(queue.Empty):
-                self._last_action = self._action_slot.get_nowait()
-            self._apply_action(iface, self._last_action)
-
-            if self._tick_count % max(1, self.config.publish_every_n_ticks) != 0:
+            publish_every = max(1, int(self.config.publish_every_n_ticks))
+            if self._tick_count % publish_every != 0:
                 return
 
             sim_state = iface.get_simulation_state()
             frame = frame_from_sim_state(
                 sim_state,
                 position_scale=self.config.position_scale,
+                forward_axis=self.config.forward_axis,
+                forward_sign=self.config.forward_sign,
                 race_time_ms=race_time_ms,
                 checkpoint_total=self._checkpoint_total,
                 wall_time=time.monotonic(),
@@ -283,12 +325,53 @@ class TMInterfaceSession(TickSource):
                 self._latest_frame = frame
                 self._frame_seq += 1
                 self._frame_available.notify_all()
+
+            # TMInterface's callback response resumes the simulation. Do not return from a
+            # published control frame until the caller supplies the next action (or requests a
+            # game-thread operation). Otherwise the game can advance many physics ticks while
+            # policy inference is still running, dropping actions and misaligning transitions.
+            with self._frame_available:
+                while not self._action_pending and not self._shutdown.is_set():
+                    self._frame_available.wait(0.1)
+                if self._shutdown.is_set():
+                    self._neutralize_controls(iface)
+                    return
+                action = self._pending_action
+                self._pending_action = None
+                self._action_pending = False
+
+            self._drain_ops(iface)
+            if action is None:
+                self._control_enabled = False
+            else:
+                self._last_action = action
+                self._control_enabled = True
+                self._apply_action(iface, action)
+            # A newer command may have arrived while the queued operation was executing.
+            self._apply_pending_action(iface)
         except Exception as exc:  # noqa: BLE001 - a dead tick loop would hang the game
             self._exception = exc
-            self._shutdown.set()
+            try:
+                self._neutralize_controls(iface)
+            except Exception:  # noqa: BLE001 - preserve the original tick failure
+                logger.error("could not release controls after tick failure", exc_info=True)
+            self._signal_shutdown()
             logger.exception("tick loop failed; ending session")
-            with self._frame_available:
-                self._frame_available.notify_all()
+
+    def _apply_pending_action(self, iface: Any) -> bool:
+        with self._frame_available:
+            if not self._action_pending:
+                return False
+            action = self._pending_action
+            self._pending_action = None
+            self._action_pending = False
+        if action is None:
+            self._control_enabled = False
+        else:
+            self._last_action = action
+            self._control_enabled = True
+            self._apply_action(iface, action)
+        return True
 
     def _drain_ops(self, iface: Any) -> None:
         while True:

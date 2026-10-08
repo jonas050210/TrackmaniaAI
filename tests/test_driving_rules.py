@@ -465,7 +465,7 @@ class TestTelemetryContactMapping:
             has_any_lateral_contact = True
 
         class SimState:
-            flags = 0x2 | 0x80  # SIM_HAS_DYNA | SIM_HAS_PLAYER_INFO
+            flags = 0x2 | 0x8 | 0x80  # DYNA | SIMULATION_WHEELS | PLAYER_INFO
             position = [1.0, 2.0, 3.0]
             velocity = [0.0, 0.0, 10.0]
             rotation_matrix = [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
@@ -533,7 +533,7 @@ class TestTelemetryContactMapping:
             has_any_lateral_contact = False
 
         class SimState:
-            flags = 0x2 | 0x80
+            flags = 0x2 | 0x8 | 0x80  # valid wheel telemetry
             position = [0.0, 0.0, 0.0]
             velocity = [0.0, 0.0, 10.0]
             rotation_matrix = np.eye(3)

@@ -80,9 +80,7 @@ def _write_run(runs_dir: Path, name: str, *, steps: int = 3, episodes: int = 2) 
         }
         for i in range(steps)
     ]
-    (run_dir / "metrics.jsonl").write_text(
-        "\n".join(json.dumps(m) for m in metrics) + "\n", encoding="utf-8"
-    )
+    (run_dir / "metrics.jsonl").write_text("\n".join(json.dumps(m) for m in metrics) + "\n", encoding="utf-8")
     events = [
         {
             "event": "episode_end",
@@ -95,9 +93,7 @@ def _write_run(runs_dir: Path, name: str, *, steps: int = 3, episodes: int = 2) 
         }
         for i in range(episodes)
     ]
-    (run_dir / "events.jsonl").write_text(
-        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
-    )
+    (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
     (run_dir / "run.log").write_text("line one\nline two\nline three\n", encoding="utf-8")
     return run_dir
 
@@ -195,9 +191,7 @@ class TestRuns:
 
     def test_run_log_tail(self, client, server_dir):
         _write_run(server_dir["runs"], "2026-01-01T00-00-00Z_alpha")
-        data = client.get(
-            "/api/runs/2026-01-01T00-00-00Z_alpha/log", params={"lines": 2}
-        ).json()
+        data = client.get("/api/runs/2026-01-01T00-00-00Z_alpha/log", params={"lines": 2}).json()
         assert data["log"] == ["line two", "line three"]
 
     def test_run_checkpoints(self, client, server_dir):
@@ -255,6 +249,18 @@ class TestTracks:
         assert data["report"]["num_tracks"] == 2
         assert set(data["synthetic"]) == {"straight", "oval", "s_curve", "figure_eight"}
 
+    def test_family_metadata_is_visible_in_track_library_api(self, client, server_dir):
+        from tmai.tracks.synthetic import build_synthetic
+
+        track = build_synthetic("oval")
+        track.metadata["family"] = "winter-cup"
+        track.save(server_dir["tracks"] / "family.json")
+        report = client.get("/api/tracks").json()["report"]
+        [entry] = report["tracks"]
+        assert entry["family"] == "winter-cup"
+        assert entry["split_group"] == "family:winter-cup"
+        assert sum(report["families_by_split"].values()) == 1
+
     def test_missing_directory_is_reported_not_raised(self, client):
         data = client.get("/api/tracks", params={"directory": "/nonexistent/dir"}).json()
         assert data["report"] is None
@@ -262,27 +268,27 @@ class TestTracks:
 
     def test_geometry_for_recorded_track(self, client, server_dir):
         _write_track(server_dir["tracks"], "oval")
-        data = client.get(
-            "/api/tracks/geometry", params={"name": "oval"}
-        ).json()
+        data = client.get("/api/tracks/geometry", params={"name": "oval"}).json()
         assert data["name"] == "oval"
+        assert data["closed"] is True
         assert data["length"] > 0
         assert len(data["points"]) == len(data["edges"]["left"])
         assert len(data["curvature"]) == len(data["points"])
         assert "curvature_mean" in data["stats"]
 
     def test_geometry_for_synthetic_track(self, client):
-        data = client.get(
-            "/api/tracks/geometry", params={"synthetic": "straight"}
-        ).json()
+        data = client.get("/api/tracks/geometry", params={"synthetic": "straight"}).json()
         assert data["name"] == "straight"
+        assert data["closed"] is False
         assert data["length"] == pytest.approx(200.0)
+        assert data["points"][-1] == pytest.approx([0.0, 0.0, 200.0])
+        midpoint = len(data["points"]) // 2
+        assert data["edges"]["left"][midpoint][0] < data["points"][midpoint][0]
+        assert data["edges"]["right"][midpoint][0] > data["points"][midpoint][0]
 
     def test_geometry_unknown_track_404(self, client):
         assert client.get("/api/tracks/geometry", params={"name": "nope"}).status_code == 404
-        assert (
-            client.get("/api/tracks/geometry", params={"synthetic": "nope"}).status_code == 404
-        )
+        assert client.get("/api/tracks/geometry", params={"synthetic": "nope"}).status_code == 404
         assert client.get("/api/tracks/geometry").status_code == 400
 
 
@@ -307,9 +313,7 @@ class TestModels:
             action_high=np.array([1.0, 1.0, 1.0]),
             seed=0,
         )
-        return save_checkpoint(
-            server_dir["runs"] / "src", step=step, learner=learner, config={"sac": {}}
-        )
+        return save_checkpoint(server_dir["runs"] / "src", step=step, learner=learner, config={"sac": {}})
 
     def test_register_list_info_delete(self, client, server_dir):
         checkpoint = self._checkpoint(server_dir)
@@ -345,18 +349,14 @@ class TestModels:
             == 400
         )
         assert (
-            client.post(
-                "/api/models/register", json={"name": "x", "checkpoint": "/nope.pt"}
-            ).status_code
+            client.post("/api/models/register", json={"name": "x", "checkpoint": "/nope.pt"}).status_code
             == 400
         )
 
     def test_duplicate_rejected(self, client, server_dir):
         checkpoint = self._checkpoint(server_dir)
         client.post("/api/models/register", json={"name": "dup", "checkpoint": str(checkpoint)})
-        response = client.post(
-            "/api/models/register", json={"name": "dup", "checkpoint": str(checkpoint)}
-        )
+        response = client.post("/api/models/register", json={"name": "dup", "checkpoint": str(checkpoint)})
         assert response.status_code == 400
         assert "already exists" in response.json()["detail"]
 
@@ -430,6 +430,27 @@ class TestReplays:
     def test_detail_missing_is_404(self, client, server_dir):
         name = self._run_with_replays(server_dir)
         assert client.get(f"/api/replays/{name}/nope.json").status_code == 404
+
+    def test_run_analysis_returns_sector_and_heatmap_data(self, client, server_dir):
+        name = self._run_with_replays(server_dir)
+        response = client.get(
+            f"/api/runs/{name}/analysis",
+            params={"track": "straight", "sectors": 4},
+        )
+        assert response.status_code == 200, response.text
+        report = response.json()
+        assert report["track"] == "straight"
+        assert report["num_replays"] == 1
+        assert len(report["sectors"]) == 4
+        assert report["failure_heatmap"]["events_with_location"] == 0
+
+    def test_analysis_rejects_path_like_track_names(self, client, server_dir):
+        name = self._run_with_replays(server_dir)
+        response = client.get(
+            f"/api/runs/{name}/analysis",
+            params={"track": "../../secret", "sectors": 4},
+        )
+        assert response.status_code == 400
 
     def test_compare(self, client, server_dir):
         import numpy as np
@@ -520,6 +541,7 @@ class TestBenchmarks:
         data = client.get("/api/benchmarks").json()
         assert len(data["benchmarks"]) == 1
         assert data["benchmarks"][0]["ranking"] == ["a", "b"]
+        assert data["benchmarks"][0]["seed_repeats"] == 1
 
     def test_empty_benchmarks(self, client):
         assert client.get("/api/benchmarks").json()["benchmarks"] == []
@@ -576,6 +598,29 @@ class TestJobs:
         detail = client.get(f"/api/runs/{run_name}").json()
         assert detail["status"]["step"] >= 200
 
+    def test_simulated_driver_safety_switch_false_overrides_config(self, client, server_dir, tmp_path):
+        """The GUI's off switch must beat a config that otherwise allows the toy driver."""
+        config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
+        assert config.driver.kind == "simulated"
+        assert config.driver.allow_simulated is True
+        config.train.output_dir = str(server_dir["runs"])
+        config_path = tmp_path / "unsafe-default.yaml"
+        config.save(config_path)
+
+        response = client.post(
+            "/api/train",
+            json={
+                "config_path": str(config_path),
+                "allow_simulated_driver": False,
+            },
+        )
+        job = response.json()["job"]
+        finished = _wait_for_job(client, job["id"], timeout=60)
+
+        assert finished["result"]["exit_code"] != 0
+        assert any("Pass --allow-simulated-driver" in line for line in finished["log_tail"])
+        assert finished["result"]["run"] is None
+
     def test_train_job_with_config_yaml_text(self, client, server_dir, tmp_path):
         """The config editor posts YAML text; the server stores it and trains from it."""
         config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
@@ -613,9 +658,7 @@ class TestJobs:
             learner = build_learner(env, config)
         finally:
             env.close()
-        checkpoint = save_checkpoint(
-            tmp_path / "ckpt", step=10, learner=learner, config=config.to_dict()
-        )
+        checkpoint = save_checkpoint(tmp_path / "ckpt", step=10, learner=learner, config=config.to_dict())
         config_path = tmp_path / "eval.yaml"
         config.save(config_path)
 
@@ -650,9 +693,7 @@ class TestJobs:
             learner = build_learner(env, config)
         finally:
             env.close()
-        checkpoint = save_checkpoint(
-            tmp_path / "ckpt", step=10, learner=learner, config=config.to_dict()
-        )
+        checkpoint = save_checkpoint(tmp_path / "ckpt", step=10, learner=learner, config=config.to_dict())
         config_path = tmp_path / "bench.yaml"
         config.save(config_path)
 
@@ -672,9 +713,13 @@ class TestJobs:
         result = finished["result"]
         assert result["ranking"] == ["m1"]
         assert Path(result["path"]).is_file()
+        assert result["report"]["seed_repeats"] == 3
+        assert len(result["report"]["evaluation_seeds"]) == 3
+        assert "confidence_intervals" in result["report"]["models"][0]
         # And the report shows up in the benchmarks listing.
         listing = client.get("/api/benchmarks").json()
-        assert any(b["benchmark"] == "api-bench" for b in listing["benchmarks"])
+        saved = next(b for b in listing["benchmarks"] if b["benchmark"] == "api-bench")
+        assert saved["seed_repeats"] == 3
 
     def test_jobs_are_listed_newest_first(self, client):
         first = client.post("/api/doctor", json={}).json()["job"]

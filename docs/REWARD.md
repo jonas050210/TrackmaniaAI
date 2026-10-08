@@ -97,8 +97,10 @@ segment boundary off-track for the reward but on-track for termination.
 **Exploit:** reach the finish line without collecting the map's checkpoints (a cut, or a bug).
 
 **Closure:** the game's own checkpoint counter is authoritative. An episode that reports
-`finished` with fewer checkpoints than the map defines is flagged `invalid_finish` by the
-evaluation layer and excluded from lap-time statistics. It never counts as a lap.
+`finished` with fewer checkpoints than the map defines is flagged `invalid_finish`, receives
+no finish bonus during training, and is excluded from lap-time statistics. The training event
+and any saved replay preserve the raw game flag and checkpoint counts for audit; it never counts
+as a valid lap.
 
 ### 3.6 Going fast in the wrong direction
 

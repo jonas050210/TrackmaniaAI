@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 import gymnasium as gym
@@ -141,6 +142,11 @@ class MultiTrackEnv(gym.Env):
         self._all_tracks = self.sampler.peek_all()
         #: Permutation state for curriculum-filtered sampling.
         self._filtered_order: list[int] = []
+        #: Optional failure-focused sampling weights supplied by the Training Director.
+        self._sampling_weights: dict[str, float] | None = None
+        #: A weighted block preserves guaranteed coverage while changing long-run frequency.
+        self._weighted_order: list[str] = []
+        self._sampling_draws = 0
 
         # Build one environment up front so the action/observation spaces are real rather
         # than guessed. The track it gets is replaced on the first reset.
@@ -198,7 +204,8 @@ class MultiTrackEnv(gym.Env):
                 "num_tracks": len(self.sampler),
                 "split": self.split,
                 "config": self.multi_config.to_dict(),
-                "draws": self.sampler.draws,
+                "draws": self._sampling_draws if self._sampling_weights is not None else self.sampler.draws,
+                "sampling_weights": dict(self._sampling_weights or {}),
             },
             "current": self._context.as_dict(),
             **self._inner_env.describe(),
@@ -236,6 +243,74 @@ class MultiTrackEnv(gym.Env):
         """Tell the environment the current training step, for curriculum resolution."""
         self._curriculum_step = int(step)
 
+    def set_sampling_weights(self, weights: dict[str, float]) -> None:
+        """Set positive per-track priorities for the next sampling block.
+
+        Unknown tracks are rejected rather than silently applying a training priority to a
+        held-out map. A block is allowed to finish before new weights take effect; every
+        block includes every currently eligible track at least once, then allocates extra
+        visits according to these bounded weights.
+        """
+        available = {track.name for track in self._all_tracks}
+        unknown = set(weights) - available
+        if unknown:
+            raise ValueError(f"sampling weights include unknown tracks: {sorted(unknown)}")
+        validated: dict[str, float] = {}
+        for track in self._all_tracks:
+            value = float(weights.get(track.name, 1.0))
+            if not isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"sampling weight for {track.name!r} must be finite and positive, got {value}"
+                )
+            validated[track.name] = value
+        self._sampling_weights = validated
+
+    def clear_sampling_weights(self) -> None:
+        """Disable adaptive priorities and discard any schedule built from them."""
+        self._sampling_weights = None
+        self._weighted_order.clear()
+        self._sampling_draws = 0
+
+    def state_dict(self) -> dict[str, Any]:
+        """State needed to resume deterministic adaptive track sampling."""
+        return {
+            "version": 1,
+            "track_names": [track.name for track in self._all_tracks],
+            "rng": self._rng.bit_generator.state,
+            "sampler": self.sampler.state_dict(),
+            "curriculum_step": self._curriculum_step,
+            "filtered_order": list(self._filtered_order),
+            "sampling_weights": dict(self._sampling_weights or {}),
+            "weighted_order": list(self._weighted_order),
+            "sampling_draws": self._sampling_draws,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore state produced by :meth:`state_dict`, validating track identity/order."""
+        if int(state.get("version", 0)) != 1:
+            raise ValueError(f"unsupported multi-track state version {state.get('version')!r}")
+        names = [track.name for track in self._all_tracks]
+        if list(state.get("track_names", [])) != names:
+            raise ValueError(
+                "multi-track environment track set/order changed since checkpoint; "
+                f"saved={state.get('track_names')}, current={names}"
+            )
+        rng_state = state.get("rng")
+        if rng_state:
+            self._rng.bit_generator.state = rng_state
+        self.sampler.load_state_dict(state.get("sampler", {}))
+        self._curriculum_step = int(state.get("curriculum_step", 0))
+        self._filtered_order = [int(index) for index in state.get("filtered_order", [])]
+        weights = state.get("sampling_weights") or {}
+        self._sampling_weights = None
+        if weights:
+            self.set_sampling_weights({str(key): float(value) for key, value in weights.items()})
+        weighted_order = [str(name) for name in state.get("weighted_order", [])]
+        if any(name not in names for name in weighted_order):
+            raise ValueError("multi-track checkpoint weighted order includes an unknown track")
+        self._weighted_order = weighted_order
+        self._sampling_draws = max(0, int(state.get("sampling_draws", 0)))
+
     @property
     def curriculum_stage(self) -> int | None:
         if self._curriculum is None:
@@ -266,17 +341,57 @@ class MultiTrackEnv(gym.Env):
             return track
         allowed = self._curriculum_filter()
         if allowed is None:
-            if self.multi_config.sample_tracks:
-                return self.sampler.next()
-            return self.sampler.peek_all()[0]
-        # Curriculum-filtered sampling: a shuffled block permutation over the allowed
-        # tracks only, so every revealed track is still seen regularly.
+            if not self.multi_config.sample_tracks:
+                return self.sampler.peek_all()[0]
+            if self._sampling_weights is not None:
+                return self._weighted_track(self._all_tracks)
+            return self.sampler.next()
+        # Curriculum-filtered sampling: every revealed track remains represented. When the
+        # director is active, additional visits in each block follow the failure-focused
+        # weights while unrevealed and held-out maps remain inaccessible.
         if not self.multi_config.sample_tracks:
             return allowed[0]
+        if self._sampling_weights is not None:
+            return self._weighted_track(allowed)
         if not self._filtered_order:
             self._filtered_order = list(self._rng.permutation(len(allowed)))
         index = self._filtered_order.pop()
         return allowed[index]
+
+    def _weighted_track(self, allowed: list[CenterlineTrack]) -> CenterlineTrack:
+        """Draw from a bounded weighted block with one guaranteed visit per eligible map."""
+        if not allowed:
+            raise RuntimeError("no tracks are eligible for sampling")
+        if not self._weighted_order:
+            count = len(allowed)
+            # Four passes provide a responsive (but non-starving) adaptation window. At
+            # least eight extra visits give a two-map suite useful resolution as well.
+            block_size = max(count * 4, count + 8)
+            sampling_weights = self._sampling_weights or {}
+            weights = np.asarray(
+                [sampling_weights.get(track.name, 1.0) for track in allowed],
+                dtype=np.float64,
+            )
+            probabilities = weights / weights.sum()
+            extra = self._rng.choice(
+                count,
+                size=block_size - count,
+                replace=True,
+                p=probabilities,
+            )
+            names = [track.name for track in allowed]
+            schedule = names + [names[int(index)] for index in extra]
+            self._rng.shuffle(schedule)
+            self._weighted_order = schedule
+        name = self._weighted_order.pop()
+        self._sampling_draws += 1
+        by_name = {track.name: track for track in allowed}
+        # A curriculum stage can shrink while an old schedule is pending. Skip entries that
+        # are no longer eligible and rebuild rather than leaking a hidden map into training.
+        if name not in by_name:
+            self._weighted_order.clear()
+            return self._weighted_track(allowed)
+        return by_name[name]
 
     def reset(
         self,

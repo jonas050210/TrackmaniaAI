@@ -4,10 +4,10 @@ Reinforcement learning that drives the **real** Trackmania game. The agent start
 driving knowledge and learns steering, throttle, braking and drifting from a reward based on
 track progress, with the long-term goal of driving maps it has never seen.
 
-The system is complete end to end: real-game integration, SAC training with temporal
-observations and curriculum learning, human demonstrations and behaviour cloning, evaluation
+The software stack is implemented end to end: a real-game integration path, SAC training with
+temporal observations and curriculum learning, demonstrations and behaviour cloning, evaluation
 and benchmarking, a model registry, replay/ghost analysis, and a **local web command center**
-(GUI) with an interactive 3D track viewer.
+(GUI) with an interactive 3D track viewer. Live Trackmania behavior remains unverified.
 
 ---
 
@@ -16,17 +16,17 @@ and benchmarking, a model registry, replay/ghost analysis, and a **local web com
 | | |
 |---|---|
 | Real Trackmania integration | Implemented against TMInterface's documented API. **Not yet verified on a live game** — it needs a Windows host with Trackmania, which this repository's CI does not have. See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md). |
-| RL environment, reward, termination | Implemented and unit-tested (**746 tests**). Crash/out-of-bounds/fall/wrong-way terminate immediately with distinct penalties; crash detection distinguishes impact, scrape and parking. |
+| RL environment, reward, termination | Implemented and unit-tested (**869 passed, 9 skipped offline in the current full suite**). Crash/out-of-bounds/fall/wrong-way terminate immediately with distinct penalties; crash detection distinguishes impact, scrape and parking. |
 | SAC learner | Implemented from scratch, tested, including a Bellman fixed-point check. |
 | Temporal observations | Frame stacking (`observation.history_length`) with an env-owned stacker; translation invariance holds under stacking. |
 | Multi-track training + generalisation | Implemented and tested: track library, train/validation/test splits, leakage prevention, held-out evaluation. |
 | Curriculum learning | Training-only track reveal by difficulty + episode-length caps; held-out evaluation is never filtered. |
-| Human demonstrations + behaviour cloning | `tmai record-demo` records what the *game* reports the human typed; `tmai pretrain` (or `bc:` in config) warm-starts the policy; resumable checkpoints. |
+| Human demonstrations + behaviour cloning | `tmai record-demo` reads game-reported human inputs by design; `tmai pretrain` (or `bc:` in config) warm-starts the policy. The live human-recording path has not been verified in Trackmania. |
 | Observation normalisation | Implemented as a learner decorator, so replay data stays valid as statistics improve. |
 | Training loop, checkpointing, resume, logging | Implemented and tested end to end, including resource monitoring in the metrics stream. |
-| Replays & ghost analysis | Every training episode can be recorded (`train.record_replays`), replayed, and compared station-by-station against a human ghost. |
-| Evaluation, benchmarking, model registry | Per-track/per-split reports, `tmai benchmark` ranks models under one protocol, `tmai models` manages named self-contained models. |
-| Track model + recording | Implemented; recorded from real telemetry with `tmai record-track`. |
+| Replays & racing analysis | Episodes can be recorded, compared against a human ghost, summarized by sector pace/lateral position, and mapped into a spatial failure heatmap. |
+| Evaluation, benchmarking, model registry | Per-track/per-split reports, paired same-track model comparisons, `baseline:curvature` heuristic, and a self-contained model registry. |
+| Track model + recording | `tmai record-track` is implemented; recording from live Trackmania telemetry has not been verified. |
 | `.Map.Gbx` parsing | **Deliberately not implemented.** Isolated behind an interface with a clear account of what verification it needs. See below. |
 | Simplified 3D track view | Implemented (headless PNG + `.obj` export). |
 | **GUI command center** | **Built.** Local backend (`tmai serve`: FastAPI + WebSocket) + web frontend (React + three.js): overview, runs, training, evaluation & benchmarking, models, tracks (3D), replays & ghosts, configuration, diagnostics. See [`docs/GUI.md`](docs/GUI.md). |
@@ -72,7 +72,7 @@ both on one box.
 ### The GUI frontend
 
 ```bash
-cd gui && npm install && npm run build      # produces gui/dist, served by `tmai serve`
+cd gui && npm ci && npm run build      # requires Node 20.19+ or 22.12+, produces gui/dist
 ```
 
 ---
@@ -106,13 +106,22 @@ This uses the labelled toy model — **not** Trackmania — and exists only to v
 
 ```bash
 tmai train -c tmai/configs/smoke.yaml
-tmai eval  --checkpoint runs/<the-run-it-just-made> --split validation,test
+tmai eval  --checkpoint runs/<the-run-it-just-made> --split train
 ```
 
-`multitrack_smoke.yaml` exercises the whole generalisation path (four tracks, two splits,
-held-out evaluation) in a few seconds. `pipeline_smoke.yaml` exercises curriculum +
-behaviour cloning + replay recording on top. The trainer refuses `driver.kind: simulated`
-unless you pass `--allow-simulated-driver`.
+`multitrack_smoke.yaml` exercises the generalisation path (four synthetic tracks, train and
+validation splits, held-out evaluation) in a few seconds. `pipeline_smoke.yaml` also tests
+curriculum, behavior cloning, and replay recording; it needs a small generated demonstration
+first:
+
+```bash
+tmai record-demo -c tmai/configs/pipeline_smoke.yaml --allow-simulated-driver \
+  --max-steps 400 --out data/demos/smoke.jsonl
+tmai train -c tmai/configs/pipeline_smoke.yaml
+```
+
+That demo is explicitly synthetic test data, **not human driving** and not a Trackmania
+result. The trainer refuses `driver.kind: simulated` unless it is explicitly allowed.
 
 ### 3. Teach it from your own driving (optional)
 
@@ -135,8 +144,28 @@ tmai record-track --out data/tracks/my_map.json --name my_map   # drive one clea
 tmai train -c tmai/configs/default.yaml
 ```
 
-`default.yaml` trains on every centreline in `data/tracks/` with a 70/15/15
-train/validation/test split, and evaluates on the held-out maps every 20 000 steps.
+To put a policy in the driver's seat, configure **only the centreline for the map currently
+loaded in Trackmania** and run `tmai play`. It defaults to 1x game speed, has a finite
+per-episode step cap, prints telemetry, progress and commanded controls, and requests neutral
+controls on Ctrl+C or normal shutdown. Live input delivery/release is not verified here. The
+displayed control values are policy commands, not proof that the game accepted them. Supply a
+saved run/checkpoint to drive the learned policy; omit it to try the clearly labelled,
+untrained curvature-pilot baseline:
+
+```bash
+tmai play --checkpoint runs/<run> \
+  --set track.path=data/tracks/my_map.json --set track.directory=null \
+  --record-replay
+# Baseline only (not a trained AI):
+tmai play -c tmai/configs/default.yaml \
+  --set track.path=data/tracks/my_map.json --set track.directory=null
+```
+
+The real driver cannot identify/switch the map for you: do not run it with a multi-map
+library or a centreline for a different map. `tmai play` refuses multi-track real-game
+libraries rather than silently selecting one. The default config trains on every centreline
+in `data/tracks/` with a 70/15/15 train/validation/test split, and evaluates on the held-out
+maps every 20 000 steps.
 
 ### 5. Inspect, compare, promote what you have
 
@@ -146,9 +175,14 @@ tmai status --run runs/<run>             # live status, metrics, evaluations
 tmai compare runs/<run-a> runs/<run-b>   # side-by-side
 tmai show-track --track data/tracks/my_map.json --out track.png
 tmai replay list --run runs/<run>        # recorded episode replays
+tmai analyze runs/<run> --track data/tracks/my_map.json --json-out sectors.json
+                                          # sector pace + spatial failure heatmap
 tmai models register --name v1 --checkpoint runs/<run>/checkpoint_*.pt
 tmai benchmark --model v1=runs/<run-a> --model v2=runs/<run-b> --split validation,test
+tmai benchmark --model pilot=baseline:curvature --model v1=runs/<run-a> --split validation
 ```
+
+`baseline:curvature` adds an explainable, track-relative heuristic to the same benchmark protocol. It is an evaluation reference only—not a learned model and not validated on a live Windows Trackmania/TMInterface session. Benchmarks also include paired wins/losses/ties for the same track and episode index.
 
 ---
 
@@ -160,11 +194,13 @@ tmai benchmark --model v1=runs/<run-a> --model v2=runs/<run-b> --split validatio
 | `tmai validate-config` | Check a configuration without running anything |
 | `tmai train` | Run training. `--resume`, `--steps`, `--seed`, `--device`, `--set key=value` |
 | `tmai eval` | Evaluate a checkpoint across every track in a split (`--split a,b`): per-track finish rate, progress, lap times, crashes |
+| `tmai play` | Directly drive the one map loaded in Trackmania with a checkpoint or an explicitly labelled curvature heuristic; bounded, interruptible, optionally records a replay |
 | `tmai record-demo` | Record a human-driven lap as a behaviour-cloning demonstration (JSONL) |
 | `tmai pretrain` | Behaviour-clone demonstrations into the policy; saves a resumable checkpoint |
 | `tmai benchmark` | Evaluate several models across splits under one protocol and rank them |
 | `tmai models` | Model registry: `list`, `register`, `info`, `delete`, `tag` |
-| `tmai replay` | Replay analysis: `list`, `show`, `compare` (AI replay vs human ghost) |
+| `tmai replay` | Replay tools: `list`, `show`, `compare` (AI replay vs human ghost) |
+| `tmai analyze` | Sector pace, lateral-position summaries and spatial failure heatmaps from replays |
 | `tmai compare` | Compare several runs side by side (JSON with `--json`) |
 | `tmai status` | Inspect a run: `--run <dir>`, `--list`, or `--json` for a full dashboard snapshot |
 | `tmai list-tracks` | List a track directory with geometry statistics and split assignment |
@@ -182,24 +218,31 @@ Every command accepts `-c config.yaml` and repeatable `--set section.field=value
 Training on one map and testing on that map measures memorisation, not driving. Four
 mechanisms make the distinction enforceable rather than a matter of discipline:
 
-* **Deterministic splits.** A track's split is a function of its identity (map UID, or a hash
-  of its geometry), not of insertion order. Adding a map never moves another map between
-  splits, so results stay comparable across runs.
+* **Deterministic, family-aware splits.** A track's split is a stable function of its identity
+  (map UID, or a hash of its geometry), unless related maps share an explicit `metadata.family`
+  label. Family members stay in one split, preventing near-variant layouts from leaking between
+  train and test. `tmai record-track --family "author-pack"` adds the label at capture time.
 * **Leakage prevention.** A track identity can only ever belong to one split; the same map
-  recorded twice is *the same track* for this purpose.
+  recorded twice is *the same track* for this purpose, and conflicting family splits are
+  rejected.
 * **Multi-track training from step one.** A different track is sampled at every episode reset,
   and the policy never sees track identity or absolute world coordinates. A test translates a
   track by 750 m and asserts the observation is bit-for-bit unchanged.
 * **Curriculum over the training split only.** Early training reveals the easiest tracks
   first and shortens episodes; held-out evaluation always runs the full suite, so a
   curriculum can never flatter the numbers it is measured by.
+* **Training Director (opt-in).** `director.enabled: true` uses a failure-aware coverage EMA to
+  prioritize weak training maps within bounded weights. Every active track keeps a guaranteed
+  share, and held-out evaluation is never sampled or reweighted.
 
 Held-out evaluation runs on a separate environment over the validation split and reports a
 **generalisation gap** (train progress minus held-out progress). A positive gap is overfitting,
 and it is visible in the metrics stream rather than hidden inside a blended average.
 
-`tmai list-tracks` reports geometry coverage per split, which is the cheap check on whether the
-held-out maps are even comparable to the training maps.
+`tmai list-tracks` reports family labels and geometry coverage per split, which helps audit
+that the held-out suite is both family-disjoint and representative of the training maps.
+Benchmarks repeat paired evaluations across seeds and report approximate, cluster-aware 95%
+bootstrap intervals; these are descriptive intervals, not significance tests.
 
 ---
 
@@ -224,21 +267,32 @@ files into JSON for a dashboard, and `tmai serve` exposes the same data to the G
 
 ---
 
-## Tests
+## Checks
+
+Python checks run headlessly without Trackmania or Windows:
 
 ```bash
-pytest                 # 746 tests, no game, no Windows, no display
+pytest -q
 ruff check tmai tests
+mypy tmai
 pytest --cov=tmai --cov-report=term-missing
 ```
 
-The suite deliberately covers what can be covered without the game, including the real
-TMInterface memory layout (tests decode genuine `SimStateData` structs), the driver's control
-logic (tested against a scripted tick source that honours the real contract), the driving
-rules (crash vs scrape vs parking), the temporal stacking invariants, the curriculum, the
-behaviour-cloning fit, replay/ghost comparison, the model registry, benchmarking, resource
-monitoring, and the full GUI backend over HTTP and WebSocket (including a real training
-subprocess started through the API).
+The tests cover what can be validated without the game, including genuine TMInterface
+`SimStateData` decoding, driver control logic against a scripted tick source, crash/contact
+rules, temporal observation stacking, curriculum, behavior cloning, replay/ghost comparison,
+model registry, benchmarking, resource monitoring, and the GUI backend over HTTP and WebSocket
+(including a real training subprocess started through the API). The Python suite does not
+validate timing or behavior against a running Trackmania instance.
+
+Build and audit the GUI with the supported Node version:
+
+```bash
+cd gui
+npm ci
+npm audit
+npm run build
+```
 
 Tests have found real defects rather than rubber-stamping code — see
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md#bugs-the-test-suite-found) for the list.

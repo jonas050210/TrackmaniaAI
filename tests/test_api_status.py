@@ -151,6 +151,29 @@ class TestRunHistory:
         assert history.total_records == 0
         assert history.series == []
 
+    def test_training_director_metrics_are_exposed_and_grouped(self, tmp_path):
+        from tmai.runlog import RunLogger
+
+        with RunLogger(tmp_path, run_name="director-status") as logger:
+            logger.log_metrics(
+                10,
+                {
+                    "director/weakest_score": 0.35,
+                    "director/failure_rate": 0.2,
+                    "director/mean_weight": 1.4,
+                },
+            )
+
+        history = run_history(tmp_path)
+        assert set(history.available["Training Director"]) == {
+            "director/weakest_score",
+            "director/failure_rate",
+            "director/mean_weight",
+        }
+        status = run_status(tmp_path)
+        assert status.latest["director/weakest_score"] == pytest.approx(0.35)
+        assert status.latest["director/failure_rate"] == pytest.approx(0.2)
+
     def test_serialises(self, completed_run):
         json.dumps(run_history(completed_run).as_dict())
 
@@ -179,6 +202,31 @@ class TestRunEpisodes:
 
     def test_serialises(self, completed_run):
         json.dumps([e.as_dict() for e in run_episodes(completed_run)])
+
+    def test_invalid_finish_preserves_raw_game_outcome(self, tmp_path):
+        from tmai.runlog import RunLogger
+
+        with RunLogger(tmp_path, run_name="invalid-finish") as logger:
+            logger.log_event(
+                "episode_end",
+                step=12,
+                episode=1,
+                steps=12,
+                reward=3.0,
+                progress=50.0,
+                end_reason="invalid_finish",
+                finished=False,
+                game_finished=True,
+                invalid_finish=True,
+                race_time=4.0,
+                track="cut-map",
+            )
+
+        [episode] = run_episodes(tmp_path)
+        assert episode.finished is False
+        assert episode.game_finished is True
+        assert episode.invalid_finish is True
+        assert episode.end_reason == "invalid_finish"
 
     def test_missing_directory(self, tmp_path):
         assert run_episodes(tmp_path) == []

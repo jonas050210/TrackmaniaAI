@@ -4,7 +4,8 @@ Sub-commands::
 
     tmai doctor          environment + real-game integration health report
     tmai train           run training
-    tmai eval            evaluate a checkpoint
+    tmai eval            evaluate a checkpoint across configured tracks
+    tmai play            control the currently loaded map with a policy
     tmai record-track    record a track centreline by driving the real map once
     tmai show-track      render the simplified 3D track view to a PNG
     tmai export-obj      export the track mesh for an external viewer
@@ -23,6 +24,8 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from tmai import __version__
 from tmai.api.status import HEADLINE_METRICS
@@ -132,8 +135,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
         rows.append(("torch", torch.__version__, "ok"))
         rows.append(
-            ("cuda available", str(torch.cuda.is_available()),
-             "ok" if torch.cuda.is_available() else "warn")
+            ("cuda available", str(torch.cuda.is_available()), "ok" if torch.cuda.is_available() else "warn")
         )
     else:
         rows.append(("torch", "not installed (needed for training)", "warn"))
@@ -149,14 +151,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         track = None
         try:
             track = build_track(config)
-            game_rows.append(
-                ("track", f"{track.name} ({track.length:.1f} m, {track.num_points} pts)", "ok")
-            )
+            game_rows.append(("track", f"{track.name} ({track.length:.1f} m, {track.num_points} pts)", "ok"))
         except Exception as exc:  # noqa: BLE001 - report and continue
             game_rows.append(("track", str(exc).splitlines()[0], "warn"))
 
         if config.driver.kind != "simulated":
-            driver = build_driver(config, track) if track is not None else None
+            # A configured centreline is the operator's signal that this is a game-host
+            # diagnostics run. The connection itself does not need geometry; pass None so a
+            # synthetic test centreline can never be mistaken for the real map geometry.
+            driver = build_driver(config, None) if track is not None else None
             if driver is None:
                 game_rows.append(("driver", "not built (no track available)", "warn"))
             else:
@@ -172,13 +175,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     game_rows.append(("driver", str(exc).splitlines()[0], "fail"))
                 else:
                     game_rows.append(("driver", f"connected ({driver.name})", "ok"))
-                    game_rows.append(
-                        ("checkpoints on map", str(info.get("checkpoint_total")), "ok")
-                    )
+                    game_rows.append(("checkpoints on map", str(info.get("checkpoint_total")), "ok"))
         else:
-            game_rows.append(
-                ("driver", "simulated (NOT the real game)", "warn")
-            )
+            game_rows.append(("driver", "simulated (NOT the real game)", "warn"))
     except Exception as exc:  # noqa: BLE001 - the whole point is to report failures
         game_rows.append(("driver", str(exc).splitlines()[0], "fail"))
 
@@ -210,9 +209,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
         print(report.format())
         if args.calibrate_out:
-            Path(args.calibrate_out).write_text(
-                json.dumps(report.as_dict(), indent=2), encoding="utf-8"
-            )
+            Path(args.calibrate_out).write_text(json.dumps(report.as_dict(), indent=2), encoding="utf-8")
             print(f"\nwrote {args.calibrate_out}")
         if not report.ok:
             exit_code = 1
@@ -357,16 +354,183 @@ def cmd_eval(args: argparse.Namespace) -> int:
             print(f"  !! {len(invalid)} INVALID finish(es): crossed the line without all checkpoints")
 
     if args.json_out:
-        payload_out = (
-            reports[0].as_dict()
-            if len(reports) == 1
-            else [r.as_dict() for r in reports]
-        )
-        Path(args.json_out).write_text(
-            json.dumps(payload_out, indent=2, default=str), encoding="utf-8"
-        )
+        payload_out = reports[0].as_dict() if len(reports) == 1 else [r.as_dict() for r in reports]
+        Path(args.json_out).write_text(json.dumps(payload_out, indent=2, default=str), encoding="utf-8")
         print(f"\nwrote {args.json_out}")
     return exit_code
+
+
+# -- play ------------------------------------------------------------------------------
+
+
+def cmd_play(args: argparse.Namespace) -> int:
+    """Drive one already-loaded Trackmania map with a learned policy or baseline pilot."""
+    from datetime import datetime, timezone
+
+    from tmai.agents.curvature import CurvaturePilot
+    from tmai.replay import ReplayRecorder, ReplayStore
+    from tmai.training.checkpoint import latest_checkpoint, load_checkpoint
+    from tmai.training.evaluate import EpisodeResult, run_episode
+    from tmai.training.factory import build_driver, build_env, build_learner, build_library
+
+    config = _load_config(args)
+    if not 1 <= args.episodes <= 20:
+        print("--episodes must be between 1 and 20", file=sys.stderr)
+        return 2
+    if args.log_interval < 1:
+        print("--log-interval must be at least 1", file=sys.stderr)
+        return 2
+    if args.stochastic and not args.checkpoint:
+        print("--stochastic only applies when --checkpoint is supplied", file=sys.stderr)
+        return 2
+    if args.replay_dir and not args.record_replay:
+        print("--replay-dir requires --record-replay", file=sys.stderr)
+        return 2
+    if not 0.1 <= args.speed_ratio <= 20.0:
+        print("--speed-ratio must be between 0.1 and 20.0", file=sys.stderr)
+        return 2
+    if args.max_steps is not None and not 1 <= args.max_steps <= 10_000:
+        print("--max-steps must be between 1 and 10000", file=sys.stderr)
+        return 2
+
+    # A direct-drive command is intentionally bounded even if a training config allows a
+    # much longer episode. The explicit hard cap keeps accidental long runs finite.
+    max_steps = min(args.max_steps or config.env.termination.max_steps, 10_000)
+    config.env.termination.max_steps = max_steps
+    config.driver.speed_ratio = args.speed_ratio
+
+    problems = config.validate()
+    if problems:
+        print("invalid configuration:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 2
+
+    checkpoint_path: Path | None = None
+    checkpoint_payload: dict[str, Any] | None = None
+    if args.checkpoint:
+        source = Path(args.checkpoint).expanduser()
+        checkpoint_path = source if source.is_file() else latest_checkpoint(source)
+        if checkpoint_path is None:
+            print(f"no checkpoint found at {source}", file=sys.stderr)
+            return 1
+        checkpoint_payload = load_checkpoint(checkpoint_path)
+
+    # Direct control is always bound to one known centreline. In particular, never silently
+    # select the first entry from a multi-map library for a real TMInterface session.
+    library = build_library(config)
+    if not library.entries:
+        print("the configured track library is empty", file=sys.stderr)
+        return 2
+    if len(library.entries) != 1:
+        print(
+            "tmai play requires exactly one configured track. Set track.path to a single "
+            "centreline (for a real game, it must match the map currently loaded in Trackmania) "
+            "or configure a directory containing only that one track.",
+            file=sys.stderr,
+        )
+        return 2
+    track = library.entries[0].track
+
+    driver = build_driver(config, track)
+    env = build_env(driver, track, config)
+    replay_store: ReplayStore | None = None
+    if args.record_replay:
+        base_dir = Path(args.replay_dir or Path(config.train.output_dir) / "play-replays")
+        session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        replay_store = ReplayStore(base_dir / session_id)
+
+    if checkpoint_payload is not None and checkpoint_path is not None:
+        learner = build_learner(env, config)
+        learner.load_state_dict(checkpoint_payload["learner"])
+        controller_name = f"checkpoint {checkpoint_path} (step {checkpoint_payload.get('step', '?')})"
+    else:
+        learner = CurvaturePilot(
+            config.env.observation,
+            action_dim=int(env.action_space.shape[0]),
+        )
+        controller_name = "CurvaturePilot heuristic (not a trained policy)"
+
+    print(f"\n=== direct drive: {track.name} ===")
+    print(f"controller: {controller_name}")
+    if config.driver.kind.lower() == "simulated":
+        print("SIMULATED DRIVER: this is only an offline pipeline check, not Trackmania.")
+    else:
+        print(
+            f"LIVE GAME INPUT: TMInterface will control the loaded car at {args.speed_ratio:g}x. "
+            "Make sure the loaded map matches the configured centreline. Ctrl+C stops the run; "
+            "shutdown requests neutral controls (live release is unverified)."
+        )
+    print(f"safety cap: {max_steps} environment steps per episode")
+    if replay_store is not None:
+        print(f"replay output: {replay_store.path}")
+
+    try:
+        for episode_index in range(args.episodes):
+            print(f"\nEpisode {episode_index + 1}/{args.episodes}: resetting race...")
+
+            def show_progress(step: int, action: np.ndarray, info: dict[str, Any]) -> None:
+                if step % args.log_interval != 0 and info.get("end_reason") == "running":
+                    return
+                progress = 100.0 * float(info.get("progress_fraction", 0.0))
+                speed_kmh = 3.6 * float(info.get("speed_forward", 0.0))
+                race_time = float(info.get("race_time", 0.0))
+                cp_index = int(info.get("checkpoint_index", 0))
+                cp_total = int(info.get("checkpoint_total", 0))
+                checkpoint_text = f" | CP {cp_index}/{cp_total}" if cp_total > 0 else ""
+                controls = ",".join(f"{float(value):+.2f}" for value in action[:3])
+                print(
+                    f"  {step:>5}/{max_steps} | {progress:6.1f}% | {speed_kmh:5.0f} km/h "
+                    f"| {race_time:6.1f}s | cmd=({controls}) "
+                    f"| {info.get('end_reason', 'running')}{checkpoint_text}"
+                )
+
+            recorder = (
+                ReplayRecorder(decimation=max(1, config.train.replay_decimation))
+                if replay_store is not None
+                else None
+            )
+            result: EpisodeResult = run_episode(
+                env,
+                learner,
+                max_steps=max_steps,
+                deterministic=not args.stochastic,
+                seed=None if config.train.seed is None else config.train.seed + episode_index,
+                track_name=track.name,
+                split="play",
+                replay_recorder=recorder,
+                on_step=show_progress,
+            )
+            status = "FINISHED" if result.finished and not result.invalid_finish else "incomplete"
+            print(
+                f"Episode result: {status}; {result.progress_fraction * 100:.1f}% progress; "
+                f"{result.race_time:.2f}s race time; {result.steps} steps; "
+                f"end reason: {result.end_reason or 'step limit'}"
+            )
+            if result.invalid_finish:
+                print("WARNING: crossed the finish without all checkpoints; lap is invalid.")
+            if recorder is not None and replay_store is not None:
+                replay = recorder.build(
+                    episode=episode_index + 1,
+                    step=result.steps,
+                    track=track.name,
+                    split="play",
+                    end_reason=result.end_reason,
+                    finished=result.finished and not result.invalid_finish,
+                    race_time=result.race_time,
+                    total_reward=result.total_reward,
+                    progress_fraction=result.progress_fraction,
+                    source="play",
+                    metadata={
+                        "controller": controller_name,
+                        "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+                    },
+                )
+                print(f"saved replay: {replay_store.save(replay)}")
+    finally:
+        env.close()
+
+    return 0
 
 
 # -- record-track ----------------------------------------------------------------------
@@ -374,7 +538,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
 def cmd_record_track(args: argparse.Namespace) -> int:
     from tmai.tracks.recording import record_track
-    from tmai.training.factory import build_driver, build_track
+    from tmai.training.factory import build_driver
 
     config = _load_config(args)
     if config.driver.kind == "simulated":
@@ -385,21 +549,25 @@ def cmd_record_track(args: argparse.Namespace) -> int:
         )
         return 2
 
-    driver = build_driver(config, build_track(config) if config.track.path or config.track.synthetic else None)
-    driver.open()
-    print(
-        "\nDrive one clean lap. The centreline is sampled from your telemetry.\n"
-        "Recording stops automatically at the finish line, or press Ctrl-C to stop early.\n"
-    )
-    track = record_track(
-        driver,
-        out_path=args.out,
-        name=args.name,
-        min_spacing=args.min_spacing,
-        corridor_half_width=args.corridor,
-        smoothing_window=args.smoothing,
-    )
-    driver.close()
+    driver = build_driver(config, None)
+    try:
+        driver.open()
+        print(
+            "\nDrive one clean lap using the game's normal keyboard/controller controls. "
+            "Recording observes telemetry without injecting input.\n"
+            "Recording stops automatically at the finish line, or press Ctrl-C to stop early.\n"
+        )
+        track = record_track(
+            driver,
+            out_path=args.out,
+            name=args.name,
+            min_spacing=args.min_spacing,
+            corridor_half_width=args.corridor,
+            smoothing_window=args.smoothing,
+            metadata={"family": args.family} if args.family else None,
+        )
+    finally:
+        driver.close()
     print(f"\nrecorded {track.num_points} points over {track.length:.1f} m -> {args.out}")
     return 0
 
@@ -428,30 +596,57 @@ def cmd_record_demo(args: argparse.Namespace) -> int:
         )
 
     library = build_library(config)
-    track = library.train[0].track if library.train else build_track(config)
+    track = library.train[0] if library.train else build_track(config)
     driver = build_driver(config, track)
-    driver.open()
-    env = build_env(driver, track, config)
     try:
-        print(
-            "\nDrive one clean lap. The demonstration stores what the GAME reports your "
-            "inputs to be\n(SceneVehicleCarState.input_steer/gas/brake), not what the AI "
-            "outputs.\n"
-            "Recording stops at the finish line, at the step cap, or on Ctrl-C.\n"
-        )
-        demo = record_demonstration(
-            env,
-            out_path=args.out,
-            max_steps=args.max_steps,
-            metadata={"track": track.name, "driver": config.driver.kind},
-        )
+        driver.open()
+        env = build_env(driver, track, config)
+        try:
+            simulated_controller = None
+            demo_metadata: dict[str, Any] = {"track": track.name, "driver": config.driver.kind}
+            if config.driver.kind == "simulated":
+                # This opt-in path is only for testing the data/BC pipeline; it is not a human
+                # demonstration and must not be mistaken for real driving data.
+                from tmai.game.protocol import Action
+
+                def simulated_controller(frame):
+                    projection = track.project(frame.vehicle.position)
+                    heading_error = track.heading_error(projection, frame.vehicle.yaw())
+                    steer = float(
+                        np.clip(
+                            -0.16 * projection.lateral_offset - 0.8 * heading_error,
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                    return Action(steer=steer, throttle=0.75)
+
+                demo_metadata["source"] = "simulated_pipeline_test"
+                demo_metadata["not_human_driving"] = True
+            if simulated_controller is None:
+                print(
+                    "\nDrive one clean lap using the game's normal keyboard/controller controls. "
+                    "The recorder observes telemetry without injecting actions.\n"
+                    "Recording stops at the finish line, at the step cap, or on Ctrl-C.\n"
+                )
+            else:
+                print(
+                    "\nSIMULATED PIPELINE TEST: a generated controller will drive the toy model.\n"
+                    "This is not human driving data and says nothing about real Trackmania.\n"
+                    "Recording stops at the finish line, at the step cap, or on Ctrl-C.\n"
+                )
+            demo = record_demonstration(
+                env,
+                out_path=args.out,
+                max_steps=args.max_steps,
+                action_provider=simulated_controller,
+                metadata=demo_metadata,
+            )
+        finally:
+            env.close()
     finally:
-        env.close()
         driver.close()
-    print(
-        f"\nrecorded {len(demo)} steps on {demo.metadata.get('track', track.name)} "
-        f"-> {args.out}"
-    )
+    print(f"\nrecorded {len(demo)} steps on {demo.metadata.get('track', track.name)} -> {args.out}")
     print(f"  end reason : {demo.metadata.get('end_reason', '?')}")
     print(f"  finished   : {demo.metadata.get('finished', False)}")
     print("\nnext: tmai pretrain -c <config> --demo", args.out)
@@ -605,9 +800,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     models: list[tuple[str, str]] = []
     for spec in args.model or []:
         if "=" not in spec:
-            print(
-                f"--model expects label=checkpoint, got {spec!r}", file=sys.stderr
-            )
+            print(f"--model expects label=checkpoint, got {spec!r}", file=sys.stderr)
             return 2
         label, _, target = spec.partition("=")
         models.append((label, target))
@@ -615,11 +808,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         print("benchmark needs at least one --model label=checkpoint", file=sys.stderr)
         return 2
 
-    splits = (
-        [s.strip() for s in args.split.split(",") if s.strip()]
-        if args.split
-        else ["validation", "test"]
-    )
+    splits = [s.strip() for s in args.split.split(",") if s.strip()] if args.split else ["validation", "test"]
     # Only keep splits that exist; an empty split would produce an empty report row.
     from tmai.training.factory import build_library
 
@@ -642,6 +831,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         splits=splits,
         episodes_per_track=args.episodes,
         name=args.name,
+        seed_repeats=args.seed_repeats,
     )
     print(f"\n=== benchmark: {report.name} ===")
     print(report.table())
@@ -667,8 +857,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
         if not rows:
             print(f"no replays in {args.run}")
             return 0
-        print(f"{'episode':>8} {'step':>9} {'track':<20} {'end':<14} {'fin':>4} "
-              f"{'lap':>8} {'reward':>9} {'samples':>8}")
+        print(
+            f"{'episode':>8} {'step':>9} {'track':<20} {'end':<14} {'fin':>4} "
+            f"{'lap':>8} {'reward':>9} {'samples':>8}"
+        )
         print("-" * 88)
         for row in rows:
             lap = "--" if not row["race_time"] else f"{row['race_time']:.2f}s"
@@ -692,12 +884,11 @@ def cmd_replay(args: argparse.Namespace) -> int:
             from tmai.viz.trackview import TrackView, TrackViewConfig
 
             if not args.track:
-                print("--out needs --track <centreline JSON> to draw the corridor",
-                      file=sys.stderr)
+                print("--out needs --track <centreline JSON> to draw the corridor", file=sys.stderr)
                 return 2
             track = CenterlineTrack.load(args.track)
             view = TrackView(track, TrackViewConfig(show_corridor=True, show_curvature=True))
-            view.render(args.out, car_positions=replay.positions)
+            view.render(args.out, trajectory=replay.positions)
             print(f"wrote {args.out}")
         return 0
 
@@ -714,8 +905,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
             from tmai.training.demos import Demonstration
 
             ghost = EpisodeReplay.from_demonstration(Demonstration.load(args.other))
-        track = CenterlineTrack.load(args.track) if args.track else None
-        if track is None:
+        comparison_track = CenterlineTrack.load(args.track) if args.track else None
+        if comparison_track is None:
             # Resolve the track from the replay's own name (recorded library first, then the
             # synthetic suite) so a demonstration ghost can be compared without --track.
             from tmai.tracks.synthetic import SYNTHETIC_TRACKS
@@ -723,17 +914,16 @@ def cmd_replay(args: argparse.Namespace) -> int:
             name = ai.track or ghost.track
             for candidate in (Path("data/tracks") / f"{name}.json", Path("data/tracks") / name):
                 if candidate.is_file():
-                    track = CenterlineTrack.load(candidate)
+                    comparison_track = CenterlineTrack.load(candidate)
                     break
-            if track is None and name in SYNTHETIC_TRACKS:
-                track = SYNTHETIC_TRACKS[name]()
-        comparison = compare_replays(ai, ghost, track=track)
+            if comparison_track is None and name in SYNTHETIC_TRACKS:
+                comparison_track = SYNTHETIC_TRACKS[name]()
+        comparison = compare_replays(ai, ghost, track=comparison_track)
         print(f"AI replay vs ghost on {comparison.track!r}")
         print(f"  {comparison.summary()}")
         print(f"  AI race time    {comparison.ai_race_time:.3f}s (finished={comparison.ai_finished})")
         print(f"  ghost race time {comparison.ghost_race_time:.3f}s (finished={comparison.ghost_finished})")
         if args.out:
-
             Path(args.out).write_text(
                 json.dumps(comparison.as_dict(), indent=2, default=str), encoding="utf-8"
             )
@@ -742,6 +932,72 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     print(f"unknown replay action {args.replay_action!r}", file=sys.stderr)
     return 2
+
+
+# -- racing analysis -------------------------------------------------------------------
+
+
+def cmd_analyze_replays(args: argparse.Namespace) -> int:
+    """Build sector and failure-location summaries from saved episode replays."""
+    from tmai.replay import EpisodeReplay
+    from tmai.tracks.centerline import CenterlineTrack
+    from tmai.training.analysis import analyze_replays
+
+    track = CenterlineTrack.load(args.track)
+    paths: list[Path] = []
+    for source_text in args.sources:
+        source = Path(source_text)
+        replay_dir = source / "replays" if (source / "replays").is_dir() else source
+        if replay_dir.is_dir():
+            paths.extend(sorted(replay_dir.glob("episode_*.json")))
+        elif source.is_file():
+            paths.append(source)
+        else:
+            raise FileNotFoundError(f"replay source not found: {source}")
+
+    if not paths:
+        print("no replay files found", file=sys.stderr)
+        return 1
+
+    replays = [EpisodeReplay.load(path) for path in paths]
+    report = analyze_replays(
+        replays,
+        track,
+        sector_count=args.sectors,
+        lateral_bin_count=args.lateral_bins,
+    )
+    print(
+        f"racing analysis: {report['num_replays']} replay(s), "
+        f"{report['num_samples']} position samples on {track.name!r} ({track.length:.1f} m)"
+    )
+    print(f"{'sector':>8} {'samples':>8} {'speed m/s':>10} {'|lat| m':>9} {'time s':>9} {'failures':>9}")
+    print("-" * 62)
+    for sector in report["sectors"]:
+        label = f"{sector['start_m']:.0f}-{sector['end_m']:.0f}m"
+        speed = sector["mean_speed_mps"]
+        lateral = sector["mean_abs_lateral_m"]
+        duration = sector["mean_sector_time_s"]
+        print(
+            f"{label:>8} {sector['speed_samples']:>8} "
+            f"{speed if speed is not None else float('nan'):>10.2f} "
+            f"{lateral if lateral is not None else float('nan'):>9.2f} "
+            f"{duration if duration is not None else float('nan'):>9.2f} "
+            f"{sector['failure_count']:>9}"
+        )
+    print(f"\nfailure reasons: {report['failure_reasons'] or 'none recorded'}")
+    print(f"slowest sectors (by mean sector time): {report['slowest_sectors'] or 'not enough data'}")
+    heatmap = report["failure_heatmap"]["counts"]
+    locations = report["failure_heatmap"]["events_with_location"]
+    print(f"failure heatmap: {locations} located event(s), columns run left-to-right")
+    print("  station band | " + " ".join(report["failure_heatmap"]["lateral_labels"]))
+    for sector, row in enumerate(heatmap):
+        if any(row):
+            print(f"  {report['sectors'][sector]['start_m']:>6.1f}m      | " + " ".join(map(str, row)))
+    if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"wrote {args.json_out}")
+    return 0
 
 
 # -- serve ------------------------------------------------------------------------------
@@ -928,9 +1184,7 @@ def cmd_list_tracks(args: argparse.Namespace) -> int:
     """List the tracks in a directory with their geometry fingerprint and split."""
     from tmai.tracks.library import TrackLibrary
 
-    library = TrackLibrary.from_directory(
-        args.directory, pattern=args.pattern, recursive=args.recursive
-    )
+    library = TrackLibrary.from_directory(args.directory, pattern=args.pattern, recursive=args.recursive)
     report = library.report()
 
     if args.json:
@@ -938,7 +1192,7 @@ def cmd_list_tracks(args: argparse.Namespace) -> int:
         return 0
 
     header = (
-        f"{'track':<26} {'split':<11} {'length':>8} {'corners':>8} "
+        f"{'track':<26} {'family':<18} {'split':<11} {'length':>8} {'corners':>8} "
         f"{'tightest':>9} {'straight%':>10} {'width':>7}"
     )
     print(header)
@@ -948,8 +1202,9 @@ def cmd_list_tracks(args: argparse.Namespace) -> int:
         radius = stats.get("min_corner_radius")
         radius_text = "straight" if radius is None else f"{radius:.0f}m"
         print(
-            f"{entry['name'][:26]:<26} {entry['split']:<11} "
-            f"{entry['length']:>7.0f}m {stats.get('corner_count', 0):>8} "
+            f"{entry['name'][:26]:<26} {(entry.get('family') or '—')[:18]:<18} "
+            f"{entry['split']:<11} {entry['length']:>7.0f}m "
+            f"{stats.get('corner_count', 0):>8} "
             f"{radius_text:>9} {stats.get('straight_fraction', 0) * 100:>10.0f} "
             f"{stats.get('corridor_mean', 0):>6.1f}m"
         )
@@ -993,7 +1248,7 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
         ]
         print(f"  track source    {sources[0] if sources else '(none)'}")
         print(f"  total steps     {config.train.total_steps}")
-        print(f"  observation dim {config.env.observation.dim}")
+        print(f"  observation dim {config.env.observation.stacked_dim}")
         print(f"  normalisation   {'on' if config.normalize.enabled else 'off'}")
         return 0
 
@@ -1105,8 +1360,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="environment and game-integration health report")
     add_config_args(doctor)
-    doctor.add_argument("--calibrate", action="store_true",
-                        help="drive the game and measure telemetry conventions")
+    doctor.add_argument(
+        "--calibrate", action="store_true", help="drive the game and measure telemetry conventions"
+    )
     doctor.add_argument("--calibrate-steps", type=int, default=300)
     doctor.add_argument("--calibrate-out", help="write the calibration report as JSON")
     doctor.set_defaults(func=cmd_doctor)
@@ -1134,6 +1390,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.set_defaults(func=cmd_eval)
 
+    play = sub.add_parser(
+        "play",
+        help="drive the currently loaded map with a checkpoint or the curvature-pilot baseline",
+    )
+    add_config_args(play)
+    play.add_argument(
+        "--checkpoint",
+        help="checkpoint file or run directory; omit to use the untrained CurvaturePilot baseline",
+    )
+    play.add_argument("--episodes", type=int, default=1, help="number of race attempts (1-20)")
+    play.add_argument(
+        "--stochastic", action="store_true", help="sample actions from a checkpoint policy"
+    )
+    play.add_argument(
+        "--max-steps", type=int, help="per-episode safety cap (default: env.termination.max_steps; max 10000)"
+    )
+    play.add_argument(
+        "--speed-ratio",
+        type=float,
+        default=1.0,
+        help="Trackmania game speed (default 1x; maximum 20x)",
+    )
+    play.add_argument("--log-interval", type=int, default=20, help="print progress every N steps")
+    play.add_argument(
+        "--record-replay", action="store_true", help="save each driven episode for replay analysis"
+    )
+    play.add_argument(
+        "--replay-dir", help="base directory for timestamped replay-session folders"
+    )
+    play.set_defaults(func=cmd_play)
+
     rec = sub.add_parser("record-track", help="record a track centreline from the real game")
     add_config_args(rec)
     rec.add_argument("--out", required=True, help="output JSON path")
@@ -1141,6 +1428,10 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--min-spacing", type=float, default=1.0, help="metres between samples")
     rec.add_argument("--corridor", type=float, default=5.0, help="corridor half width, metres")
     rec.add_argument("--smoothing", type=int, default=5, help="odd moving-average window")
+    rec.add_argument(
+        "--family",
+        help="optional family label shared with related maps to keep them in one data split",
+    )
     rec.set_defaults(func=cmd_record_track)
 
     show = sub.add_parser("show-track", help="render the simplified 3D track view to a PNG")
@@ -1162,8 +1453,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--runs-dir", help="directory to scan with --list")
     status.add_argument("--list", action="store_true", help="list runs in --runs-dir")
     status.add_argument("--json", action="store_true", help="emit the full snapshot as JSON")
-    status.add_argument("--max-points", type=int, default=400,
-                        help="max points per curve with --json")
+    status.add_argument("--max-points", type=int, default=400, help="max points per curve with --json")
     status.set_defaults(func=cmd_status)
 
     tracks = sub.add_parser("list-tracks", help="list tracks with geometry and split assignment")
@@ -1197,8 +1487,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="behaviour-clone demonstrations into the policy, save a resumable checkpoint",
     )
     add_config_args(pre)
-    pre.add_argument("--demo", action="append", required=True,
-                     help="demonstration JSONL file (repeatable)")
+    pre.add_argument("--demo", action="append", required=True, help="demonstration JSONL file (repeatable)")
     pre.add_argument("--out", required=True, help="output checkpoint path, e.g. models/pretrained.pt")
     pre.add_argument("--epochs", type=int, help="override bc.epochs")
     pre.add_argument("--batch-size", type=int, help="override bc.batch_size")
@@ -1220,10 +1509,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluate several models across splits and rank them",
     )
     add_config_args(bench)
-    bench.add_argument("--model", action="append",
-                       help="label=checkpoint (or run directory), repeatable")
+    bench.add_argument(
+        "--model",
+        action="append",
+        help="label=checkpoint, run directory, or baseline:curvature; repeatable",
+    )
     bench.add_argument("--split", help="comma-separated splits (default: validation,test)")
-    bench.add_argument("--episodes", type=int, default=3, help="episodes per track per split")
+    bench.add_argument("--episodes", type=int, default=3, help="episodes per track, split and seed")
+    bench.add_argument(
+        "--seed-repeats",
+        type=int,
+        default=3,
+        help="paired evaluation seeds (1 for a quick smoke benchmark)",
+    )
     bench.add_argument("--name", default="benchmark", help="benchmark name")
     bench.add_argument("--out", help="write the report JSON here")
     bench.set_defaults(func=cmd_benchmark)
@@ -1237,9 +1535,20 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--out", help="write a PNG (show) or JSON (compare) here")
     replay.set_defaults(func=cmd_replay)
 
-    serve = sub.add_parser(
-        "serve", help="start the local GUI backend (API + WebSocket + web frontend)"
+    analysis = sub.add_parser(
+        "analyze",
+        help="analyze replay sectors, pace, lateral position and spatial failure locations",
     )
+    analysis.add_argument("sources", nargs="+", help="replay JSON files or run/replay directories")
+    analysis.add_argument("--track", required=True, help="matching centreline JSON")
+    analysis.add_argument("--sectors", type=int, default=20, help="equal-distance sectors")
+    analysis.add_argument(
+        "--lateral-bins", type=int, default=7, help="odd number of lateral bins for the failure heatmap"
+    )
+    analysis.add_argument("--json-out", help="write the complete report as JSON")
+    analysis.set_defaults(func=cmd_analyze_replays)
+
+    serve = sub.add_parser("serve", help="start the local GUI backend (API + WebSocket + web frontend)")
     serve.add_argument(
         "--host",
         default="0.0.0.0",
@@ -1252,8 +1561,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--models-dir", default="models")
     serve.add_argument("--demos-dir", default="data/demos")
     serve.add_argument("--benchmarks-dir", default="benchmarks")
-    serve.add_argument("--static-dir", default="gui/dist",
-                       help="built frontend directory to serve at /")
+    serve.add_argument("--static-dir", default="gui/dist", help="built frontend directory to serve at /")
     serve.add_argument("--config", help="default config for the GUI's train form")
     serve.add_argument("--no-open", action="store_true", help="do not open a browser")
     serve.set_defaults(func=cmd_serve)

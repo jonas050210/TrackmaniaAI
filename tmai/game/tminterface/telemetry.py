@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # dependency on the (Windows-only) tminterface package.
 SIM_HAS_TIMERS = 0x1
 SIM_HAS_DYNA = 0x2
+SIM_HAS_SIMULATION_WHEELS = 0x8
 SIM_HAS_PLAYER_INFO = 0x80
 
 
@@ -143,6 +144,12 @@ def _wheel_ground_contacts(sim_state: SimStateLike) -> int | None:
     struct without the field yields ``None``, and the caller then falls back to the
     conservative default rather than guessing.
     """
+    # SimStateData always exposes a four-wheel array in its memory layout, even when the
+    # server did not populate that region. Trust it only when the upstream validity flag is
+    # set; otherwise four zero-filled structs falsely look like four airborne wheels.
+    flags = int(getattr(sim_state, "flags", 0))
+    if not flags & SIM_HAS_SIMULATION_WHEELS:
+        return None
     wheels = getattr(sim_state, "simulation_wheels", None)
     if wheels is None:
         return None
@@ -163,6 +170,8 @@ def vehicle_state_from_sim_state(
     sim_state: SimStateLike,
     *,
     position_scale: float = 1.0,
+    forward_axis: int = 0,
+    forward_sign: float = 1.0,
 ) -> VehicleState:
     """Build a :class:`VehicleState` from a TMInterface simulation state.
 
@@ -212,6 +221,8 @@ def vehicle_state_from_sim_state(
         input_steer=_finite(getattr(car_state, "input_steer", 0.0)),
         input_gas=_finite(getattr(car_state, "input_gas", 0.0)),
         input_brake=_finite(getattr(car_state, "input_brake", 0.0)),
+        forward_axis=int(forward_axis),
+        forward_sign=float(forward_sign),
     )
 
 
@@ -266,6 +277,8 @@ def frame_from_sim_state(
     sim_state: SimStateLike,
     *,
     position_scale: float = 1.0,
+    forward_axis: int = 0,
+    forward_sign: float = 1.0,
     race_time_ms: int | None = None,
     checkpoint_total: int = 0,
     wall_time: float = 0.0,
@@ -274,7 +287,12 @@ def frame_from_sim_state(
     from tmai.game.protocol import GameFrame
 
     return GameFrame(
-        vehicle=vehicle_state_from_sim_state(sim_state, position_scale=position_scale),
+        vehicle=vehicle_state_from_sim_state(
+            sim_state,
+            position_scale=position_scale,
+            forward_axis=forward_axis,
+            forward_sign=forward_sign,
+        ),
         race=race_state_from_sim_state(
             sim_state, race_time_ms=race_time_ms, checkpoint_total=checkpoint_total
         ),

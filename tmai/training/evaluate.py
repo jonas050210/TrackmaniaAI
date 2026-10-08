@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,8 @@ class TrackResult:
     track: str
     split: str = ""
     episodes: list[EpisodeResult] = field(default_factory=list)
+    #: Optional family label carried by benchmark track libraries.
+    family: str | None = None
 
     @property
     def num_episodes(self) -> int:
@@ -125,18 +128,14 @@ class TrackResult:
     @property
     def best_race_time(self) -> float | None:
         times = [
-            e.race_time
-            for e in self.episodes
-            if e.finished and not e.invalid_finish and e.race_time > 0
+            e.race_time for e in self.episodes if e.finished and not e.invalid_finish and e.race_time > 0
         ]
         return min(times) if times else None
 
     @property
     def mean_race_time(self) -> float | None:
         times = [
-            e.race_time
-            for e in self.episodes
-            if e.finished and not e.invalid_finish and e.race_time > 0
+            e.race_time for e in self.episodes if e.finished and not e.invalid_finish and e.race_time > 0
         ]
         return float(np.mean(times)) if times else None
 
@@ -177,6 +176,7 @@ class TrackResult:
         best = self.best_race_time
         return {
             "track": self.track,
+            "family": self.family,
             "split": self.split,
             "episodes": self.num_episodes,
             "finish_rate": round(self.finish_rate, 4),
@@ -437,10 +437,12 @@ class EvaluationReport:
                 f"{(f'{best:.2f}s' if best is not None else '--'):>9}"
             )
         lines.append("-" * len(header))
-        lines.append(f"{'TOTAL':<22} {'':<11} {self.finish_rate * 100:>5.0f} "
-                     f"{self.mean_progress_fraction * 100:>6.1f} "
-                     f"{self.consistency * 100:>6.1f} {'':>7} "
-                     f"{self.crash_rate * 100:>7.0f}")
+        lines.append(
+            f"{'TOTAL':<22} {'':<11} {self.finish_rate * 100:>5.0f} "
+            f"{self.mean_progress_fraction * 100:>6.1f} "
+            f"{self.consistency * 100:>6.1f} {'':>7} "
+            f"{self.crash_rate * 100:>7.0f}"
+        )
         return "\n".join(lines)
 
 
@@ -457,12 +459,15 @@ def run_episode(
     track_name: str = "",
     split: str = "",
     replay_recorder: Any | None = None,
+    on_step: Callable[[int, np.ndarray, dict[str, Any]], None] | None = None,
 ) -> EpisodeResult:
     """Run one evaluation episode and summarise it.
 
     Args:
         replay_recorder: an optional :class:`~tmai.replay.ReplayRecorder`; when given, the
             episode's trajectory is recorded for replay/ghost analysis.
+        on_step: optional callback for live progress display or monitoring; receives the
+            one-based step number, the requested action array, and that step's environment info.
     """
     observation, info = env.reset(seed=seed)
     result = EpisodeResult(track=track_name or str(info.get("track", "")))
@@ -509,6 +514,9 @@ def run_episode(
                 result.off_track_events += 1
         was_off_track = off_track
 
+        if on_step is not None:
+            on_step(result.steps, np.asarray(action, dtype=np.float32).reshape(-1).copy(), info)
+
         if terminated or truncated:
             break
 
@@ -553,9 +561,7 @@ def evaluate_policy(
     evaluation goes through :func:`evaluate_tracks`, which reuses this function per track so
     there is exactly one implementation of "run an episode".
     """
-    track = TrackResult(
-        track=track_name or getattr(env.track, "name", "unknown"), split=split
-    )
+    track = TrackResult(track=track_name or getattr(env.track, "name", "unknown"), split=split)
     for i in range(episodes):
         episode_seed = None if seed is None else seed + 1000 + i
         episode = run_episode(
@@ -576,9 +582,7 @@ def evaluate_policy(
             episode.progress_fraction * 100,
             episode.end_reason,
         )
-    return EvaluationReport(
-        tracks=[track], deterministic=deterministic, label=label, step=step
-    )
+    return EvaluationReport(tracks=[track], deterministic=deterministic, label=label, step=step)
 
 
 def evaluate_tracks(
@@ -618,9 +622,7 @@ def evaluate_tracks(
                 deterministic=deterministic,
                 seed=episode_seed,
             )
-            bucket = buckets.setdefault(
-                episode.track, TrackResult(track=episode.track, split="sampled")
-            )
+            bucket = buckets.setdefault(episode.track, TrackResult(track=episode.track, split="sampled"))
             bucket.episodes.append(episode)
         report.tracks = list(buckets.values())
         return report

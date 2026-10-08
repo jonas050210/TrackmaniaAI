@@ -11,6 +11,11 @@ const REWARD_METRICS = ["env/episode_reward", "reward/episode_reward", "env/mean
 const PROGRESS_METRICS = ["env/progress_fraction", "env/episode_progress_fraction"];
 const LEARNER_METRICS = ["sac/critic_loss", "sac/actor_loss", "learner/temperature"];
 const SYSTEM_METRICS = ["system/memory_used_fraction", "system/load1"];
+const DIRECTOR_METRICS = [
+  "director/weakest_score",
+  "director/failure_rate",
+  "director/mean_weight",
+];
 
 function pickSeries(history: { series: Series[] } | null, names: string[]): string[] {
   if (!history) return [];
@@ -66,6 +71,15 @@ export function RunDetail() {
         snapshot?.history ?? null,
         pickSeries(snapshot?.history ?? null, SYSTEM_METRICS),
         ["#34d399", "#fbbf24"]
+      ),
+    [snapshot]
+  );
+  const directorChart = useMemo(
+    () =>
+      toChartSeries(
+        snapshot?.history ?? null,
+        pickSeries(snapshot?.history ?? null, DIRECTOR_METRICS),
+        ["#64d8f5", "#ff878d", "#b8a2ff"]
       ),
     [snapshot]
   );
@@ -133,6 +147,16 @@ export function RunDetail() {
         )}
       </div>
 
+      {directorChart.length > 0 && (
+        <div className="section">
+          <h3>Training Director</h3>
+          <LineChart series={directorChart} title="Adaptive track focus and outcomes" yLabel="score / rate" />
+          <p className="hint" style={{ marginTop: 8 }}>
+            Weak-track sampling stays bounded and only uses training-split outcomes.
+          </p>
+        </div>
+      )}
+
       <div className="grid cols-2">
         <div className="section">
           <h3>Learner</h3>
@@ -163,6 +187,7 @@ export function RunDetail() {
                 <tr>
                   <th>#</th>
                   <th>Step</th>
+                  <th>Track</th>
                   <th>End reason</th>
                   <th>Reward</th>
                   <th>Progress</th>
@@ -173,8 +198,11 @@ export function RunDetail() {
                   <tr key={ep.episode}>
                     <td>{ep.episode}</td>
                     <td>{ep.step}</td>
+                    <td>{String(ep.track ?? "—")}</td>
                     <td>
-                      {ep.end_reason === "finish" ? (
+                      {ep.invalid_finish ? (
+                        <Badge tone="red">invalid finish</Badge>
+                      ) : ep.finished ? (
                         <Badge tone="green">finish</Badge>
                       ) : ep.end_reason === "crash" || ep.end_reason === "out_of_bounds" ? (
                         <Badge tone="red">{ep.end_reason}</Badge>

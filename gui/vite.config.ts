@@ -8,6 +8,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: "0.0.0.0",
+    allowedHosts: [".e2b.app"],
     port: 5173,
     proxy: {
       "/api": {
@@ -20,5 +21,20 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: false,
+    // The lazy-loaded three.js chunk is about 500 KiB minified (~125 KiB gzip); keep a small
+    // headroom above it rather than warning on that known, on-demand viewer dependency.
+    chunkSizeWarningLimit: 520,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: "three",
+              test: /node_modules[\\/]three[\\/]/,
+            },
+          ],
+        },
+      },
+    },
   },
 });

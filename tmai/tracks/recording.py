@@ -22,8 +22,9 @@ Then drive one clean lap. Press Ctrl-C when done; the partial recording is still
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -68,14 +69,20 @@ class CenterlineRecorder:
     def __len__(self) -> int:
         return len(self.points)
 
-    def _smooth(self, pts: np.ndarray) -> np.ndarray:
+    def _smooth(self, pts: np.ndarray, *, closed: bool = False) -> np.ndarray:
         window = int(self.smoothing_window)
         if window <= 1 or len(pts) < window:
             return pts
         if window % 2 == 0:
             raise ValueError(f"smoothing_window must be odd, got {window}")
         pad = window // 2
-        padded = np.concatenate([np.repeat(pts[:1], pad, axis=0), pts, np.repeat(pts[-1:], pad, axis=0)])
+        if closed:
+            padded = np.concatenate([pts[-pad:], pts, pts[:pad]], axis=0)
+        else:
+            padded = np.concatenate(
+                [np.repeat(pts[:1], pad, axis=0), pts, np.repeat(pts[-1:], pad, axis=0)],
+                axis=0,
+            )
         kernel = np.ones(window) / window
         return np.stack([np.convolve(padded[:, i], kernel, mode="valid") for i in range(3)], axis=1)
 
@@ -85,13 +92,17 @@ class CenterlineRecorder:
         name: str,
         uid: str | None = None,
         metadata: dict | None = None,
+        closed: bool = False,
     ) -> CenterlineTrack:
         """Turn the collected points into a :class:`CenterlineTrack`."""
         if len(self.points) < 2:
-            raise ValueError(
-                f"need at least 2 recorded points to build a track, got {len(self.points)}"
-            )
-        pts = self._smooth(np.asarray(self.points, dtype=np.float64))
+            raise ValueError(f"need at least 2 recorded points to build a track, got {len(self.points)}")
+        raw_points = np.asarray(self.points, dtype=np.float64)
+        if closed and len(raw_points) > 2 and float(np.linalg.norm(raw_points[-1] - raw_points[0])) < 1e-3:
+            # Remove a duplicate finish-line sample before circular smoothing so the seam is
+            # treated as a true ring instead of smoothing an artificial zero-length segment.
+            raw_points = raw_points[:-1]
+        pts = self._smooth(raw_points, closed=closed)
         pts = _deduplicate(pts, eps=1e-3)
         if len(pts) < 2:
             raise ValueError("smoothing collapsed the recording to fewer than 2 distinct points")
@@ -107,6 +118,7 @@ class CenterlineRecorder:
             name=name,
             uid=uid,
             corridor_half_width=self.corridor_half_width,
+            closed=closed,
             metadata=meta,
         )
 
@@ -130,13 +142,14 @@ def record_track(
     smoothing_window: int = 5,
     max_points: int = 20000,
     should_stop: Callable[[], bool] | None = None,
-    action_provider: Callable[[GameFrame], Action] | None = None,
+    action_provider: Callable[[GameFrame], Action | None] | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> CenterlineTrack:
-    """Drive the game and record a centreline.
+    """Record a centreline from the car's telemetry.
 
-    The caller drives: ``action_provider`` decides the inputs each frame (a human is
-    expected to be at the wheel, in which case the provider just returns a neutral action
-    and the game ignores it because the player is overriding it).
+    With the real driver, the default ``None`` action leaves game input untouched, so the
+    player can drive with their normal keyboard/controller. Supply an ``action_provider`` to
+    automate a recording (or to drive the simulated test driver).
 
     Args:
         driver: an opened :class:`~tmai.game.protocol.GameDriver`.
@@ -144,7 +157,10 @@ def record_track(
         name: track name.
         max_points: safety cap on the recording length.
         should_stop: polled each frame; return True to stop early (Ctrl-C friendly).
-        action_provider: called each frame with the latest frame. Defaults to no input.
+        action_provider: optional control source. If omitted, advances without injecting an
+            action (human controls remain live on TMInterface).
+        metadata: additional provenance, including an optional shared ``family`` label for
+            related maps that must stay in the same data split.
 
     Returns:
         The recorded :class:`CenterlineTrack`, also saved to ``out_path``.
@@ -154,9 +170,8 @@ def record_track(
         corridor_half_width=corridor_half_width,
         smoothing_window=smoothing_window,
     )
-    provide = action_provider or (lambda frame: Action())
-
     frame = driver.reset()
+    finished = False
     recorder.add_frame(frame)
     logger.info("recording started for track %r; drive one clean lap", name)
 
@@ -165,11 +180,11 @@ def record_track(
             if should_stop is not None and should_stop():
                 logger.info("recording stopped by operator after %d points", len(recorder))
                 break
-            frame = driver.step(provide(frame))
+            action = action_provider(frame) if action_provider is not None else None
+            frame = driver.step(action)
             if frame.race.finished:
-                logger.info(
-                    "finish line reached at %.3fs; recording complete", frame.race.race_time
-                )
+                finished = True
+                logger.info("finish line reached at %.3fs; recording complete", frame.race.race_time)
                 recorder.add_frame(frame)
                 break
             recorder.add_frame(frame)
@@ -179,7 +194,15 @@ def record_track(
     except KeyboardInterrupt:  # pragma: no cover - interactive path
         logger.info("interrupted; saving the %d points recorded so far", len(recorder))
 
-    track = recorder.build_track(name=name, metadata={"race_time_s": frame.race.race_time})
+    track = recorder.build_track(
+        name=name,
+        metadata={
+            **dict(metadata or {}),
+            "race_time_s": frame.race.race_time,
+            "finished_lap": finished,
+        },
+        closed=finished,
+    )
     saved = track.save(out_path)
     logger.info("saved centreline: %d points, %.1f m -> %s", track.num_points, track.length, saved)
     return track

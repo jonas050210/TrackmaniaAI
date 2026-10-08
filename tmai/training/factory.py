@@ -20,7 +20,11 @@ from tmai.agents.replay import ReplayBuffer
 from tmai.config import RunConfig
 from tmai.env.tm_env import TrackmaniaEnv
 from tmai.game.protocol import GameDriver
-from tmai.game.simulated import SIMULATED_DRIVER_BANNER, SimulatedGameDriver
+from tmai.game.simulated import (
+    SIMULATED_DRIVER_BANNER,
+    SimulatedDriverConfig,
+    SimulatedGameDriver,
+)
 from tmai.tracks.centerline import CenterlineTrack
 from tmai.tracks.library import TrackLibrary
 from tmai.tracks.synthetic import build_synthetic
@@ -63,8 +67,16 @@ def build_library(config: RunConfig) -> TrackLibrary:
 
     if spec.synthetic_suite:
         for entry in spec.synthetic_suite:
-            name = entry.get("name") if isinstance(entry, dict) else str(entry)
-            kwargs = entry.get("kwargs", {}) if isinstance(entry, dict) else {}
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                kwargs = entry.get("kwargs", {})
+                if not isinstance(name, str) or not name:
+                    raise ConfigError("each synthetic_suite entry needs a non-empty name")
+                if not isinstance(kwargs, dict):
+                    raise ConfigError(f"synthetic track {name!r} kwargs must be a mapping")
+            else:
+                name = str(entry)
+                kwargs = {}
             track = build_synthetic(name, **kwargs)
             library.add(track)
         logger.warning(
@@ -105,12 +117,22 @@ def build_track(config: RunConfig) -> CenterlineTrack:
     raise ConfigError("the track library is empty")
 
 
-def build_driver(config: RunConfig, track: CenterlineTrack) -> GameDriver:
-    """Instantiate the configured game driver."""
+def build_driver(config: RunConfig, track: CenterlineTrack | None) -> GameDriver:
+    """Instantiate the configured game driver.
+
+    A real driver may be built without geometry for passive track recording. Whenever a track
+    is supplied for driving, synthetic geometry is rejected: the real game cannot be aligned
+    to a toy centreline honestly.
+    """
     spec = config.driver
     kind = spec.kind.lower()
 
     if kind == "tminterface":
+        if track is not None and track.metadata.get("synthetic"):
+            raise ConfigError(
+                "refusing to drive the real game against synthetic track geometry; "
+                "record the centreline for the map currently loaded in Trackmania"
+            )
         from tmai.game.tminterface.driver import build_tminterface_driver
 
         logger.info(
@@ -122,14 +144,21 @@ def build_driver(config: RunConfig, track: CenterlineTrack) -> GameDriver:
             server_name=spec.server_name,
             speed_ratio=spec.speed_ratio,
             position_scale=spec.position_scale,
+            forward_axis=spec.forward_axis,
+            forward_sign=spec.forward_sign,
             reset_strategy=spec.reset_strategy,
             reset_command=spec.reset_command,
             settle_ticks=spec.settle_ticks,
             frame_timeout_s=spec.frame_timeout_s,
             connect_timeout_s=spec.connect_timeout_s,
+            publish_every_n_ticks=max(
+                1, round(config.env.control_dt * spec.physics_hz)
+            ),
         )
 
     if kind == "simulated":
+        if track is None:
+            raise ConfigError("the simulated driver requires track geometry")
         if not spec.allow_simulated:
             raise ConfigError(
                 "driver.kind='simulated' is a toy model, not Trackmania. Refusing to start. "
@@ -137,7 +166,10 @@ def build_driver(config: RunConfig, track: CenterlineTrack) -> GameDriver:
                 "(CLI: --allow-simulated-driver)."
             )
         logger.warning("%s", SIMULATED_DRIVER_BANNER)
-        return SimulatedGameDriver(track)
+        return SimulatedGameDriver(
+            track,
+            SimulatedDriverConfig(dt=config.env.control_dt),
+        )
 
     raise ConfigError(
         f"unknown driver.kind {spec.kind!r}; expected 'tminterface' or 'simulated'"
@@ -153,9 +185,9 @@ def build_learner(env: TrackmaniaEnv, config: RunConfig) -> Learner:
     from tmai.agents.sac import SACLearner
 
     low, high = env.action_space.low, env.action_space.high
-    learner = SACLearner(
+    learner: Learner = SACLearner(
         observation_dim=env.observation_dim,
-        action_dim=int(env.action_space.shape[0]),
+        action_dim=int(env.action_space.low.size),
         config=config.sac,
         action_low=np.asarray(low, dtype=np.float32),
         action_high=np.asarray(high, dtype=np.float32),
@@ -202,7 +234,7 @@ def build_buffer(env: TrackmaniaEnv, config: RunConfig) -> ReplayBuffer:
         replay = replace(replay, seed=config.train.seed + 7000)
     return ReplayBuffer(
         observation_dim=env.observation_dim,
-        action_dim=int(env.action_space.shape[0]),
+        action_dim=int(env.action_space.low.size),
         config=replay,
     )
 
@@ -226,6 +258,12 @@ def build_multi_track_env(
         raise ConfigError(
             f"the {split!r} split is empty (library has {library.counts()}); check "
             "track.split_weights and track.explicit_splits"
+        )
+    if config.driver.kind == "tminterface" and len(library.entries) > 1:
+        raise ConfigError(
+            "the TMInterface driver is bound to the map already loaded in Trackmania and "
+            "cannot switch maps between episodes or splits; use a one-track library per run "
+            "or the simulated driver for multi-track pipeline tests"
         )
     if len(entries) == 1:
         track = entries[0].track

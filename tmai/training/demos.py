@@ -182,6 +182,7 @@ def load_demonstrations(
     Every file must agree with the expected dimensions (when given); a mismatch is a
     configuration error, not data to be silently truncated.
     """
+    paths = list(paths)
     demos = [Demonstration.load(p) for p in paths]
     if not demos:
         raise ValueError("no demonstration files given")
@@ -293,20 +294,16 @@ def record_demonstration(
 
     Args:
         env: a :class:`~tmai.env.tm_env.TrackmaniaEnv` (or the multi-track wrapper). A
-            human is expected to be at the wheel of the real game; ``action_provider``
-            supplies the AI-side inputs (neutral by default -- the game reports what
-            actually happened through the input read-back).
+            human is expected to be at the wheel of the real game.
         out_path: where to write the JSONL dataset.
         max_steps: safety cap on the recording length.
-        action_provider: called each step with the latest frame; defaults to no input.
+        action_provider: optional automated input source. When omitted, ``None`` is passed
+            through so TMInterface leaves the player's keyboard/controller input untouched.
         should_stop: polled each step; return True to stop early (Ctrl-C friendly).
 
     Returns:
         The recorded :class:`Demonstration`, also saved to ``out_path``.
     """
-    from tmai.game.protocol import neutral_action
-
-    provide = action_provider or (lambda frame: neutral_action())
     recorder = DemonstrationRecorder()
 
     observation, info = env.reset()
@@ -320,7 +317,7 @@ def record_demonstration(
             if should_stop is not None and should_stop():
                 logger.info("recording stopped by operator after %d steps", steps)
                 break
-            action = provide(frame)
+            action = action_provider(frame) if action_provider is not None else None
             observation, reward, terminated, truncated, info = env.step(action)
             frame = env.last_frame
             recorder.record_step(observation, frame, reward)

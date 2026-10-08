@@ -114,6 +114,7 @@ class Trainer:
         run_logger: RunLogger,
         held_out_env: Any | None = None,
         curriculum: Any | None = None,
+        director: Any | None = None,
     ) -> None:
         self.config = config
         self.env = env
@@ -127,6 +128,8 @@ class Trainer:
         #: Progressive track/episode curriculum, attached to the training env only.
         self._curriculum = curriculum
         self._last_curriculum_stage = -1
+        #: Failure-focused sampling, wired only to the training environment.
+        self._director = director
         self._episode = 0
         self._best_score = float("-inf")
         self._accumulator = EpisodeAccumulator()
@@ -169,6 +172,8 @@ class Trainer:
         )
         if self._curriculum is not None:
             self.log.update_manifest(curriculum=self._curriculum.describe())
+        if self._director is not None:
+            self.log.update_manifest(training_director=self._director.describe())
 
         observation, info = self._reset_env()
         self.log.log_event(
@@ -176,7 +181,7 @@ class Trainer:
             total_steps=cfg.total_steps,
             start_step=start_step,
             observation_dim=self.env.observation_dim,
-            action_dim=int(np.prod(self.env.action_space.shape)),
+            action_dim=int(self.env.action_space.low.size),
             driver=self.env.driver.name,
         )
 
@@ -192,6 +197,15 @@ class Trainer:
                 action = self._select_action(observation, step)
                 next_observation, reward, terminated, truncated, info = self.env.step(action)
                 self._record_replay_step(action, reward, info)
+                nominal_control_seconds = self.config.env.control_dt * max(
+                    1, self.config.env.action_repeat
+                )
+                elapsed_seconds = float(info.get("elapsed_seconds", 0.0))
+                discount_exponent = (
+                    elapsed_seconds / nominal_control_seconds
+                    if np.isfinite(elapsed_seconds) and elapsed_seconds > 0.0
+                    else 1.0
+                )
                 self.buffer.add(
                     Transition(
                         observation=observation,
@@ -200,8 +214,10 @@ class Trainer:
                         next_observation=next_observation,
                         terminated=bool(terminated),
                         truncated=bool(truncated),
+                        discount_exponent=discount_exponent,
                     )
                 )
+                result.steps = step
 
                 self._accumulator.steps += 1
                 self._accumulator.reward += float(reward)
@@ -245,6 +261,25 @@ class Trainer:
             self.log.log_event("game_error", step=result.steps, error=str(exc))
             result.failure = str(exc)
             self._save(result.steps, note="game_error")
+        except Exception as exc:
+            # Unexpected failures should remain visible to the caller, but not destroy the
+            # last useful learner/director state. Checkpoint failure must never mask the
+            # original traceback.
+            logger.exception("unexpected trainer failure at step %d; saving state", result.steps)
+            try:
+                self.log.log_event(
+                    "trainer_exception",
+                    step=result.steps,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            except Exception:  # noqa: BLE001 - logging must not mask the trainer exception
+                logger.exception("could not write trainer exception event")
+            try:
+                self._save(result.steps, note="unexpected_exception")
+            except Exception:  # noqa: BLE001 - preserve the original exception
+                logger.exception("could not checkpoint after trainer exception")
+            raise
 
         result.wall_seconds = time.monotonic() - started
         result.best_score = 0.0 if self._best_score == float("-inf") else self._best_score
@@ -343,7 +378,15 @@ class Trainer:
             total_reward=round(self._accumulator.reward, 4),
             progress_fraction=float(info.get("progress_fraction", 0.0)),
             source="training",
-            metadata={"episode_steps": self._accumulator.steps},
+            metadata={
+                "episode_steps": self._accumulator.steps,
+                "game_end_reason": str(info.get("game_end_reason", info.get("end_reason", ""))),
+                "game_finished": bool(info.get("game_finished", info.get("finished", False))),
+                "invalid_finish": bool(info.get("invalid_finish", False)),
+                "checkpoint_index": int(info.get("checkpoint_index", 0) or 0),
+                "checkpoint_total": int(info.get("checkpoint_total", 0) or 0),
+                "track_identity": str(info.get("track_identity", "")),
+            },
         )
         path = self._replay_store.save(
             replay, max_replays=max(0, self.config.train.max_replays)
@@ -379,7 +422,60 @@ class Trainer:
     def _on_episode_end(self, step: int, info: dict[str, Any]) -> None:
         self._episode += 1
         elapsed = max(1e-9, time.monotonic() - self._accumulator.started)
-        self._save_replay(step, info)
+        track_name = str(info.get("track", getattr(self.env, "track", None)
+                                 and self.env.track.name or ""))
+        game_finished = bool(info.get("finished", False))
+        checkpoint_total = int(info.get("checkpoint_total", 0) or 0)
+        checkpoint_index = int(info.get("checkpoint_index", 0) or 0)
+        checkpoint_invalid = (
+            game_finished and checkpoint_total > 0 and checkpoint_index < checkpoint_total
+        )
+        invalid_finish = bool(info.get("invalid_finish", checkpoint_invalid))
+        finished = bool(info.get("valid_finish", game_finished and not invalid_finish))
+        game_end_reason = str(info.get("end_reason", ""))
+        end_reason = "invalid_finish" if invalid_finish else game_end_reason
+
+        replay_info = dict(info)
+        replay_info.update(
+            {
+                "end_reason": end_reason,
+                "game_end_reason": game_end_reason,
+                "finished": finished,
+                "game_finished": game_finished,
+                "invalid_finish": invalid_finish,
+                "checkpoint_index": checkpoint_index,
+                "checkpoint_total": checkpoint_total,
+            }
+        )
+        self._save_replay(step, replay_info)
+
+        if self._director is not None:
+            progress_fraction = float(info.get("progress_fraction", 0.0))
+            weights = self._director.observe_episode(
+                track=track_name,
+                progress_fraction=progress_fraction,
+                finished=finished,
+                end_reason=end_reason,
+            )
+            setter = getattr(self.env, "set_sampling_weights", None)
+            if callable(setter):
+                setter(weights)
+            self.log.log_event(
+                "training_director_update",
+                step=step,
+                episode=self._episode,
+                track=track_name,
+                progress_fraction=progress_fraction,
+                end_reason=end_reason,
+                game_end_reason=game_end_reason,
+                finished=finished,
+                game_finished=game_finished,
+                invalid_finish=invalid_finish,
+                checkpoint_index=checkpoint_index,
+                checkpoint_total=checkpoint_total,
+                weights=weights,
+                summary=self._director.summary(),
+            )
         self.log.log_event(
             "episode_end",
             step=step,
@@ -388,20 +484,24 @@ class Trainer:
             reward=round(self._accumulator.reward, 4),
             progress=round(self._accumulator.progress, 2),
             max_speed=round(self._accumulator.max_speed, 2),
-            end_reason=str(info.get("end_reason", "")),
-            finished=bool(info.get("finished", False)),
+            end_reason=end_reason,
+            game_end_reason=game_end_reason,
+            finished=finished,
+            game_finished=game_finished,
+            invalid_finish=invalid_finish,
+            checkpoint_index=checkpoint_index,
+            checkpoint_total=checkpoint_total,
             race_time=float(info.get("race_time", 0.0)),
             steps_per_second=self._accumulator.steps / elapsed,
             driver=str(info.get("driver", "")),
             # Which map this episode ran on. Without it, per-track episode analysis is
             # impossible for a multi-track run, and a bad track looks like a bad policy.
-            track=str(info.get("track", getattr(self.env, "track", None)
-                                 and self.env.track.name or "")),
+            track=track_name,
         )
         logger.info(
             "episode %d ended (%s): %d steps, return %.2f, progress %.1f m",
             self._episode,
-            info.get("end_reason", "?"),
+            end_reason or "?",
             self._accumulator.steps,
             self._accumulator.reward,
             self._accumulator.progress,
@@ -434,6 +534,8 @@ class Trainer:
         record["learner/temperature"] = float(getattr(self.learner, "temperature", 0.0))
         if self._curriculum is not None:
             record["curriculum/stage"] = float(self._curriculum.stage_index_at(step))
+        if self._director is not None:
+            record.update(self._director.summary())
         # Resource usage rides along with the metrics so a dashboard can plot it against
         # reward without a second data source. Stdlib-only; missing counters are skipped.
         from tmai.monitoring import flat_system_metrics
@@ -481,6 +583,7 @@ class Trainer:
                 score=report.score,
                 episode=self._episode,
                 config=self.config.to_dict(),
+                extra=self._checkpoint_extra(note="best_score"),
             )
             self.log.log_event("new_best", step=step, score=round(report.score, 4))
         return report
@@ -520,6 +623,17 @@ class Trainer:
         logger.info("HELD-OUT evaluation at step %d: %s", step, report.summary())
         return report
 
+    def _checkpoint_extra(self, *, note: str | None = None) -> dict[str, Any]:
+        extra: dict[str, Any] = {}
+        if note:
+            extra["note"] = note
+        if self._director is not None:
+            extra["training_director"] = self._director.state_dict()
+        state_getter = getattr(self.env, "state_dict", None)
+        if callable(state_getter):
+            extra["training_env"] = state_getter()
+        return extra
+
     def _save(self, step: int, *, note: str | None = None) -> None:
         save_checkpoint(
             self.log.run_dir,
@@ -529,7 +643,7 @@ class Trainer:
             buffer_size=len(self.buffer),
             config=self.config.to_dict(),
             best_score=None if self._best_score == float("-inf") else self._best_score,
-            extra={"note": note} if note else None,
+            extra=self._checkpoint_extra(note=note),
             keep=self.config.train.keep_checkpoints,
         )
 
@@ -542,6 +656,19 @@ class Trainer:
         payload = load_checkpoint(path)
         self.learner.load_state_dict(payload["learner"])
         restore_rng(payload)
+        extra = payload.get("extra", {})
+        if self._director is not None and "training_director" in extra:
+            self._director.load_state_dict(extra["training_director"])
+        state_loader = getattr(self.env, "load_state_dict", None)
+        if callable(state_loader) and "training_env" in extra:
+            state_loader(extra["training_env"])
+        setter = getattr(self.env, "set_sampling_weights", None)
+        if self._director is not None and callable(setter):
+            setter(self._director.weights())
+        elif self._director is None:
+            clearer = getattr(self.env, "clear_sampling_weights", None)
+            if callable(clearer):
+                clearer()
         self._episode = int(payload.get("episode", 0))
         self._best_score = float(payload.get("best_score") or float("-inf"))
         step = int(payload.get("step", 0))
@@ -565,7 +692,9 @@ class Trainer:
 def train_from_config(config: RunConfig) -> TrainerResult:
     """Build everything from ``config`` and run training. The ``tmai train`` entry point."""
     from tmai.training.curriculum import Curriculum
+    from tmai.training.director import TrainingDirector
     from tmai.training.factory import (
+        ConfigError,
         build_buffer,
         build_learner,
         build_library,
@@ -575,6 +704,12 @@ def train_from_config(config: RunConfig) -> TrainerResult:
     config.validate_or_raise()
 
     library = build_library(config)
+    if config.driver.kind == "tminterface" and len(library.entries) > 1:
+        raise ConfigError(
+            "the real TMInterface runtime currently supports one already-loaded map per run; "
+            "it cannot switch or hold out multiple maps automatically. Use a one-map library, "
+            "or use the explicitly simulated driver for multi-track tests."
+        )
     env = build_multi_track_env(config, library, split="train", seed=config.train.seed)
     learner = build_learner(env, config)
     buffer = build_buffer(env, config)
@@ -596,6 +731,21 @@ def train_from_config(config: RunConfig) -> TrainerResult:
             len(entries),
             curriculum.difficulty_order(),
         )
+
+    # Adaptive track priorities are constructed exclusively from the training split. The
+    # held-out environment below never receives the director or its weights.
+    director = None
+    if config.director.enabled:
+        train_entries = library.by_split("train")
+        director = TrainingDirector(config.director, [entry.name for entry in train_entries])
+        weight_setter = getattr(env, "set_sampling_weights", None)
+        if callable(weight_setter):
+            weight_setter(director.weights())
+        else:
+            logger.info(
+                "Training Director is recording outcomes, but adaptive track sampling has no "
+                "effect with a single training track"
+            )
 
     # A held-out environment is built only when there is something to hold out and the run
     # asked for it. Building one unconditionally would open game connections for nothing.
@@ -645,7 +795,7 @@ def train_from_config(config: RunConfig) -> TrainerResult:
 
         trainer = Trainer(
             config, env, learner, buffer, run_logger,
-            held_out_env=held_out_env, curriculum=curriculum,
+            held_out_env=held_out_env, curriculum=curriculum, director=director,
         )
         try:
             return trainer.train()

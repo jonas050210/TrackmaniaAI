@@ -99,6 +99,21 @@ class TestReplayBuffer:
         assert batch.terminated[0] == 0.0
         assert batch.truncated[0] == 1.0
 
+    def test_elapsed_time_discount_exponent_roundtrips(self):
+        buffer = ReplayBuffer(4, 3, ReplayBufferConfig(capacity=10, seed=0))
+        transition = make_transition(0)
+        transition.discount_exponent = 0.25
+        buffer.add(transition)
+        assert buffer.snapshot().discount_exponents.tolist() == pytest.approx([0.25])
+        assert buffer.sample(1).discount_exponents[0] == pytest.approx(0.25)
+
+    def test_invalid_discount_exponent_rejected(self):
+        buffer = ReplayBuffer(4, 3, ReplayBufferConfig(capacity=10, seed=0))
+        transition = make_transition(0)
+        transition.discount_exponent = float("nan")
+        with pytest.raises(ValueError, match="discount_exponent"):
+            buffer.add(transition)
+
     def test_sampling_is_seeded(self):
         def fill():
             buffer = ReplayBuffer(4, 3, ReplayBufferConfig(capacity=100, seed=1234))
@@ -129,6 +144,36 @@ class TestReplayBuffer:
         buffer = ReplayBuffer(4, 3, ReplayBufferConfig(capacity=10, seed=0))
         with pytest.raises(ValueError, match="features"):
             buffer.add(make_transition(0, action_dim=2))
+
+    def test_next_observation_shape_is_validated(self):
+        buffer = ReplayBuffer(4, 3, ReplayBufferConfig(capacity=10, seed=0))
+        transition = make_transition(0)
+        transition.next_observation = np.zeros((1, 4), dtype=np.float32)
+        with pytest.raises(ValueError, match="one-dimensional"):
+            buffer.add(transition)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("observation", np.array([0.0, np.nan, 0.0, 0.0], dtype=np.float32)),
+            ("action", np.array([0.0, np.inf, 0.0], dtype=np.float32)),
+            ("next_observation", np.array([0.0, 0.0, 0.0, np.nan], dtype=np.float32)),
+            ("reward", float("nan")),
+        ],
+    )
+    def test_nonfinite_transition_fields_are_rejected_atomically(self, field, value):
+        buffer = ReplayBuffer(4, 3, ReplayBufferConfig(capacity=10, seed=0))
+        buffer.add(make_transition(1))
+        before = buffer.snapshot()
+        transition = make_transition(2)
+        setattr(transition, field, value)
+        with pytest.raises(ValueError):
+            buffer.add(transition)
+        after = buffer.snapshot()
+        assert buffer.total_added == 1
+        np.testing.assert_array_equal(after.observations, before.observations)
+        np.testing.assert_array_equal(after.actions, before.actions)
+        np.testing.assert_array_equal(after.rewards, before.rewards)
 
     def test_invalid_construction_rejected(self):
         with pytest.raises(ValueError):
@@ -340,7 +385,11 @@ class TestSACLearner:
         rng = np.random.default_rng(seed)
         return Batch(
             observations=rng.normal(size=(n, 4)).astype(np.float32),
-            actions=rng.uniform(-1, 1, size=(n, 3)).astype(np.float32),
+            actions=rng.uniform(
+                low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+                high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+                size=(n, 3),
+            ).astype(np.float32),
             rewards=rng.normal(size=(n,)).astype(np.float32),
             next_observations=rng.normal(size=(n, 4)).astype(np.float32),
             terminated=np.zeros(n, dtype=np.float32),
@@ -366,6 +415,15 @@ class TestSACLearner:
         with pytest.raises(ValueError, match="features"):
             learner.act(np.zeros(5, dtype=np.float32))
 
+    def test_act_rejects_nonfinite_and_wrong_rank(self):
+        learner = self.make_learner()
+        bad = np.zeros(4, dtype=np.float32)
+        bad[2] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            learner.act(bad)
+        with pytest.raises(ValueError, match="shape"):
+            learner.act(np.zeros((2, 2, 1), dtype=np.float32))
+
     def test_deterministic_act_is_reproducible(self):
         learner = self.make_learner()
         obs = np.random.default_rng(0).normal(size=(8, 4)).astype(np.float32)
@@ -382,11 +440,59 @@ class TestSACLearner:
             "sac/temperature",
             "sac/q1_mean",
             "sac/q_target_mean",
+            "sac/discount_mean",
             "sac/gradient_steps",
         ):
             assert key in metrics, f"missing metric {key}"
         assert np.isfinite(list(metrics.values())).all()
         assert metrics["sac/gradient_steps"] == 1.0
+
+    def test_discount_factor_scales_with_elapsed_time(self):
+        learner = self.make_learner(gamma=0.9)
+        batch = self.make_batch(n=3)
+        batch.discount_exponents = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+        metrics = learner.update(batch)
+        expected = np.mean([1.0, 0.9**0.5, 0.9])
+        assert metrics["sac/discount_mean"] == pytest.approx(expected, rel=1e-6)
+
+    def test_invalid_batch_discount_exponents_are_rejected(self):
+        learner = self.make_learner()
+        batch = self.make_batch(n=2)
+        batch.discount_exponents = np.array([1.0, float("nan")], dtype=np.float32)
+        with pytest.raises(ValueError, match="discount_exponents"):
+            learner.update(batch)
+
+    @pytest.mark.parametrize(
+        "field,value,match",
+        [
+            ("observations", np.zeros((2, 3), dtype=np.float32), "observations"),
+            ("actions", np.zeros((2, 2), dtype=np.float32), "actions"),
+            ("rewards", np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), "rewards"),
+            ("next_observations", np.zeros((1, 4), dtype=np.float32), "next_observations"),
+            ("terminated", np.array([0.0, 0.5], dtype=np.float32), "terminated"),
+            ("truncated", np.array([0.0, np.nan], dtype=np.float32), "truncated"),
+            ("discount_exponents", np.array([1.0, -0.1], dtype=np.float32), "discount_exponents"),
+        ],
+    )
+    def test_malformed_batch_is_rejected_before_optimizer_updates(self, field, value, match):
+        learner = self.make_learner()
+        batch = self.make_batch(n=2)
+        setattr(batch, field, value)
+        before = [parameter.detach().clone() for parameter in learner.network.parameters()]
+        with pytest.raises(ValueError, match=match):
+            learner.update(batch)
+        assert learner.gradient_steps == 0
+        assert all(
+            torch.equal(previous, current)
+            for previous, current in zip(before, learner.network.parameters(), strict=True)
+        )
+
+    def test_action_outside_bounds_is_rejected(self):
+        learner = self.make_learner()
+        batch = self.make_batch(n=2)
+        batch.actions[0, 1] = -0.1
+        with pytest.raises(ValueError, match="action bounds"):
+            learner.update(batch)
 
     def test_gradient_steps_increment(self):
         learner = self.make_learner()
@@ -424,7 +530,11 @@ class TestSACLearner:
             n = 128
             batch = Batch(
                 observations=rng.normal(size=(n, 4)).astype(np.float32),
-                actions=rng.uniform(-1, 1, size=(n, 3)).astype(np.float32),
+                actions=rng.uniform(
+                    low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+                    high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+                    size=(n, 3),
+                ).astype(np.float32),
                 rewards=np.ones(n, dtype=np.float32),
                 next_observations=rng.normal(size=(n, 4)).astype(np.float32),
                 terminated=np.zeros(n, dtype=np.float32),

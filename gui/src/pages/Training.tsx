@@ -20,7 +20,8 @@ export function Training() {
   const [runName, setRunName] = useState("");
   const [steps, setSteps] = useState<number | "">("");
   const [resume, setResume] = useState("");
-  const [allowSimulated, setAllowSimulated] = useState(true);
+  const [allowSimulated, setAllowSimulated] = useState(false);
+  const [directorEnabled, setDirectorEnabled] = useState(false);
   const [validating, setValidating] = useState(false);
   const [validation, setValidation] = useState<{ ok: boolean; problems: string[] } | null>(null);
   const [starting, setStarting] = useState(false);
@@ -90,6 +91,10 @@ export function Training() {
       const payload: Record<string, unknown> = {
         config_yaml: yaml,
         allow_simulated_driver: allowSimulated,
+      };
+      payload.overrides = {
+        "director.enabled": String(directorEnabled),
+        "driver.allow_simulated": String(allowSimulated),
       };
       if (runName.trim()) payload.run_name = runName.trim();
       if (steps !== "") payload.steps = Number(steps);
@@ -163,6 +168,36 @@ export function Training() {
             </span>
           </div>
 
+          <div className="field">
+            <label>Sampling strategy</label>
+            <label className="dim" style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={directorEnabled}
+                onChange={(e) => setDirectorEnabled(e.target.checked)}
+              />
+              Enable Training Director
+            </label>
+            <span className="hint">
+              Overrides director.enabled: adapts sampling from episode progress and failures; held-out tracks remain untouched.
+            </span>
+          </div>
+
+          <div className="field">
+            <label>Driver safety</label>
+            <label className="dim" style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                type="checkbox"
+                checked={allowSimulated}
+                onChange={(e) => setAllowSimulated(e.target.checked)}
+              />
+              Allow simulated driver (toy model, not Trackmania)
+            </label>
+            <span className="hint">
+              Off by default. Enable only for synthetic tests; this does not connect to or validate the real game.
+            </span>
+          </div>
+
           {preset !== "__custom__" ? (
             <div className="field">
               <label>Run options</label>
@@ -201,14 +236,6 @@ export function Training() {
                 <button className="btn sm" onClick={onValidate} disabled={validating}>
                   {validating ? <Spinner size={12} /> : "Validate"}
                 </button>
-                <label className="dim" style={{ fontSize: 12, display: "flex", gap: 6, alignItems: "center" }}>
-                  <input
-                    type="checkbox"
-                    checked={allowSimulated}
-                    onChange={(e) => setAllowSimulated(e.target.checked)}
-                  />
-                  allow simulated driver
-                </label>
               </div>
               {validation && (
                 <div style={{ marginTop: 8 }}>
@@ -254,7 +281,14 @@ export function Training() {
                   // send the preset path directly
                   setStarting(true);
                   try {
-                    const payload: Record<string, unknown> = { config_path: preset };
+                    const payload: Record<string, unknown> = {
+                      config_path: preset,
+                      allow_simulated_driver: allowSimulated,
+                    };
+                    payload.overrides = {
+                      "director.enabled": String(directorEnabled),
+                      "driver.allow_simulated": String(allowSimulated),
+                    };
                     if (runName.trim()) payload.run_name = runName.trim();
                     if (steps !== "") payload.steps = Number(steps);
                     if (resume.trim()) payload.resume = resume.trim();

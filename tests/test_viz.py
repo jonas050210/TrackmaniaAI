@@ -52,6 +52,15 @@ class TestMesh:
         assert faces.min() >= 0
         assert faces.max() < len(vertices)
 
+    def test_closed_mesh_contains_the_seam_quad(self, oval_track):
+        view = TrackView(oval_track)
+        vertices, faces = view.corridor_mesh()
+        n = oval_track.num_points
+        assert faces.shape == (2 * n, 3)
+        assert set(faces[-2]) == {n - 1, 0, n}
+        assert set(faces[-1]) == {n - 1, n, 2 * n - 1}
+        assert faces.max() < len(vertices)
+
     def test_obj_export(self, tmp_path, s_curve_track):
         view = TrackView(s_curve_track)
         path = view.to_obj(tmp_path / "track.obj")
@@ -75,6 +84,16 @@ class TestMesh:
             if line.startswith("f ")
         ]
         assert min(min(f) for f in faces) >= 1
+
+    def test_closed_obj_polyline_closes_at_the_start(self, tmp_path, oval_track):
+        path = TrackView(oval_track).to_obj(tmp_path / "oval.obj")
+        line = next(
+            line for line in path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("l ")
+        )
+        indices = [int(value) for value in line.split()[1:]]
+        assert len(indices) == oval_track.num_points + 1
+        assert indices[0] == indices[-1]
 
     def test_obj_creates_parent_directories(self, tmp_path, straight_track):
         path = TrackView(straight_track).to_obj(tmp_path / "nested" / "dir" / "t.obj")

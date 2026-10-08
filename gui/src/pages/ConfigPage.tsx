@@ -93,6 +93,7 @@ export function ConfigPage() {
               Sections: <code className="mono">driver</code>, <code className="mono">track</code>,{" "}
               <code className="mono">env</code> (observation/reward/termination), <code className="mono">sac</code>,{" "}
               <code className="mono">curriculum</code>, <code className="mono">bc</code>,{" "}
+              <code className="mono">director</code> (training-only adaptive sampling), and{" "}
               <code className="mono">train</code>.
             </li>
           </ul>

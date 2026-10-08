@@ -89,6 +89,7 @@ class NormalizingLearner:
             next_observations=self._normalize(batch.next_observations),
             terminated=batch.terminated,
             truncated=batch.truncated,
+            discount_exponents=batch.discount_exponents,
         )
         metrics = self.inner.update(normalised)
         metrics.update(self.normalizer.statistics())

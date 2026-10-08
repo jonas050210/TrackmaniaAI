@@ -25,6 +25,9 @@ class Transition:
     terminated: bool
     #: True when we stopped the episode (time limit). Value bootstrapping continues.
     truncated: bool
+    #: Discount exponent relative to the configured nominal control interval. ``1.0`` keeps
+    #: the legacy per-transition gamma; real-time transitions can scale gamma by elapsed time.
+    discount_exponent: float = 1.0
     info: dict[str, Any] | None = None
 
 
@@ -42,6 +45,8 @@ class Batch:
     next_observations: np.ndarray
     terminated: np.ndarray  # float32, 1.0 = terminal
     truncated: np.ndarray
+    #: Relative elapsed-time exponents for gamma; absent on legacy hand-built batches.
+    discount_exponents: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.observations.shape[0])
@@ -55,8 +60,15 @@ class Batch:
 class Learner(Protocol):
     """What the trainer needs from any RL algorithm."""
 
-    observation_dim: int
-    action_dim: int
+    @property
+    def observation_dim(self) -> int:
+        """Width of the policy observation vector."""
+        ...
+
+    @property
+    def action_dim(self) -> int:
+        """Width of the policy action vector."""
+        ...
 
     def act(self, observation: np.ndarray, deterministic: bool = False) -> np.ndarray:
         """Return an action for a single observation (batch dim optional)."""

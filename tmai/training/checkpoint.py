@@ -181,6 +181,7 @@ def save_best(
     score: float,
     episode: int = 0,
     config: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> Path:
     """Save (overwrite) the best-scoring checkpoint so far."""
     directory = Path(directory)
@@ -196,7 +197,7 @@ def save_best(
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "learner": learner.state_dict(),
         "config": config or {},
-        "extra": {"reason": "best_score"},
+        "extra": {"reason": "best_score", **(extra or {})},
     }
     path = directory / f"{BEST_PREFIX}{CHECKPOINT_EXTENSION}"
     _atomic_torch_save(payload, path)

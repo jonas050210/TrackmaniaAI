@@ -43,8 +43,8 @@ class TickSource(Protocol):
     def request_op(self, op: GameOp) -> None:
         """Queue a control operation for execution on the next physics tick."""
 
-    def push_action(self, action: Action) -> None:
-        """Hand the newest control command to the game (newest wins)."""
+    def push_action(self, action: Action | None) -> None:
+        """Hand over the newest control command; ``None`` enables passive observation."""
 
     def next_frame(self, timeout: float | None = None) -> GameFrame:
         """Block until the game produces a new frame."""

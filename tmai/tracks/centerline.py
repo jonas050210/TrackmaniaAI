@@ -68,7 +68,7 @@ class CenterlineTrack:
         *,
         name: str = "track",
         uid: str | None = None,
-        corridor_half_width: float | Sequence[float] = 5.0,
+        corridor_half_width: float | Sequence[float] | np.ndarray = 5.0,
         closed: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -77,6 +77,8 @@ class CenterlineTrack:
             raise ValueError(f"points must have shape (N, 3), got {pts.shape}")
         if pts.shape[0] < 2:
             raise ValueError("a track needs at least 2 centreline points")
+        if closed and pts.shape[0] < 3:
+            raise ValueError("a closed track needs at least 3 centreline points")
         if not np.all(np.isfinite(pts)):
             raise ValueError("track points contain non-finite values")
 
@@ -86,23 +88,33 @@ class CenterlineTrack:
         self.closed = bool(closed)
         self.metadata: dict[str, Any] = dict(metadata or {})
 
-        if np.isscalar(corridor_half_width):
-            width = float(corridor_half_width)
-            if width <= 0:
-                raise ValueError(f"corridor_half_width must be positive, got {width}")
-            self.corridor_half_width = np.full(pts.shape[0], width, dtype=np.float64)
+        if isinstance(corridor_half_width, (int, float, np.integer, np.floating)):
+            scalar_width = float(corridor_half_width)
+            if scalar_width <= 0:
+                raise ValueError(f"corridor_half_width must be positive, got {scalar_width}")
+            width_values = np.full(pts.shape[0], scalar_width, dtype=np.float64)
+        elif isinstance(corridor_half_width, np.ndarray) and corridor_half_width.ndim == 0:
+            scalar_width = float(corridor_half_width.item())
+            if scalar_width <= 0:
+                raise ValueError(f"corridor_half_width must be positive, got {scalar_width}")
+            width_values = np.full(pts.shape[0], scalar_width, dtype=np.float64)
         else:
-            width = np.asarray(corridor_half_width, dtype=np.float64).reshape(-1)
-            if width.shape[0] != pts.shape[0]:
+            width_values = np.asarray(corridor_half_width, dtype=np.float64).reshape(-1)
+            if width_values.shape[0] != pts.shape[0]:
                 raise ValueError("corridor_half_width must have one entry per point")
-            if np.any(width <= 0):
+            if np.any(width_values <= 0):
                 raise ValueError("corridor_half_width entries must be positive")
-            self.corridor_half_width = width
+        self.corridor_half_width = width_values
 
-        self._segment_vectors = np.diff(self.points, axis=0)
+        if self.closed:
+            self._segment_vectors = np.roll(self.points, -1, axis=0) - self.points
+        else:
+            self._segment_vectors = np.diff(self.points, axis=0)
         self._segment_lengths = np.linalg.norm(self._segment_vectors, axis=1)
         if np.any(self._segment_lengths < 1e-6):
-            raise ValueError("track has duplicate consecutive points (zero-length segment)")
+            raise ValueError(
+                "track has duplicate consecutive points or a zero-length segment at the closing seam"
+            )
         self._cum_lengths = np.concatenate([[0.0], np.cumsum(self._segment_lengths)])
         self._length = float(self._cum_lengths[-1])
         self._tangents = self._segment_vectors / self._segment_lengths[:, None]
@@ -120,25 +132,34 @@ class CenterlineTrack:
         return int(self.points.shape[0])
 
     def index_at(self, s: float) -> int:
-        """Index of the segment that contains arc-length ``s`` (clamped)."""
-        s = float(np.clip(s, 0.0, self._length))
-        return int(np.clip(np.searchsorted(self._cum_lengths, s, side="right") - 1,
+        """Index of the segment containing arc-length ``s``.
+
+        Open tracks clamp out-of-range values. Closed tracks wrap, so the closing segment
+        is the last segment and ``s == length`` is the start of the next lap.
+        """
+        station = self._station(s)
+        return int(np.clip(np.searchsorted(self._cum_lengths, station, side="right") - 1,
                            0, len(self._segment_lengths) - 1))
 
-    def point_at(self, s: float) -> np.ndarray:
-        """Centreline position at arc-length ``s``.
+    def _station(self, s: float) -> float:
+        """Convert a possibly unwrapped coordinate to this track's local station."""
+        value = float(s)
+        if not np.isfinite(value):
+            raise ValueError(f"track station must be finite, got {value}")
+        if self.closed:
+            return value % self._length
+        return float(np.clip(value, 0.0, self._length))
 
-        ``_tangents`` are *unit* vectors, so the offset has to be scaled by the segment
-        length. Multiplying by the bare fraction silently returns a point ``frac`` metres
-        along the segment instead of ``frac`` of the way down it -- correct only when every
-        segment happens to be exactly one metre, which is true of the default synthetic
-        tracks and of nothing recorded from a real map.
+    def point_at(self, s: float) -> np.ndarray:
+        """Centreline position at arc-length ``s`` (wrapped on a closed circuit).
+
+        ``_tangents`` are *unit* vectors, so the offset is in metres and multiplies the unit
+        tangent directly. The final segment of a circuit runs from its last sample back to
+        the first; callers do not need to duplicate the start point in the input data.
         """
-        s = float(np.clip(s, 0.0, self._length))
-        i = self.index_at(s)
-        # `_tangents` are unit vectors: the offset along the segment is already in metres,
-        # so it multiplies the unit tangent directly.
-        offset = s - self._cum_lengths[i]
+        station = self._station(s)
+        i = self.index_at(station)
+        offset = station - self._cum_lengths[i]
         return self.points[i] + self._tangents[i] * offset
 
     def heading_at(self, s: float) -> np.ndarray:
@@ -156,10 +177,12 @@ class CenterlineTrack:
         *segment*. Interpolating keeps the two consistent and means the final sample is
         actually used instead of being silently ignored.
         """
-        s = float(np.clip(s, 0.0, self._length))
-        i = self.index_at(s)
-        j = min(i + 1, len(self.corridor_half_width) - 1)
-        fraction = (s - self._cum_lengths[i]) / self._segment_lengths[i]
+        station = self._station(s)
+        i = self.index_at(station)
+        j = (i + 1) % len(self.corridor_half_width) if self.closed else min(
+            i + 1, len(self.corridor_half_width) - 1
+        )
+        fraction = (station - self._cum_lengths[i]) / self._segment_lengths[i]
         return float(
             self.corridor_half_width[i] * (1.0 - fraction) + self.corridor_half_width[j] * fraction
         )
@@ -187,21 +210,46 @@ class CenterlineTrack:
                 (episode start) always searches the whole track.
 
         Returns:
-            The :class:`TrackProjection`. Progress is clamped to ``[0, length]``: a car that
-            drives off the end of a point-to-point map does not get unbounded progress.
+            The :class:`TrackProjection`. Progress is clamped to ``[0, length]`` on open
+            tracks. On a closed circuit, a hinted projection is unwrapped to the lap nearest
+            ``hint_s`` so progress stays continuous across the start/finish seam.
         """
         pos = np.asarray(position, dtype=np.float64).reshape(3)
         if not np.all(np.isfinite(pos)):
             raise ValueError(f"cannot project non-finite position {pos!r}")
 
+        segment_count = len(self._segment_lengths)
+        if hint_s is not None and not np.isfinite(float(hint_s)):
+            raise ValueError(f"hint_s must be finite, got {hint_s}")
+        window = float(search_window)
+        if not np.isfinite(window) or window < 0:
+            raise ValueError(f"search_window must be finite and non-negative, got {window}")
         if hint_s is None:
-            lo, hi = 0, len(self._segment_lengths)
+            idx = np.arange(segment_count)
+        elif self.closed:
+            if 2.0 * window >= self._length:
+                idx = np.arange(segment_count)
+            else:
+                station = float(hint_s) % self._length
+                lo = station - window
+                hi = station + window
+                if lo < 0.0:
+                    first = np.arange(self.index_at(self._length + lo), segment_count)
+                    second = np.arange(0, self.index_at(hi) + 1)
+                    idx = np.concatenate((first, second))
+                elif hi >= self._length:
+                    first = np.arange(self.index_at(lo), segment_count)
+                    second = np.arange(0, self.index_at(hi - self._length) + 1)
+                    idx = np.concatenate((first, second))
+                else:
+                    idx = np.arange(self.index_at(lo), self.index_at(hi) + 1)
+                if idx.size == 0:
+                    idx = np.array([self.index_at(station)], dtype=np.int64)
         else:
-            lo = self.index_at(float(hint_s) - search_window)
-            hi = self.index_at(float(hint_s) + search_window) + 1
-            hi = min(hi, len(self._segment_lengths))
+            lo = self.index_at(float(hint_s) - window)
+            hi = min(self.index_at(float(hint_s) + window) + 1, segment_count)
+            idx = np.arange(lo, hi)
 
-        idx = np.arange(lo, hi)
         a = self.points[idx]
         ab = self._segment_vectors[idx]
         lengths = self._segment_lengths[idx]
@@ -222,9 +270,14 @@ class CenterlineTrack:
         # `lengths` is the windowed slice, `seg` is a global segment index: index the full
         # array. Mixing the two corrupts the arc length whenever a hint is supplied.
         segment_length = float(self._segment_lengths[seg])
-        progress = float(
-            np.clip(self._cum_lengths[seg] + t_best * segment_length, 0.0, self._length)
-        )
+        local_progress = float(self._cum_lengths[seg] + t_best * segment_length)
+        if self.closed and hint_s is not None:
+            # Keep the station continuous across the finish/start seam. This lets reward,
+            # wrong-way detection and episode progress use ordinary signed deltas over laps.
+            hint = float(hint_s)
+            progress = local_progress + round((hint - local_progress) / self._length) * self._length
+        else:
+            progress = float(np.clip(local_progress, 0.0, self._length))
         tangent = self._tangents[seg]
         centre = a[best] + ab[best] * t_best
 
@@ -253,7 +306,7 @@ class CenterlineTrack:
 
     def is_on_track(self, projection: TrackProjection) -> bool:
         """Whether a projection lies inside the drivable corridor."""
-        return abs(projection.lateral_offset) <= float(self.corridor_half_width[projection.index])
+        return abs(projection.lateral_offset) <= self.corridor_half_width_at(projection.progress)
 
     def edge_distances(self, projection: TrackProjection) -> tuple[float, float]:
         """``(distance_to_left_edge, distance_to_right_edge)`` in metres, along the lateral axis.
@@ -276,16 +329,26 @@ class CenterlineTrack:
     # -- curvature ------------------------------------------------------------------
 
     def _compute_curvature(self) -> np.ndarray:
-        """Signed curvature per segment from the turning angle between consecutive segments."""
-        t0 = self._tangents[:-1]
-        t1 = self._tangents[1:]
+        """Signed curvature per segment, including the seam on a closed circuit."""
+        if self.closed:
+            t0 = self._tangents
+            t1 = np.roll(self._tangents, -1, axis=0)
+            lengths = self._segment_lengths
+        else:
+            t0 = self._tangents[:-1]
+            t1 = self._tangents[1:]
+            lengths = self._segment_lengths[:-1]
+
         # Angle around the world up axis, signed so that a right turn is positive.
         cross_y = t0[:, 0] * t1[:, 2] - t0[:, 2] * t1[:, 0]
         dot = np.clip((t0 * t1).sum(axis=1), -1.0, 1.0)
         dtheta = np.arctan2(-cross_y, dot)
-        lengths = np.maximum(self._segment_lengths[:-1], 1e-9)
-        per_segment = dtheta / lengths
-        # Assign to segments: curvature of segment i is the turn into segment i.
+        per_segment = dtheta / np.maximum(lengths, 1e-9)
+
+        if self.closed:
+            return per_segment.astype(np.float64, copy=False)
+
+        # Assign the final open segment the last observed turn, as before.
         curvature = np.zeros(len(self._segment_lengths), dtype=np.float64)
         curvature[:-1] = per_segment
         curvature[-1] = per_segment[-1] if len(per_segment) else 0.0

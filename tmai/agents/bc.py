@@ -12,8 +12,11 @@ Design notes:
   next gradient step of the RL loop continues from the pretrained policy. There is no
   separate BC policy to keep in sync.
 * When the learner is wrapped in :class:`~tmai.agents.normalize.NormalizingLearner`, the
-  normaliser's statistics are first fitted on the demonstration observations and the demos
-  are then normalised with them -- the same representation the network will see during RL.
+  normaliser's statistics are fitted only on training observations, then used for both train
+  and validation data -- the same representation the network will see during RL.
+* Validation is split by whole demonstration file when multiple files are loaded; a single
+  recording instead uses a time-ordered holdout with a purge gap to reduce adjacent-frame
+  leakage.
 * The loss is MSE between the policy's deterministic (mean) action and the recorded
   action, in the *bounded* action space, so the squashing transform is part of the fit.
 """
@@ -47,6 +50,66 @@ def _unwrap_sac(learner: Learner):
     )
 
 
+def _split_demonstrations(
+    demos: Demonstration,
+    *,
+    val_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Split at lap/file boundaries when known, otherwise use a purged time-ordered holdout.
+
+    Random row-wise splits are misleading for driving data: adjacent frames are nearly
+    duplicates, so a validation loss can look excellent while the network is effectively
+    evaluated on observations from the training samples immediately beside them.
+    """
+    count = len(demos)
+    if val_fraction <= 0.0:
+        return np.arange(count), np.asarray([], dtype=int), "none"
+
+    raw_lengths = demos.metadata.get("steps_per_file")
+    try:
+        lengths = np.asarray(raw_lengths, dtype=np.int64).reshape(-1)
+    except (TypeError, ValueError):
+        lengths = np.asarray([], dtype=np.int64)
+
+    if (
+        lengths.size >= 2
+        and np.all(lengths > 0)
+        and int(lengths.sum()) == count
+    ):
+        target = max(1, int(count * val_fraction))
+        order = rng.permutation(lengths.size)
+        validation_groups: list[int] = []
+        validation_count = 0
+        for group in order:
+            if len(validation_groups) >= lengths.size - 1:
+                break
+            if validation_count < target or not validation_groups:
+                validation_groups.append(int(group))
+                validation_count += int(lengths[group])
+        offsets = np.concatenate([[0], np.cumsum(lengths)])
+        val_idx = np.concatenate(
+            [np.arange(offsets[g], offsets[g + 1]) for g in validation_groups]
+        ).astype(int)
+        train_mask = np.ones(count, dtype=bool)
+        train_mask[val_idx] = False
+        return np.flatnonzero(train_mask), val_idx, "whole_demo_files"
+
+    num_val = int(count * val_fraction)
+    if num_val < 1:
+        return np.arange(count), np.asarray([], dtype=int), "none_too_small"
+    val_start = count - num_val
+    # Keep a small purge window between train and validation so stacked/nearby frames do not
+    # leak across the boundary. For tiny datasets, prefer a usable train set over a purge.
+    purge = min(max(1, num_val // 20), max(0, val_start - 1))
+    train_end = val_start - purge
+    if train_end < 1:
+        train_end = val_start
+    train_idx = np.arange(train_end, dtype=int)
+    val_idx = np.arange(val_start, count, dtype=int)
+    return train_idx, val_idx, "purged_temporal_holdout"
+
+
 def pretrain_policy(
     learner: Learner,
     demos: Demonstration,
@@ -72,6 +135,15 @@ def pretrain_policy(
     """
     sac, normalizer = _unwrap_sac(learner)
 
+    if epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {epochs}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    if lr <= 0 or not np.isfinite(lr):
+        raise ValueError(f"lr must be finite and positive, got {lr}")
+    if not 0.0 <= val_fraction < 1.0:
+        raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
+
     if demos.observation_dim != sac.observation_dim:
         raise ValueError(
             f"demonstrations have observation_dim {demos.observation_dim}, learner expects "
@@ -90,24 +162,27 @@ def pretrain_policy(
 
     observations = np.asarray(demos.observations, dtype=np.float32)
     actions = np.asarray(demos.actions, dtype=np.float32)
+    if not np.all(np.isfinite(observations)) or not np.all(np.isfinite(actions)):
+        raise ValueError("demonstration observations and actions must be finite")
     # Clip to the learner's action bounds: the game's input read-back should already be
     # inside them, but a stray out-of-range value must not poison the fit.
     actions = np.clip(actions, sac._action_low, sac._action_high)
 
-    if normalizer is not None:
-        # Fit the normaliser on the demonstrations so the network trains on the same
-        # representation it will see during RL.
-        normalizer.update(observations)
-        observations = normalizer.normalize(observations)
-
-    # Deterministic train/val split.
-    order = rng.permutation(len(demos)) if shuffle else np.arange(len(demos))
-    num_val = int(len(demos) * val_fraction)
-    val_idx = order[:num_val]
-    train_idx = order[num_val:]
-    if len(train_idx) == 0:  # tiny dataset: train on everything, no val
-        train_idx = order
+    train_idx, val_idx, split_kind = _split_demonstrations(
+        demos,
+        val_fraction=val_fraction,
+        rng=rng,
+    )
+    if len(train_idx) == 0:  # tiny dataset: train on everything, no validation
+        train_idx = np.arange(len(demos))
         val_idx = np.asarray([], dtype=int)
+        split_kind = "none_too_small"
+
+    if normalizer is not None:
+        # Validation observations must not influence normalization statistics. Fit only on the
+        # training subset, then transform both partitions with those frozen running moments.
+        normalizer.update(observations[train_idx])
+        observations = normalizer.normalize(observations)
 
     obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
     act_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
@@ -153,13 +228,16 @@ def pretrain_policy(
     metrics = {
         "bc/samples": float(len(demos)),
         "bc/train_samples": float(len(train_idx)),
+        "bc/val_samples": float(len(val_idx)),
+        "bc/whole_file_validation": float(split_kind == "whole_demo_files"),
         "bc/epochs": float(epochs),
         "bc/final_train_loss": train_loss,
         "bc/val_loss": val_loss,
     }
     logger.info(
-        "behaviour cloning done: %d samples, %d epochs, final train loss %.5f, val %.5f",
-        len(demos), epochs, train_loss, val_loss,
+        "behaviour cloning done: %d samples (%d train, %d validation; %s split), "
+        "%d epochs, final train loss %.5f, val %.5f",
+        len(demos), len(train_idx), len(val_idx), split_kind, epochs, train_loss, val_loss,
     )
     return metrics
 

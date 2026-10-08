@@ -114,6 +114,20 @@ class TestVehicleStateMapping:
         vehicle = vehicle_state_from_sim_state(state)
         np.testing.assert_allclose(vehicle.rotation, np.eye(3))
 
+    def test_calibrated_forward_axis_and_sign_are_used(self):
+        rotation = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]]
+        )
+        state = StubSimState(rotation=rotation)
+        vehicle = vehicle_state_from_sim_state(state, forward_axis=2, forward_sign=-1.0)
+        np.testing.assert_allclose(vehicle.forward_vector(), [0.0, 0.0, 1.0])
+        assert vehicle.yaw() == pytest.approx(0.0)
+
+    def test_invalid_forward_axis_is_rejected(self):
+        state = StubSimState()
+        with pytest.raises(ValueError, match="forward_axis"):
+            vehicle_state_from_sim_state(state, forward_axis=3)
+
     def test_missing_dynamics_flag_raises(self):
         state = StubSimState(flags=SIM_HAS_TIMERS | SIM_HAS_PLAYER_INFO)
         with pytest.raises(GameProtocolError, match="SIM_HAS_DYNA"):
@@ -242,6 +256,28 @@ class TestAgainstRealStructs:
         assert vehicle.rotation.shape == (3, 3)
         # A zeroed buffer yields a zero matrix, which the mapper must replace with identity.
         np.testing.assert_allclose(vehicle.rotation, np.eye(3))
+
+    def test_unflagged_zero_filled_wheel_region_is_not_treated_as_airborne(self):
+        state = self._make()
+        vehicle = vehicle_state_from_sim_state(state)
+        assert vehicle.has_ground_contact is True
+        assert vehicle.num_wheels_ground_contact == 4
+
+    def test_flagged_wheel_region_reports_actual_contact_count(self):
+        from tminterface.constants import SIM_HAS_SIMULATION_WHEELS
+
+        state = self._make(flags=SIM_HAS_TIMERS | SIM_HAS_DYNA | SIM_HAS_PLAYER_INFO
+                           | SIM_HAS_SIMULATION_WHEELS)
+        for index, wheel in enumerate(state.simulation_wheels):
+            wheel.real_time_state.has_ground_contact = index < 2
+        vehicle = vehicle_state_from_sim_state(state)
+        assert vehicle.has_ground_contact is True
+        assert vehicle.num_wheels_ground_contact == 2
+        for wheel in state.simulation_wheels:
+            wheel.real_time_state.has_ground_contact = False
+        vehicle = vehicle_state_from_sim_state(state)
+        assert vehicle.has_ground_contact is False
+        assert vehicle.num_wheels_ground_contact == 0
 
     def test_frame_helper_over_real_struct(self):
         state = self._make()

@@ -454,15 +454,41 @@ def compare_replays(
             this track to obtain it.
         station_spacing: metres between compared stations.
     """
+    if ai.track and ghost.track and ai.track != ghost.track:
+        raise ValueError(
+            f"cannot compare replays from different tracks: {ai.track!r} vs {ghost.track!r}"
+        )
+    ai_identity = str(ai.metadata.get("track_identity", ""))
+    ghost_identity = str(ghost.metadata.get("track_identity", ""))
+    if ai_identity and ghost_identity and ai_identity != ghost_identity:
+        raise ValueError(
+            "cannot compare replays with different track identities: "
+            f"{ai_identity!r} vs {ghost_identity!r}"
+        )
+
     def _progress_of(replay: EpisodeReplay) -> np.ndarray:
         progress = np.asarray(replay.progress, dtype=np.float64)
-        if len(progress) >= 2 or track is None:
-            return progress
-        # No usable progress array: project the trajectory onto the track instead. This is
-        # what makes a human demonstration (positions + times, no progress) comparable.
-        return np.array(
-            [track.project(p).progress for p in replay.positions], dtype=np.float64
+        has_progress = (
+            len(progress) >= 2
+            and np.all(np.isfinite(progress))
+            and float(np.ptp(progress)) > 1e-6
         )
+        if has_progress or track is None:
+            return progress
+        # No usable progress array (empty, all-zero legacy data, or non-finite): project the
+        # trajectory onto the track instead. Carry the previous station as a hint so paths near
+        # a crossing stay on the driven branch rather than jumping to a geometrically close one.
+        projected = np.empty(len(replay.positions), dtype=np.float64)
+        hint: float | None = None
+        for index, position in enumerate(replay.positions):
+            projection = track.project(
+                position,
+                hint_s=hint,
+                search_window=max(track.length, 1.0),
+            )
+            projected[index] = projection.progress
+            hint = projection.progress
+        return projected
 
     ai_progress = _progress_of(ai)
     ghost_progress = _progress_of(ghost)

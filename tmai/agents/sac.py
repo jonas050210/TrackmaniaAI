@@ -141,7 +141,10 @@ class SACLearner:
     @torch.no_grad()
     def act(self, observation: np.ndarray, deterministic: bool = False) -> np.ndarray:
         """Compute an action for one observation ``(dim,)`` or a batch ``(B, dim)``."""
-        obs = np.asarray(observation, dtype=np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            obs = np.asarray(observation, dtype=np.float32)
+        if obs.ndim not in (1, 2):
+            raise ValueError(f"observation must have shape (dim,) or (batch, dim), got {obs.shape}")
         single = obs.ndim == 1
         if single:
             obs = obs[None, :]
@@ -149,29 +152,132 @@ class SACLearner:
             raise ValueError(
                 f"observation has {obs.shape[-1]} features, learner expects {self.observation_dim}"
             )
+        if obs.shape[0] == 0:
+            raise ValueError("observation batch must not be empty")
+        if not np.all(np.isfinite(obs)):
+            raise ValueError("observation must contain only finite float32 values")
+        was_training = self.network.training
         self.network.eval()
-        action, _ = self.network.act(
-            torch.as_tensor(obs, device=self.device), deterministic=deterministic
-        )
-        self.network.train()
+        try:
+            action, _ = self.network.act(
+                torch.as_tensor(obs, device=self.device), deterministic=deterministic
+            )
+        finally:
+            self.network.train(was_training)
         out = action.detach().cpu().numpy().astype(np.float32)
         out = np.clip(out, self._action_low, self._action_high)
         return out[0] if single else out
 
     # -- learning -------------------------------------------------------------------
 
+    @staticmethod
+    def _float32_array(value: Any, *, name: str) -> np.ndarray:
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                array = np.asarray(value, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"batch field {name!r} must contain numeric float32 values") from exc
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"batch field {name!r} must contain only finite values")
+        return array
+
+    def _validate_batch(
+        self, batch: Batch
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Validate shapes, flags, action bounds, and finiteness before any optimizer step."""
+        observations = self._float32_array(batch.observations, name="observations")
+        if observations.ndim != 2 or observations.shape[1] != self.observation_dim:
+            raise ValueError(
+                f"observations must have shape (batch, {self.observation_dim}), "
+                f"got {observations.shape}"
+            )
+        batch_size = observations.shape[0]
+        if batch_size == 0:
+            raise ValueError("SAC update requires a non-empty batch")
+
+        actions = self._float32_array(batch.actions, name="actions")
+        if actions.shape != (batch_size, self.action_dim):
+            raise ValueError(
+                f"actions must have shape ({batch_size}, {self.action_dim}), got {actions.shape}"
+            )
+        if np.any(actions < self._action_low - 1e-5) or np.any(actions > self._action_high + 1e-5):
+            raise ValueError("batch actions fall outside the learner's configured action bounds")
+
+        next_observations = self._float32_array(
+            batch.next_observations, name="next_observations"
+        )
+        if next_observations.shape != (batch_size, self.observation_dim):
+            raise ValueError(
+                "next_observations must have shape "
+                f"({batch_size}, {self.observation_dim}), got {next_observations.shape}"
+            )
+
+        def scalar_field(value: Any, *, name: str) -> np.ndarray:
+            array = self._float32_array(value, name=name)
+            if array.shape == (batch_size, 1):
+                array = array[:, 0]
+            if array.shape != (batch_size,):
+                raise ValueError(
+                    f"{name} must have shape ({batch_size},) or ({batch_size}, 1), "
+                    f"got {array.shape}"
+                )
+            return array
+
+        rewards = scalar_field(batch.rewards, name="rewards")
+        terminated = scalar_field(batch.terminated, name="terminated")
+        truncated = scalar_field(batch.truncated, name="truncated")
+        for name, flags in (("terminated", terminated), ("truncated", truncated)):
+            if np.any((flags != 0.0) & (flags != 1.0)):
+                raise ValueError(f"{name} flags must contain only 0 or 1")
+
+        if batch.discount_exponents is None:
+            discount_exponents = np.ones(batch_size, dtype=np.float32)
+        else:
+            discount_exponents = scalar_field(
+                batch.discount_exponents, name="discount_exponents"
+            )
+            if np.any(discount_exponents < 0.0):
+                raise ValueError("discount_exponents must be non-negative")
+
+        return (
+            observations,
+            actions,
+            rewards,
+            next_observations,
+            terminated,
+            truncated,
+            discount_exponents,
+        )
+
     def update(self, batch: Batch) -> dict[str, float]:
         """One SAC gradient step over ``batch``; returns scalar metrics."""
         cfg = self.config
-        obs = torch.as_tensor(batch.observations, dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor(batch.actions, dtype=torch.float32, device=self.device)
-        rewards = torch.as_tensor(batch.rewards, dtype=torch.float32, device=self.device)[:, None]
+        (
+            observations,
+            actions_array,
+            rewards_array,
+            next_observations,
+            terminated_array,
+            _truncated_array,
+            discount_array,
+        ) = self._validate_batch(batch)
+        obs = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(actions_array, dtype=torch.float32, device=self.device)
+        rewards = torch.as_tensor(
+            rewards_array, dtype=torch.float32, device=self.device
+        ).unsqueeze(1)
         next_obs = torch.as_tensor(
-            batch.next_observations, dtype=torch.float32, device=self.device
+            next_observations, dtype=torch.float32, device=self.device
         )
         terminated = torch.as_tensor(
-            batch.terminated, dtype=torch.float32, device=self.device
-        )[:, None]
+            terminated_array, dtype=torch.float32, device=self.device
+        ).unsqueeze(1)
+        discount_exponents = torch.as_tensor(
+            discount_array, dtype=torch.float32, device=self.device
+        ).unsqueeze(1)
+        discounts = torch.pow(
+            torch.full_like(discount_exponents, float(cfg.gamma)), discount_exponents
+        )
 
         alpha = self.log_temperature.detach().exp()
 
@@ -181,10 +287,12 @@ class SACLearner:
             next_q1, next_q2 = self.network.target_q_values(next_obs, next_actions)
             next_q = torch.min(next_q1, next_q2)
             # Bootstrap through truncations (time limit) but not through true terminals.
-            target = rewards + cfg.gamma * (1.0 - terminated) * (next_q - alpha * next_log_probs)
+            target = rewards + discounts * (1.0 - terminated) * (next_q - alpha * next_log_probs)
+        self._require_finite(target, "Bellman target")
 
         q1, q2 = self.network.q_values(obs, actions)
         critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+        self._require_finite(critic_loss, "critic loss")
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
@@ -196,6 +304,8 @@ class SACLearner:
         q1_new, q2_new = self.network.q_values(obs, new_actions)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (alpha * log_probs - q_new).mean()
+        self._require_finite(actor_loss, "actor loss")
+        self._require_finite(log_probs, "actor log probabilities")
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -208,6 +318,7 @@ class SACLearner:
             temperature_loss = -(
                 self.log_temperature * (log_probs.detach() + self.target_entropy)
             ).mean()
+            self._require_finite(temperature_loss, "temperature loss")
             self.temperature_optimizer.zero_grad(set_to_none=True)
             temperature_loss.backward()
             self.temperature_optimizer.step()
@@ -225,6 +336,7 @@ class SACLearner:
                 "sac/q1_mean": float(q1.mean().item()),
                 "sac/q2_mean": float(q2.mean().item()),
                 "sac/q_target_mean": float(target.mean().item()),
+                "sac/discount_mean": float(discounts.mean().item()),
                 "sac/log_prob_mean": float(log_probs.mean().item()),
                 "sac/action_std_mean": float(
                     self.network.policy.forward(obs)[1].exp().mean().item()
@@ -234,14 +346,30 @@ class SACLearner:
                 "sac/gradient_steps": float(self._gradient_steps),
             }
 
+    @staticmethod
+    def _require_finite(values: torch.Tensor, label: str) -> None:
+        if not bool(torch.isfinite(values).all()):
+            raise FloatingPointError(f"{label} became non-finite; SAC update aborted")
+
     def _clip(self, parameters) -> float:
-        """Optional global-norm gradient clipping; returns the pre-clip norm."""
-        params = [p for p in parameters if p.grad is not None]
+        """Check gradients, optionally clip their global norm, and return the original norm."""
+        params = [parameter for parameter in parameters if parameter.grad is not None]
         if not params:
             return 0.0
-        norm = float(torch.nn.utils.clip_grad_norm_(params, max_norm=1e12).item())
+        for parameter in params:
+            self._require_finite(parameter.grad, "gradient")
+        norm_tensor = torch.nn.utils.clip_grad_norm_(
+            params, max_norm=float("inf"), error_if_nonfinite=True
+        )
+        norm = float(norm_tensor.item())
+        if not np.isfinite(norm):
+            raise FloatingPointError("gradient norm became non-finite; SAC update aborted")
         if self.config.max_grad_norm and self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(params, max_norm=self.config.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                params,
+                max_norm=self.config.max_grad_norm,
+                error_if_nonfinite=True,
+            )
         return norm
 
     # -- serialisation --------------------------------------------------------------

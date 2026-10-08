@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -181,7 +182,7 @@ class RunLogger:
 
     # -- streaming output -----------------------------------------------------------
 
-    def log_metrics(self, step: int, metrics: dict[str, float | int | str | bool]) -> None:
+    def log_metrics(self, step: int, metrics: Mapping[str, float | int | str | bool]) -> None:
         """Append one metrics record. Flushes so a crash loses at most one record."""
         record = {
             "step": int(step),

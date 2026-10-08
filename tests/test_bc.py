@@ -61,7 +61,29 @@ class TestPretrainPolicy:
             learner, _demo_from_policy(), epochs=2, val_fraction=0.2, seed=0
         )
         assert metrics["bc/val_loss"] == metrics["bc/val_loss"]  # not NaN
-        assert metrics["bc/train_samples"] == pytest.approx(0.8 * 400)
+        assert metrics["bc/train_samples"] == 316  # purge gap before temporal validation
+        assert metrics["bc/val_samples"] == 80
+        assert metrics["bc/whole_file_validation"] == 0
+
+    def test_validation_keeps_demonstration_files_separate(self, tmp_path):
+        from tmai.training.demos import load_demonstrations
+
+        learner = _make_learner()
+        first = _demo_from_policy(steps=120, seed=2)
+        second = _demo_from_policy(steps=80, seed=3)
+        first_path = tmp_path / "first.jsonl"
+        second_path = tmp_path / "second.jsonl"
+        first.save(first_path)
+        second.save(second_path)
+        demos = load_demonstrations([first_path, second_path])
+
+        metrics = pretrain_policy(learner, demos, epochs=1, val_fraction=0.2, seed=7)
+
+        # A whole recording is reserved for validation, rather than randomly leaking
+        # near-identical frames from each file into both partitions.
+        assert metrics["bc/val_samples"] in {80, 120}
+        assert metrics["bc/train_samples"] + metrics["bc/val_samples"] == 200
+        assert metrics["bc/whole_file_validation"] == 1
 
     def test_actions_are_clipped_to_bounds(self):
         learner = _make_learner()
@@ -81,8 +103,8 @@ class TestPretrainPolicy:
         pretrain_policy(wrapped, demos, epochs=20, batch_size=64, lr=3e-3, seed=0)
         after = self._policy_mse(sac, demos)
         assert after < before * 0.2
-        # The normaliser was fitted on the demonstrations.
-        assert wrapped.normalizer.count >= len(demos)
+        # Normalization statistics use only the training partition, not held-out frames.
+        assert 0.85 * len(demos) < wrapped.normalizer.count < len(demos)
 
     def test_rejects_dimension_mismatch(self):
         learner = _make_learner(observation_dim=4)
