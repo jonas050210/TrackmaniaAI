@@ -38,12 +38,26 @@ learn = ["torch>=2.1"]
 game = ["tminterface>=1.0.2; sys_platform == 'win32'"]
 # Simplified track visualisation / debugging plots.
 viz = ["matplotlib>=3.7"]
+# The GUI backend: FastAPI + uvicorn + websockets for `tmai serve`. The frontend itself is
+# built with npm (see gui/) and served as static files.
+gui = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "ruff>=0.1",
     "torch>=2.1",
     "matplotlib>=3.7",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]

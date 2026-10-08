@@ -97,6 +97,10 @@ class TMInterfaceDriver:
             reports_checkpoints=True,
             reports_finish=True,
             reports_sliding=True,
+            # The telemetry mapping reads the game's own contact state
+            # (SceneVehicleCar.has_any_lateral_contact and per-wheel ground contact), so
+            # crash detection can trust the game rather than infer it.
+            reports_contact=True,
             headless_capable=False,
             max_speed_ratio=20.0,
             notes=(

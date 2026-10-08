@@ -17,6 +17,8 @@ On a Windows host with Trackmania + TMInterface:
 - [ ] Drive the car manually and watch `tmai`'s telemetry agree with what the car is doing.
 - [ ] Confirm `iface.respawn()` restarts an episode usefully. If it does not, switch to
       `ResetStrategy.COMMAND` with the right console command.
+- [ ] Record a human lap with `tmai record-demo` and pretrain from it (`tmai pretrain`) — the
+      demonstration path has only ever run against the simulated driver.
 
 Everything else on this list is premature until this is done.
 
@@ -86,22 +88,21 @@ One game instance caps everything.
 - [ ] Off-policy algorithms tolerate stale policy weights well, which is what makes this
       architecture viable for SAC.
 
-## 8. GUI and human-vs-AI evaluation
+## 8. GUI and human-vs-AI evaluation — **done, with follow-ups**
 
-Explicitly out of scope for the foundation phase. The data foundations exist:
-`tmai.api.status` reads a run directory into a single JSON snapshot (`run_snapshot`) covering
-status, downsampled curves, episodes, evaluations, checkpoints, manifest and log tail, and
-`tmai status --json` exposes it on the command line.
+The command center is built: `tmai serve` (FastAPI backend + WebSocket) with a React +
+three.js frontend. See [`GUI.md`](GUI.md) for the full map.
 
-- [ ] Switchable simplified 3D view showing track/block structure. `tmai.viz` already renders
-      the centreline, corridor, curvature and car state to PNG and exports `.obj`; the GUI is a
-      viewer over the same geometry plus block meshes from item 5.
-- [ ] Live dashboard over `tmai.api.status` (LearningView-inspired styling, subtle
-      hover/transition animation, professional training-dashboard feel).
-- [ ] Live overlay of the agent's observation and reward during a run.
-- [ ] Human-vs-AI: a real-time pacing wrapper on top of `GameDriver` (the environment is
-      deliberately lock-step with the game, not the wall clock, so this is additive), plus
-      ghost comparison against a recorded human lap.
+- [x] Local backend exposing runs, metrics, tracks, models, replays, benchmarks,
+      configuration and diagnostics as JSON, with jobs for long-running work.
+- [x] Live dashboard over `tmai.api.status` with charts, hover states and smooth transitions.
+- [x] Switchable 3D view showing the track: centreline, corridor ribbon, curvature
+      colouring, trajectory playback with a car marker, checkpoints/start marker.
+- [x] Human-vs-AI: ghost comparison of an AI replay against a recorded human lap
+      (`tmai replay compare`, GUI Replays page), station-by-station and per-segment.
+- [ ] Live overlay of the agent's observation and reward during a real run (needs the game).
+- [ ] Block-level 3D meshes in the viewer (depends on item 5).
+- [ ] Real-time pacing wrapper over `GameDriver` for a true race against the human.
 
 ## 9. Algorithm work
 

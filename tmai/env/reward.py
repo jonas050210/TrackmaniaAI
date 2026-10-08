@@ -52,6 +52,7 @@ from typing import Any
 
 import numpy as np
 
+from tmai.env.termination import EndReason
 from tmai.game.protocol import GameFrame
 from tmai.tracks.centerline import CenterlineTrack, TrackProjection
 
@@ -93,6 +94,23 @@ class RewardConfig:
     #: One-off bonus for crossing the finish line.
     finish_bonus: float = 20.0
 
+    # -- failure penalties, one-off and terminal -------------------------------------
+    #
+    #: Charged once, on the step a wall collision is confirmed. Large enough that crashing
+    #: is never a way to escape a bad state: the episode ends and the penalty is bigger
+    #: than several seconds of progress reward.
+    crash_penalty: float = 30.0
+    #: Charged once, on the step a confirmed out-of-bounds excursion ends the episode.
+    out_of_bounds_penalty: float = 20.0
+    #: Charged once, when the car falls off the map.
+    fell_off_penalty: float = 20.0
+    #: Charged once, when sustained reverse driving ends the episode.
+    wrong_way_penalty: float = 10.0
+    #: Small per-second charge while the game reports lateral contact. This is what
+    #: separates "scraped a wall and carried on" (a small continuous cost) from a genuine
+    #: crash (a large one-off penalty plus an immediate respawn).
+    contact_penalty: float = 0.5
+
     # -- anti-exploit limits, all speed-based rather than distance-based ------------
 
     #: Speed assumed to be the fastest the car can legitimately travel, m/s. Progress beyond
@@ -127,7 +145,8 @@ class RewardConfig:
         if self.idle_speed_threshold < 0:
             problems.append(f"idle_speed_threshold must be non-negative, got {self.idle_speed_threshold}")
         for name in ("off_track_weight", "heading_weight", "slip_weight", "slide_penalty",
-                     "step_penalty", "idle_penalty"):
+                     "step_penalty", "idle_penalty", "contact_penalty", "crash_penalty",
+                     "out_of_bounds_penalty", "fell_off_penalty", "wrong_way_penalty"):
             if getattr(self, name) < 0:
                 problems.append(f"{name} must be non-negative, got {getattr(self, name)}")
         if problems:
@@ -148,6 +167,10 @@ class RewardBreakdown:
     step: float = 0.0
     idle: float = 0.0
     finish: float = 0.0
+    #: Per-second charge for lateral wall contact (scraping, distinct from a crash).
+    contact: float = 0.0
+    #: One-off terminal penalty (crash / out-of-bounds / fell-off / wrong-way), 0 normally.
+    terminal_penalty: float = 0.0
     #: Credited progress in metres after cut clamping (a key diagnostic).
     progress_metres: float = 0.0
     #: True when raw progress exceeded the speed-derived cut threshold.
@@ -167,6 +190,8 @@ class RewardBreakdown:
             "reward/step": self.step,
             "reward/idle": self.idle,
             "reward/finish": self.finish,
+            "reward/contact": self.contact,
+            "reward/terminal_penalty": self.terminal_penalty,
             "reward/progress_metres": self.progress_metres,
             "reward/raw_progress_metres": self.raw_progress_metres,
             "reward/clamped": 1.0 if self.clamped else 0.0,
@@ -240,6 +265,14 @@ class ProgressReward:
         slide_term = -cfg.slide_penalty * dt * (1.0 if vehicle.is_sliding else 0.0)
         step_term = -cfg.step_penalty * dt
 
+        # Scraping a wall is not a crash: it costs a small amount per second of contact,
+        # which shapes the policy to avoid walls without ending the episode. A confirmed
+        # crash is different -- it ends the episode and charges a large one-off penalty
+        # (see terminal_penalty below).
+        contact_term = (
+            -cfg.contact_penalty * dt if vehicle.has_lateral_contact else 0.0
+        )
+
         # Idling must score worse than driving, or a stationary car is a stable optimum.
         idle = abs(vehicle.speed_forward) < cfg.idle_speed_threshold and not finished
         idle_term = -cfg.idle_penalty * dt if idle else 0.0
@@ -254,6 +287,7 @@ class ProgressReward:
             + slip_term
             + slide_term
             + step_term
+            + contact_term
             + idle_term
             + finish_term
         )
@@ -269,10 +303,28 @@ class ProgressReward:
             step=float(step_term),
             idle=float(idle_term),
             finish=float(finish_term),
+            contact=float(contact_term),
             progress_metres=clipped_delta,
             raw_progress_metres=float(raw_delta),
             clamped=clamped,
         )
+
+    def terminal_penalty(self, reason: EndReason) -> float:
+        """The one-off negative reward for a terminating failure ``reason``.
+
+        Applied by the environment on the step the failure is confirmed, so crash,
+        out-of-bounds, fell-off and wrong-way all produce a meaningful negative reward.
+        Reasons without a configured penalty (finish, stall, time limit, ...) return 0:
+        those failures are already shaped by their per-second terms.
+        """
+        cfg = self.config
+        table = {
+            EndReason.CRASH: cfg.crash_penalty,
+            EndReason.OUT_OF_BOUNDS: cfg.out_of_bounds_penalty,
+            EndReason.FELL_OFF: cfg.fell_off_penalty,
+            EndReason.WRONG_WAY: cfg.wrong_way_penalty,
+        }
+        return -float(table.get(reason, 0.0))
 
 
 __all__ = ["ProgressReward", "RewardBreakdown", "RewardConfig"]

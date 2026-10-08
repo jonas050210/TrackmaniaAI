@@ -31,7 +31,9 @@ being silently ignored.
 | `env` | `control_dt`, `action_repeat`, observation spec, reward weights, termination thresholds |
 | `sac` | `gamma`, `tau`, learning rates, temperature, network shape |
 | `replay` | `capacity`, `seed` |
-| `train` | steps, warm-up, batch size, UTD ratio, intervals, held-out evaluation, seed, device, resume |
+| `curriculum` | `enabled`, `stages` (track reveal + episode-length fraction per step range). Training split only |
+| `bc` | `enabled`, `demo_paths`, `epochs`, `batch_size`, `lr`, `val_fraction`, `shuffle` — behaviour cloning from demonstrations |
+| `train` | steps, warm-up, batch size, UTD ratio, intervals, held-out evaluation, seed, device, resume, `record_replays`/`replay_decimation`/`max_replays`, `model_store` |
 
 Three shipped configs, all of which pass `tmai validate-config`:
 
@@ -42,6 +44,9 @@ Three shipped configs, all of which pass `tmai validate-config`:
   validating plumbing and CI.
 * `multitrack_smoke.yaml` — the toy model across four synthetic tracks and two splits, with
   held-out evaluation. Exercises the whole generalisation path in a few seconds.
+* `pipeline_smoke.yaml` — the toy model with the full pipeline on: temporal observations
+  (`history_length: 3`), curriculum (track reveal + episode caps), behaviour cloning from a
+  recorded demonstration, and replay recording.
 
 ## The training loop
 
@@ -64,6 +69,18 @@ Properties worth knowing:
   track is sampled at each reset. See [GENERALIZATION.md](GENERALIZATION.md).
 * **Held-out evaluation cannot kill the run.** It executes on a separate environment and is
   wrapped, so a failure there is logged and training continues.
+* **Curriculum advances with the step counter.** `curriculum.enabled` reveals tracks from
+  easiest to hardest (by mean curvature + corner density) and can shorten early episodes;
+  the trainer logs `curriculum_stage` events and a `curriculum/stage` metric. Held-out
+  evaluation is **never** curriculum-filtered.
+* **Behaviour cloning can warm-start the policy.** With `bc.enabled`, demonstrations are
+  loaded and the actor is pretrained on them (logged as a `bc_pretrain` event) before RL
+  begins. Skipped when resuming — the resumed checkpoint already carries its warm start.
+* **Episodes can be recorded as replays.** `train.record_replays: true` writes a decimated
+  trajectory per episode to `<run>/replays/` (capped by `max_replays`), ready for the Replays
+  page and ghost comparison.
+* **Resource usage is in the metrics stream.** `system/*` keys (load, memory, disk, CUDA when
+  present) are logged alongside reward, so a dashboard can plot them without a second source.
 
 ## Resume
 
@@ -99,6 +116,89 @@ match an uninterrupted run.
 Note this is reproducibility of the training pipeline, not of the game. The real
 Trackmania physics is not deterministic across processes, so a real-game run will not
 reproduce exactly even with a fixed seed — the simulated driver will.
+
+## Demonstrations and behaviour cloning
+
+SAC has to discover "throttle drives the car" from reward alone. A human lap teaches it
+directly, and the pipeline supports the whole loop:
+
+```bash
+# 1. drive one clean lap of a real map (the game reports YOUR inputs, not the AI's)
+tmai record-demo -c tmai/configs/default.yaml --out data/demos/my_lap.jsonl
+
+# 2a. pretrain a checkpoint from it (resumable like any other checkpoint)
+tmai pretrain -c tmai/configs/default.yaml --demo data/demos/my_lap.jsonl --out models/pretrained.pt
+tmai train -c tmai/configs/default.yaml --resume models/pretrained.pt
+
+# 2b. ...or let a training run do it automatically
+#     bc: {enabled: true, demo_paths: [data/demos/my_lap.jsonl], epochs: 20}
+```
+
+Demonstrations are JSON Lines — one transition per line: the observation, the
+**game-reported** action (`input_steer`/`input_gas`/`input_brake` read back from the game, so a
+human's real inputs are what get stored), position, speed, reward and race time. A torn
+trailing line (Ctrl-C mid-recording) is skipped on load, so an interrupted recording still
+leaves a usable dataset.
+
+`pretrain_policy` fits the policy's deterministic action to the recorded actions (MSE in the
+bounded action space) and, when the learner is normalisation-wrapped, first fits the
+normaliser's statistics on the demonstrations so the network trains on the same
+representation it will see during RL. It is a **warm start**, not an imitation objective:
+SAC takes over afterwards and can improve on the demonstrations.
+
+Two guards are deliberate: a demonstration whose observation/action dimensions do not match
+the learner is rejected (a demo recorded against a different observation layout is a
+configuration error, not data to truncate), and `record-demo` refuses the simulated driver
+unless `--allow-simulated-driver` is passed, because the toy model just echoes the AI's own
+outputs — a "human" demonstration recorded against it contains nothing a human did.
+
+## Replays and ghosts
+
+```bash
+tmai replay list --run runs/<run>                       # every recorded episode
+tmai replay show --run runs/<run> --replay episode_000042.json --track data/tracks/x.json --out lap.png
+tmai replay compare --run runs/<run> --replay episode_000042.json \
+        --other data/demos/my_lap.jsonl --track data/tracks/x.json --out gaps.json
+```
+
+A replay is a decimated trajectory (positions, speeds, actions, rewards, arc-length progress,
+race times) plus the outcome. The trainer records them when `train.record_replays: true`.
+
+Comparing an AI replay against a **ghost** (a human demonstration, or any other replay)
+answers "where is the time lost?" over a grid of arc-length stations. Two gap series are
+reported: the *station* gap (clock difference at each station — the racing-ghost view, only
+meaningful when both replays start together) and the *segment* gap (time per station pair —
+invariant to random start stations, so it is the honest answer for a partial lap). Only the
+arc length both replays actually drove is compared, so an early crash shortens the comparison
+instead of faking gaps over the rest of the track.
+
+## The model registry
+
+```bash
+tmai models register --name v1 --checkpoint runs/<run>/checkpoint_00200000.pt --tag baseline
+tmai models list
+tmai models info --name v1
+tmai models tag --name v1 --tag promoted
+tmai models delete --name v1
+```
+
+A registered model is **self-contained**: the registry copies the checkpoint into
+`models/<name>/` (`model.json` metadata + `policy.pt` weights), so deleting or renaming the
+run that produced it never breaks the model. Benchmarks and the GUI's Models page bind to the
+same store.
+
+## Benchmarking
+
+```bash
+tmai benchmark --model v1=runs/<run-a> --model v2=runs/<run-b> \
+        --split validation,test --episodes 3 --name my-benchmark --out benchmarks/my-benchmark.json
+```
+
+Every model is evaluated on every split under one identical protocol — same tracks, same
+episode count, same determinism — so differences are the models, not the measurement. The
+report carries per-split numbers (a model that wins on validation but loses on test is
+visible, not averaged away), a single ranking score, and a printable table. Reports are JSON
+in `benchmarks/`; the GUI lists them and can start one as a job.
 
 ## Reward tuning
 
@@ -178,6 +278,11 @@ jq -c 'select(.event=="episode_end") | {track, end_reason, progress}' runs/<run>
 dashboard snapshot (status, downsampled curves, episodes, evaluations, checkpoints, manifest,
 log tail) that a GUI can bind to.
 
+The metrics stream also carries `system/*` keys (CPU load, memory, disk, CUDA when present),
+logged every `train.log_interval` steps, and `curriculum/stage` when a curriculum is active.
+
+The same data is what `tmai serve` exposes to the GUI — see [GUI.md](GUI.md).
+
 `metrics.jsonl` is append-only JSON Lines rather than a binary format so that it survives a
 killed process, can be read line by line, and needs no special tooling.
 
@@ -232,5 +337,5 @@ pipeline can be developed and CI-tested without the game.
 
 The trainer refuses it unless `driver.allow_simulated: true` / `--allow-simulated-driver`. Every
 run records `driver: simulated` in its manifest and the CLI prints a banner. `tmai
-record-track` refuses it outright, because recording a "map" from the toy model would be
-actively misleading.
+record-track` and `tmai record-demo` refuse it outright, because recording a "map" or a
+"human lap" from the toy model would be actively misleading.

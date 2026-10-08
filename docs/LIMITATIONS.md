@@ -54,7 +54,17 @@ Three categories are used throughout:
 | Evaluation reports (per-track, per-split, gap) | **Verified** | 38 tests against artefacts from a real training run. |
 | Status/compare CLI and dashboard API | **Verified** | 25 + 38 tests. |
 | Simplified track visualisation | **Verified** | Headless PNG + `.obj`. |
-| **Total** | | **568 tests, `ruff` clean, 93% statement coverage** |
+| Driving rules (crash/OOB/fall/wrong-way → immediate respawn + penalty) | **Verified** | 27 tests incl. impact vs scrape vs parking, reward-exploit checks, failure-reason recording. |
+| Temporal observations (frame stacking) | **Verified** | 13 tests: stacker ordering/reset/guards, spec, env dims, translation invariance under stacking, checkpoint dim guard. |
+| Curriculum learning | **Verified** | 23 tests: spec validation, difficulty order, stage resolution, reveal + episode caps, env/trainer integration. |
+| Human demonstrations + behaviour cloning | **Verified (simulated driver)** | 14 demo tests + 11 BC tests. **The recording path has never run against the real game** — it needs a human at the wheel of a live Trackmania. |
+| Replays & ghost comparison | **Verified** | 20 tests: round-trips, decimation, store pruning, station + start-invariant segment gaps, overlap clamping. |
+| Model registry | **Verified** | 13 tests: register/list/get/delete/tag, name validation, corrupt-checkpoint handling, wrapped-learner unwrap. |
+| Benchmarking | **Verified** | 7 tests: ranking, run-dir resolution, serialisation, empty-split rejection. |
+| Resource monitoring | **Verified** | 9 tests; degrades to `None` when a counter is unavailable. |
+| GUI backend (HTTP + WebSocket + jobs) | **Verified** | 44 tests over FastAPI's TestClient, including a real training subprocess started through `POST /api/train`, and a WebSocket tick. |
+| GUI frontend | **Built and type-checked; verified by serving it** | `npm run build` (tsc + vite) is clean; the built app was served by `tmai serve` and its pages/API exercised over HTTP. **Not verified in a real browser with a human user.** |
+| **Total** | | **746 tests, `ruff` clean** |
 
 Measured with `pytest --cov=tmai --cov-report=term-missing`. Coverage is high everywhere except
 one file, deliberately:
@@ -62,7 +72,7 @@ one file, deliberately:
 | File | Coverage | Why |
 |---|---|---|
 | `tmai/game/tminterface/session.py` | **43%** | The Windows named-shared-memory transport. The untested lines are the ones that require a running game and cannot execute anywhere else. |
-| `tmai/cli.py` | 89% | The remainder is `doctor --calibrate` and `record-track`, both of which drive the real game. |
+| `tmai/cli.py` | ~90% | The remainder is `doctor --calibrate`, `record-track` and `record-demo`, all of which drive the real game. |
 
 A low number on the transport is the honest result, not a gap to paper over: testing it here
 would mean faking the game.
@@ -74,6 +84,8 @@ would mean faking the game.
 | The reward function produces good driving in the real game | **Requires the real PC** — weights are reasoned defaults, never tuned against real physics. |
 | A policy trained here can drive a real map | **Not done** — no real training has happened. |
 | The agent generalises to unseen *real* maps | **Not done** — generalisation is proven only across four synthetic centrelines. |
+| A human has driven a demonstration into `tmai record-demo` | **Not done** — the recording path is tested against the simulated driver only; it has never captured a real human's inputs from a live game. |
+| The GUI has been used by a human in a real browser | **Not done** — the frontend is built, type-checked and served, and its API is exercised by tests and over HTTP; no human has clicked through it yet. |
 
 ---
 
@@ -105,6 +117,11 @@ several are the kind that produce *plausible-looking but wrong* results rather t
 | Nested dicts were stringified in `events.jsonl` | Evaluation reports were written as the *string* `"{'a': 1}"`, breaking machine readability. |
 | Episode events did not record which track they ran on | Per-track episode analysis was impossible for a multi-track run; a bad track looked like a bad policy. |
 | `Any` used but not imported in `tmai/cli.py` | A `NameError` waiting on the `compare` code path; caught by `ruff`. |
+| `evaluate_tracks` assumed a `MultiTrackEnv` | A single-track split builds a plain `TrackmaniaEnv` (no `select_track`), so evaluating/benchmarking a one-track library crashed with `AttributeError` instead of reporting. Found by an API-level evaluation job; fixed to pin only when the env supports it and to refuse a track the env does not hold. |
+| Run links keyed by manifest `run_name` but endpoints keyed by directory name | With `--run-name`, the two differ, so a UI linking by run name 404'd. Found by exercising the live server; `list_runs` now reports both ids and the server resolves either. |
+| Replay comparison was not start-station invariant | With `random_start_station`, comparing absolute race times at each station made a partial lap look like it was losing time it never had a chance to lose. Segment gaps (time per station pair) are now the headline metric. |
+| The final curriculum stage re-applied the episode cap | A `1.0` length fraction overrode the env's own `max_steps` with the same value — harmless but wrong in principle, and it broke the "no cap" contract. `episode_max_steps` now returns `None` for full-length stages. |
+| The model registry read dims off a normalisation-wrapped learner | `observation_dim`/`action_dim` came back `null` for every wrapped checkpoint. The registry now unwraps `inner`. |
 
 ---
 
@@ -188,6 +205,13 @@ With a deterministic policy and the simulated driver, repeated evaluation episod
 identical, so `eval_episodes > 1` wastes time there. Against the real game there is
 nondeterminism and repeated episodes are meaningful.
 
+### The GUI backend has no authentication
+
+`tmai serve` can start training runs, delete models and read files, and it binds to
+`0.0.0.0` by default (so it is reachable from preview proxies and other machines' browsers).
+It is a local tool: **do not run it on an untrusted network**; use `--host 127.0.0.1` if in
+doubt. See [`GUI.md`](GUI.md#security-model-read-this).
+
 ---
 
 ## What to do first on a real Windows host
@@ -204,6 +228,10 @@ In this order, because each step makes the next one trustworthy:
    coherent before committing to a long run.
 5. A short `tmai train` run (a few thousand steps) purely to confirm the loop runs against the
    real game and that `reward/progress` increases.
+6. `tmai record-demo` — drive one clean lap so the behaviour-cloning path is exercised against
+   real human input, then `tmai pretrain` from it.
+7. `tmai serve` — watch the run in the command center, and try the 3D track view and the
+   replay/ghost comparison.
 6. Record several more maps, then `tmai list-tracks data/tracks` to check the split geometry
    coverage is comparable.
 7. Only then, a long run.

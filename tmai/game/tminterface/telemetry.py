@@ -16,8 +16,11 @@ Attribute names used below were taken from ``tminterface`` 1.0.2 ``structs.py``:
 * ``SimStateData.rotation_matrix`` -- 3x3 matrix (``[[0,0,0]]*3`` when unset).
 * ``SimStateData.flags`` -- bitmask of ``SIM_HAS_*`` flags.
 * ``SimStateData.scene_mobil`` -- ``SceneVehicleCar`` with ``.sync_vehicle_state``
-  (``speed_forward``, ``speed_sideward``, ``rpm``, ``gearbox_state``), ``.engine``
-  (``gear``, ``max_rpm``) and ``.is_sliding``.
+  (``speed_forward``, ``speed_sideward``, ``rpm``, ``gearbox_state``, ``input_steer``,
+  ``input_gas``, ``input_brake``), ``.engine`` (``gear``, ``max_rpm``), ``.is_sliding``
+  and ``.has_any_lateral_contact`` (the game's own wall-contact flag).
+* ``SimStateData.simulation_wheels`` -- four ``SimulationWheel`` structs whose
+  ``.real_time_state.has_ground_contact`` reports per-wheel ground contact.
 * ``SimStateData.player_info`` -- ``PlayerInfoStruct`` with ``race_time`` (ms),
   ``race_finished``, ``cur_cp_count``, ``display_speed``.
 """
@@ -47,6 +50,9 @@ class _CarStateLike(Protocol):
     speed_sideward: float
     rpm: float
     gearbox_state: int
+    input_steer: float
+    input_gas: float
+    input_brake: float
 
 
 class _EngineLike(Protocol):
@@ -54,10 +60,19 @@ class _EngineLike(Protocol):
     max_rpm: float
 
 
+class _RealTimeStateLike(Protocol):
+    has_ground_contact: bool
+
+
+class _WheelLike(Protocol):
+    real_time_state: _RealTimeStateLike
+
+
 class _CarLike(Protocol):
     sync_vehicle_state: _CarStateLike
     engine: _EngineLike
     is_sliding: bool
+    has_any_lateral_contact: bool
 
 
 class _PlayerInfoLike(Protocol):
@@ -77,6 +92,7 @@ class SimStateLike(Protocol):
     player_info: _PlayerInfoLike
     race_time: Any
     num_respawns: int
+    simulation_wheels: Any
 
 
 def has_dynamics(sim_state: SimStateLike) -> bool:
@@ -119,6 +135,30 @@ def _finite(value: Any, default: float = 0.0) -> float:
     return out if math.isfinite(out) else default
 
 
+def _wheel_ground_contacts(sim_state: SimStateLike) -> int | None:
+    """Count wheels reporting ground contact, or ``None`` when the state lacks the data.
+
+    ``SimStateData.simulation_wheels`` holds four ``SimulationWheel`` structs, each with a
+    ``real_time_state.has_ground_contact`` flag. The lookup is defensive: a stub or an older
+    struct without the field yields ``None``, and the caller then falls back to the
+    conservative default rather than guessing.
+    """
+    wheels = getattr(sim_state, "simulation_wheels", None)
+    if wheels is None:
+        return None
+    count = 0
+    seen = 0
+    for wheel in wheels:
+        real_time = getattr(wheel, "real_time_state", None)
+        contact = getattr(real_time, "has_ground_contact", None)
+        if contact is None:
+            return None
+        seen += 1
+        if bool(contact):
+            count += 1
+    return count if seen else None
+
+
 def vehicle_state_from_sim_state(
     sim_state: SimStateLike,
     *,
@@ -148,6 +188,13 @@ def vehicle_state_from_sim_state(
     speed_forward = _finite(car_state.speed_forward)
     speed_sideward = _finite(car_state.speed_sideward)
 
+    # Ground contact comes from the game's per-wheel flags when the struct carries them.
+    # The previous behaviour (hard-coded True) meant "fell off the map" could never be
+    # detected from real telemetry; a stub without the wheels region still gets the
+    # conservative default.
+    wheel_contacts = _wheel_ground_contacts(sim_state)
+    has_ground_contact = True if wheel_contacts is None else wheel_contacts > 0
+
     return VehicleState(
         position=_as_vec3(sim_state.position) * float(position_scale),
         velocity=_as_vec3(sim_state.velocity) * float(position_scale),
@@ -157,7 +204,14 @@ def vehicle_state_from_sim_state(
         rpm=_finite(car_state.rpm),
         gear=int(_finite(getattr(car.engine, "gear", 0))),
         is_sliding=bool(getattr(car, "is_sliding", False)),
-        has_ground_contact=True,
+        has_ground_contact=has_ground_contact,
+        # The game's own lateral-contact flag: trusted over any derived signal by the
+        # crash detector (tmai.env.termination).
+        has_lateral_contact=bool(getattr(car, "has_any_lateral_contact", False)),
+        num_wheels_ground_contact=4 if wheel_contacts is None else int(wheel_contacts),
+        input_steer=_finite(getattr(car_state, "input_steer", 0.0)),
+        input_gas=_finite(getattr(car_state, "input_gas", 0.0)),
+        input_brake=_finite(getattr(car_state, "input_brake", 0.0)),
     )
 
 

@@ -404,6 +404,368 @@ def cmd_record_track(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- demonstrations & behaviour cloning ---------------------------------------------------
+
+
+def cmd_record_demo(args: argparse.Namespace) -> int:
+    """Record a human-driven lap as a behaviour-cloning demonstration."""
+    from tmai.training.demos import record_demonstration
+    from tmai.training.factory import (
+        ConfigError,
+        build_driver,
+        build_env,
+        build_library,
+        build_track,
+    )
+
+    config = _load_config(args)
+    if config.driver.kind == "simulated" and not config.driver.allow_simulated:
+        raise ConfigError(
+            "record-demo captures HUMAN driving. The simulated driver just echoes whatever "
+            "the AI outputs, so a demonstration recorded against it contains nothing a "
+            "human did. Record against the real game (driver.kind: tminterface), or pass "
+            "--allow-simulated-driver to produce a synthetic dataset for pipeline testing."
+        )
+
+    library = build_library(config)
+    track = library.train[0].track if library.train else build_track(config)
+    driver = build_driver(config, track)
+    driver.open()
+    env = build_env(driver, track, config)
+    try:
+        print(
+            "\nDrive one clean lap. The demonstration stores what the GAME reports your "
+            "inputs to be\n(SceneVehicleCarState.input_steer/gas/brake), not what the AI "
+            "outputs.\n"
+            "Recording stops at the finish line, at the step cap, or on Ctrl-C.\n"
+        )
+        demo = record_demonstration(
+            env,
+            out_path=args.out,
+            max_steps=args.max_steps,
+            metadata={"track": track.name, "driver": config.driver.kind},
+        )
+    finally:
+        env.close()
+        driver.close()
+    print(
+        f"\nrecorded {len(demo)} steps on {demo.metadata.get('track', track.name)} "
+        f"-> {args.out}"
+    )
+    print(f"  end reason : {demo.metadata.get('end_reason', '?')}")
+    print(f"  finished   : {demo.metadata.get('finished', False)}")
+    print("\nnext: tmai pretrain -c <config> --demo", args.out)
+    return 0
+
+
+def cmd_pretrain(args: argparse.Namespace) -> int:
+    """Supervised-pretrain the policy from demonstrations and save a resumable checkpoint."""
+    from tmai.agents.bc import pretrain_policy
+    from tmai.training.checkpoint import save_checkpoint
+    from tmai.training.demos import load_demonstrations
+    from tmai.training.factory import build_learner, build_library, build_multi_track_env
+
+    config = _load_config(args)
+    bc = config.bc
+    if args.epochs is not None:
+        bc.epochs = args.epochs
+    if args.batch_size is not None:
+        bc.batch_size = args.batch_size
+    if args.lr is not None:
+        bc.lr = args.lr
+    if not args.demo:
+        print("pretrain needs at least one --demo file", file=sys.stderr)
+        return 2
+
+    library = build_library(config)
+    env = build_multi_track_env(config, library, split="train", seed=config.train.seed)
+    try:
+        learner = build_learner(env, config)
+        demos = load_demonstrations(
+            args.demo,
+            observation_dim=learner.observation_dim,
+            action_dim=int(env.action_space.shape[0]),
+        )
+    finally:
+        env.close()
+
+    print(
+        f"behaviour cloning on {len(demos)} demonstration steps from "
+        f"{len(args.demo)} file(s): {bc.epochs} epochs, batch {bc.batch_size}, lr {bc.lr}"
+    )
+    stats = pretrain_policy(
+        learner,
+        demos,
+        epochs=bc.epochs,
+        batch_size=bc.batch_size,
+        lr=bc.lr,
+        val_fraction=bc.val_fraction,
+        shuffle=bc.shuffle,
+        seed=config.train.seed,
+        log_every=max(1, bc.epochs // 5),
+    )
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    saved = save_checkpoint(
+        out.parent,
+        step=0,
+        learner=learner,
+        config=config.to_dict(),
+        extra={"reason": "bc_pretrain", "demo_files": [str(p) for p in args.demo]},
+        keep=1,
+    )
+    if saved != out:
+        saved.replace(out)
+    print(f"\nsaved pretrained policy -> {out}")
+    for key, value in stats.items():
+        print(f"  {key:<24} {value:.5f}" if isinstance(value, float) else f"  {key:<24} {value}")
+    print("\nnext: tmai train -c <config> --resume", out)
+    return 0
+
+
+# -- model registry ---------------------------------------------------------------------
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    from tmai.registry import ModelStore, RegistryError
+
+    store = ModelStore(args.models_dir)
+    if args.models_action == "list":
+        models = store.list()
+        if not models:
+            print(f"no models registered in {store.root}")
+            return 0
+        print(f"{'name':<24} {'step':>9} {'grad':>8} {'best':>8} {'created':<20} tags")
+        print("-" * 84)
+        for model in models:
+            best = "--" if model.best_score is None else f"{model.best_score:.3f}"
+            tags = ",".join(model.tags)
+            print(
+                f"{model.name[:24]:<24} {model.step:>9} {model.gradient_steps:>8} "
+                f"{best:>8} {model.created_utc[:19]:<20} {tags}"
+            )
+        return 0
+
+    if args.models_action == "register":
+        try:
+            info = store.register(
+                args.name,
+                args.checkpoint,
+                tags=args.tag or [],
+                notes=args.notes or "",
+                overwrite=args.force,
+            )
+        except RegistryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"registered {info.name} -> {info.directory}")
+        print(f"  source checkpoint : {info.source_checkpoint}")
+        print(f"  step {info.step}, {info.gradient_steps} gradient steps")
+        return 0
+
+    if args.models_action == "info":
+        try:
+            info = store.get(args.name)
+        except RegistryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(info.as_dict(), indent=2, default=str))
+        return 0
+
+    if args.models_action == "delete":
+        try:
+            store.delete(args.name)
+        except RegistryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"deleted model {args.name}")
+        return 0
+
+    if args.models_action == "tag":
+        try:
+            info = store.add_tags(args.name, args.tag or [])
+        except RegistryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"{info.name}: tags = {', '.join(info.tags)}")
+        return 0
+
+    print(f"unknown models action {args.models_action!r}", file=sys.stderr)
+    return 2
+
+
+# -- benchmark ---------------------------------------------------------------------------
+
+
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    from tmai.training.benchmark import run_benchmark
+
+    config = _load_config(args)
+    models: list[tuple[str, str]] = []
+    for spec in args.model or []:
+        if "=" not in spec:
+            print(
+                f"--model expects label=checkpoint, got {spec!r}", file=sys.stderr
+            )
+            return 2
+        label, _, target = spec.partition("=")
+        models.append((label, target))
+    if not models:
+        print("benchmark needs at least one --model label=checkpoint", file=sys.stderr)
+        return 2
+
+    splits = (
+        [s.strip() for s in args.split.split(",") if s.strip()]
+        if args.split
+        else ["validation", "test"]
+    )
+    # Only keep splits that exist; an empty split would produce an empty report row.
+    from tmai.training.factory import build_library
+
+    library = build_library(config)
+    kept = [s for s in splits if library.by_split(s)]
+    dropped = [s for s in splits if s not in kept]
+    for split in dropped:
+        print(
+            f"warning: split {split!r} has no tracks in this library; skipping it",
+            file=sys.stderr,
+        )
+    splits = kept
+    if not splits:
+        print("none of the requested splits exist in the library", file=sys.stderr)
+        return 1
+
+    report = run_benchmark(
+        config,
+        models,
+        splits=splits,
+        episodes_per_track=args.episodes,
+        name=args.name,
+    )
+    print(f"\n=== benchmark: {report.name} ===")
+    print(report.table())
+    print(f"\nranking: {' > '.join(report.ranking)}")
+    if args.out:
+        report.save(args.out)
+        print(f"\nwrote {args.out}")
+    return 0
+
+
+# -- replays ----------------------------------------------------------------------------
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    from tmai.replay import EpisodeReplay, ReplayStore, compare_replays
+    from tmai.tracks.centerline import CenterlineTrack
+
+    # --run is a run directory; replays live in <run>/replays.
+    run_path = Path(args.run)
+    store = ReplayStore(run_path / "replays" if (run_path / "replays").is_dir() else run_path)
+    if args.replay_action == "list":
+        rows = store.list()
+        if not rows:
+            print(f"no replays in {args.run}")
+            return 0
+        print(f"{'episode':>8} {'step':>9} {'track':<20} {'end':<14} {'fin':>4} "
+              f"{'lap':>8} {'reward':>9} {'samples':>8}")
+        print("-" * 88)
+        for row in rows:
+            lap = "--" if not row["race_time"] else f"{row['race_time']:.2f}s"
+            print(
+                f"{row['episode']:>8} {row['step']:>9} {row['track'][:20]:<20} "
+                f"{row['end_reason'][:14]:<14} {'yes' if row['finished'] else 'no':>4} "
+                f"{lap:>8} {row['total_reward']:>9.2f} {row['num_samples']:>8}"
+            )
+        return 0
+
+    if args.replay_action == "show":
+        replay = store.load(args.replay)
+        print(f"replay {args.replay}: episode {replay.episode} on {replay.track!r}")
+        print(f"  end reason      {replay.end_reason or '-'}")
+        print(f"  finished        {replay.finished}")
+        print(f"  race time       {replay.race_time:.3f}s")
+        print(f"  total reward    {replay.total_reward:.2f}")
+        print(f"  progress        {replay.progress_fraction * 100:.1f}% of the lap")
+        print(f"  samples         {replay.num_samples}")
+        if args.out:
+            from tmai.viz.trackview import TrackView, TrackViewConfig
+
+            if not args.track:
+                print("--out needs --track <centreline JSON> to draw the corridor",
+                      file=sys.stderr)
+                return 2
+            track = CenterlineTrack.load(args.track)
+            view = TrackView(track, TrackViewConfig(show_corridor=True, show_curvature=True))
+            view.render(args.out, car_positions=replay.positions)
+            print(f"wrote {args.out}")
+        return 0
+
+    if args.replay_action == "compare":
+        if not args.other:
+            print("compare needs --other <replay file or demonstration JSONL>", file=sys.stderr)
+            return 2
+        ai = store.load(args.replay)
+        # The ghost can be another replay file or a human demonstration (JSONL from
+        # `tmai record-demo`); a demonstration is converted to a ghost replay on the fly.
+        try:
+            ghost = EpisodeReplay.load(args.other)
+        except (ValueError, json.JSONDecodeError):
+            from tmai.training.demos import Demonstration
+
+            ghost = EpisodeReplay.from_demonstration(Demonstration.load(args.other))
+        track = CenterlineTrack.load(args.track) if args.track else None
+        if track is None:
+            # Resolve the track from the replay's own name (recorded library first, then the
+            # synthetic suite) so a demonstration ghost can be compared without --track.
+            from tmai.tracks.synthetic import SYNTHETIC_TRACKS
+
+            name = ai.track or ghost.track
+            for candidate in (Path("data/tracks") / f"{name}.json", Path("data/tracks") / name):
+                if candidate.is_file():
+                    track = CenterlineTrack.load(candidate)
+                    break
+            if track is None and name in SYNTHETIC_TRACKS:
+                track = SYNTHETIC_TRACKS[name]()
+        comparison = compare_replays(ai, ghost, track=track)
+        print(f"AI replay vs ghost on {comparison.track!r}")
+        print(f"  {comparison.summary()}")
+        print(f"  AI race time    {comparison.ai_race_time:.3f}s (finished={comparison.ai_finished})")
+        print(f"  ghost race time {comparison.ghost_race_time:.3f}s (finished={comparison.ghost_finished})")
+        if args.out:
+
+            Path(args.out).write_text(
+                json.dumps(comparison.as_dict(), indent=2, default=str), encoding="utf-8"
+            )
+            print(f"  wrote {args.out}")
+        return 0
+
+    print(f"unknown replay action {args.replay_action!r}", file=sys.stderr)
+    return 2
+
+
+# -- serve ------------------------------------------------------------------------------
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the local GUI backend (API + WebSocket + static frontend)."""
+    from tmai.server.app import ServerConfig, run_server
+
+    config = ServerConfig(
+        host=args.host,
+        port=args.port,
+        runs_dir=args.runs_dir,
+        tracks_dir=args.tracks_dir,
+        models_dir=args.models_dir,
+        demos_dir=args.demos_dir,
+        benchmarks_dir=args.benchmarks_dir,
+        static_dir=args.static_dir,
+        config_path=args.config,
+    )
+    run_server(config, open_browser=not args.no_open)
+    return 0
+
+
 # -- visualisation ---------------------------------------------------------------------
 
 
@@ -820,6 +1182,81 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("targets", nargs="+", help="run directories to compare")
     compare.add_argument("--json", action="store_true")
     compare.set_defaults(func=cmd_compare)
+
+    demo = sub.add_parser(
+        "record-demo",
+        help="record a human-driven lap as a behaviour-cloning demonstration",
+    )
+    add_config_args(demo)
+    demo.add_argument("--out", required=True, help="output JSONL path, e.g. data/demos/lap.jsonl")
+    demo.add_argument("--max-steps", type=int, default=5000, help="safety cap on the lap")
+    demo.set_defaults(func=cmd_record_demo)
+
+    pre = sub.add_parser(
+        "pretrain",
+        help="behaviour-clone demonstrations into the policy, save a resumable checkpoint",
+    )
+    add_config_args(pre)
+    pre.add_argument("--demo", action="append", required=True,
+                     help="demonstration JSONL file (repeatable)")
+    pre.add_argument("--out", required=True, help="output checkpoint path, e.g. models/pretrained.pt")
+    pre.add_argument("--epochs", type=int, help="override bc.epochs")
+    pre.add_argument("--batch-size", type=int, help="override bc.batch_size")
+    pre.add_argument("--lr", help="override bc.lr", type=float)
+    pre.set_defaults(func=cmd_pretrain)
+
+    models = sub.add_parser("models", help="manage the model registry")
+    models.add_argument("models_action", choices=["list", "register", "info", "delete", "tag"])
+    models.add_argument("--models-dir", default="models", help="registry directory")
+    models.add_argument("--name", help="model name (register/info/delete/tag)")
+    models.add_argument("--checkpoint", help="checkpoint to register (register)")
+    models.add_argument("--tag", action="append", help="tag (register/tag, repeatable)")
+    models.add_argument("--notes", help="free-text notes (register)")
+    models.add_argument("--force", action="store_true", help="overwrite an existing model")
+    models.set_defaults(func=cmd_models)
+
+    bench = sub.add_parser(
+        "benchmark",
+        help="evaluate several models across splits and rank them",
+    )
+    add_config_args(bench)
+    bench.add_argument("--model", action="append",
+                       help="label=checkpoint (or run directory), repeatable")
+    bench.add_argument("--split", help="comma-separated splits (default: validation,test)")
+    bench.add_argument("--episodes", type=int, default=3, help="episodes per track per split")
+    bench.add_argument("--name", default="benchmark", help="benchmark name")
+    bench.add_argument("--out", help="write the report JSON here")
+    bench.set_defaults(func=cmd_benchmark)
+
+    replay = sub.add_parser("replay", help="inspect recorded episode replays")
+    replay.add_argument("replay_action", choices=["list", "show", "compare"])
+    replay.add_argument("--run", default="runs", help="run directory (or replay directory)")
+    replay.add_argument("--replay", help="replay file name (show/compare)")
+    replay.add_argument("--other", help="ghost replay file to compare against")
+    replay.add_argument("--track", help="centreline JSON (corridor rendering / comparison)")
+    replay.add_argument("--out", help="write a PNG (show) or JSON (compare) here")
+    replay.set_defaults(func=cmd_replay)
+
+    serve = sub.add_parser(
+        "serve", help="start the local GUI backend (API + WebSocket + web frontend)"
+    )
+    serve.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="interface to bind (default: all interfaces; this is a local tool with no "
+        "authentication, so do not expose it to an untrusted network)",
+    )
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--runs-dir", default="runs")
+    serve.add_argument("--tracks-dir", default="data/tracks")
+    serve.add_argument("--models-dir", default="models")
+    serve.add_argument("--demos-dir", default="data/demos")
+    serve.add_argument("--benchmarks-dir", default="benchmarks")
+    serve.add_argument("--static-dir", default="gui/dist",
+                       help="built frontend directory to serve at /")
+    serve.add_argument("--config", help="default config for the GUI's train form")
+    serve.add_argument("--no-open", action="store_true", help="do not open a browser")
+    serve.set_defaults(func=cmd_serve)
 
     return parser
 

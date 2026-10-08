@@ -70,6 +70,8 @@ METRIC_GROUPS: tuple[tuple[str, str], ...] = (
     ("heldout/", "Held-out evaluation"),
     ("throughput/", "Throughput"),
     ("normalizer/", "Normalisation"),
+    ("curriculum/", "Curriculum"),
+    ("system/", "System resources"),
 )
 
 
@@ -457,7 +459,12 @@ def _log_tail(run_dir: Path, *, lines: int = 40) -> list[str]:
 
 
 def list_runs(output_dir: str | Path) -> list[dict[str, Any]]:
-    """Summarise every run in a directory, newest first. For a run-picker UI."""
+    """Summarise every run in a directory, newest first. For a run-picker UI.
+
+    Each row carries both identifiers: ``name`` is the *directory* name (the canonical id
+    used by every other run endpoint), while ``run_name`` is the human label from the
+    manifest, which can differ when a run was started with ``--run-name``.
+    """
     output_dir = Path(output_dir)
     if not output_dir.is_dir():
         return []
@@ -467,6 +474,7 @@ def list_runs(output_dir: str | Path) -> list[dict[str, Any]]:
             status = run_status(child)
             runs.append(
                 {
+                    "name": child.name,
                     "run_dir": str(child),
                     "run_name": status.run_name,
                     "step": status.step,

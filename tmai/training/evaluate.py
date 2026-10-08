@@ -144,13 +144,34 @@ class TrackResult:
     def crash_rate(self) -> float:
         """Fraction of episodes that ended in something other than finishing or time limit.
 
-        A proxy for "drove badly": off-track, stalled, airborne. Truncation by time limit is
-        not a crash, it just means the lap is long.
+        A proxy for "drove badly": crashes, out-of-bounds, falls, off-track, stalled,
+        airborne, wrong-way. Truncation by time limit is not a crash, it just means the
+        lap is long.
         """
         if not self.episodes:
             return 0.0
-        bad = {"off_track", "stalled", "no_ground_contact", "game_error"}
+        bad = {
+            "crash",
+            "out_of_bounds",
+            "fell_off",
+            "off_track",
+            "stalled",
+            "no_ground_contact",
+            "wrong_way",
+            "game_error",
+        }
         return sum(1 for e in self.episodes if e.end_reason in bad) / len(self.episodes)
+
+    @property
+    def failure_reasons(self) -> dict[str, int]:
+        """How many episodes ended with each non-finish reason, for failure analysis."""
+        counts: dict[str, int] = {}
+        for episode in self.episodes:
+            if episode.finished and not episode.invalid_finish:
+                continue
+            reason = episode.end_reason or "unknown"
+            counts[reason] = counts.get(reason, 0) + 1
+        return counts
 
     def as_dict(self) -> dict[str, Any]:
         best = self.best_race_time
@@ -163,6 +184,7 @@ class TrackResult:
             "std_progress_fraction": round(self.std_progress_fraction, 4),
             "worst_progress_fraction": round(self.worst_progress_fraction, 4),
             "crash_rate": round(self.crash_rate, 4),
+            "failure_reasons": self.failure_reasons,
             "best_race_time": round(best, 3) if best is not None else None,
             "mean_race_time": round(self.mean_race_time, 3) if self.mean_race_time else None,
             "episodes_detail": [e.as_dict() for e in self.episodes],
@@ -286,6 +308,15 @@ class EvaluationReport:
         }
 
     @property
+    def failure_reasons(self) -> dict[str, int]:
+        """Episode end-reason counts across every track: the failure distribution."""
+        counts: dict[str, int] = {}
+        for track in self.tracks:
+            for reason, count in track.failure_reasons.items():
+                counts[reason] = counts.get(reason, 0) + count
+        return counts
+
+    @property
     def generalization_gap(self) -> float | None:
         """Train progress minus held-out progress. Positive means overfitting to seen maps.
 
@@ -359,6 +390,7 @@ class EvaluationReport:
             "mean_race_time": self.mean_race_time,
             "score": round(self.score, 4),
             "generalization_gap": self.generalization_gap,
+            "failure_reasons": self.failure_reasons,
             "by_split": self.by_split(),
             "tracks": [t.as_dict() for t in self.tracks],
         }
@@ -424,17 +456,47 @@ def run_episode(
     seed: int | None = None,
     track_name: str = "",
     split: str = "",
+    replay_recorder: Any | None = None,
 ) -> EpisodeResult:
-    """Run one evaluation episode and summarise it."""
+    """Run one evaluation episode and summarise it.
+
+    Args:
+        replay_recorder: an optional :class:`~tmai.replay.ReplayRecorder`; when given, the
+            episode's trajectory is recorded for replay/ghost analysis.
+    """
     observation, info = env.reset(seed=seed)
     result = EpisodeResult(track=track_name or str(info.get("track", "")))
     speeds: list[float] = []
     started = time.monotonic()
 
+    if replay_recorder is not None:
+        replay_recorder.reset()
+        frame = getattr(env, "last_frame", None)
+        if frame is not None:
+            replay_recorder.record(
+                position=frame.vehicle.position,
+                speed=frame.vehicle.speed_forward,
+                action=np.zeros(3, dtype=np.float32),
+                reward=0.0,
+                progress=float(info.get("progress", 0.0)),
+                race_time=float(info.get("race_time", 0.0)),
+            )
+
     was_off_track = False
     for _ in range(max_steps):
         action = learner.act(observation, deterministic=deterministic)
         observation, reward, terminated, truncated, info = env.step(action)
+        if replay_recorder is not None:
+            frame = getattr(env, "last_frame", None)
+            if frame is not None:
+                replay_recorder.record(
+                    position=frame.vehicle.position,
+                    speed=float(info.get("speed_forward", frame.vehicle.speed_forward)),
+                    action=np.asarray(action, dtype=np.float64).reshape(-1),
+                    reward=float(reward),
+                    progress=float(info.get("progress", 0.0)),
+                    race_time=float(info.get("race_time", frame.race.race_time)),
+                )
         result.steps += 1
         result.total_reward += float(reward)
         speeds.append(float(info.get("speed_forward", 0.0)))
@@ -565,9 +627,20 @@ def evaluate_tracks(
 
     for name, split in tracks:
         bucket = TrackResult(track=name, split=split)
+        if hasattr(env, "select_track"):
+            env.select_track(name)
+        else:
+            # A single-track split builds a plain TrackmaniaEnv (no track switching), so
+            # there is nothing to pin -- but the requested track must be the one it holds,
+            # otherwise the evaluation would silently measure the wrong map.
+            env_track = getattr(getattr(env, "track", None), "name", None)
+            if len(tracks) != 1 or (env_track is not None and env_track != name):
+                raise ValueError(
+                    f"cannot evaluate track {name!r} on a single-track environment holding "
+                    f"{env_track!r}; use a multi-track split or a matching configuration"
+                )
         for i in range(episodes_per_track):
             episode_seed = None if seed is None else seed + 7000 + i
-            env.select_track(name)
             bucket.episodes.append(
                 run_episode(
                     env,

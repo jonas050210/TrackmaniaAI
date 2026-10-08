@@ -178,3 +178,12 @@ Implement the `GameDriver` protocol in `tmai/game/<name>/driver.py` and register
 `tmai/training/factory.py::build_driver`. Nothing above `tmai.game` changes. An Openplanet
 backend would need a telemetry socket client plus a control path (virtual gamepad or an
 Openplanet input API) — both are outside the `GameDriver` contract's concerns.
+
+## Recording a human demonstration
+
+`tmai record-demo` drives the same `GameDriver` the trainer uses, but the inputs that get
+recorded are the ones the **game reports** (`SceneVehicleCarState.input_steer` /
+`input_gas` / `input_brake`, read back through `VehicleState.input_*`). With a human at the
+wheel of the real game, that is the human's real control; the AI's own outputs are irrelevant
+to the recording. The result is a JSONL dataset (`tmai/training/demos.py`) that
+`tmai pretrain` / `bc:` turns into a warm start. See [TRAINING.md](TRAINING.md#demonstrations-and-behaviour-cloning).

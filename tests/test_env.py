@@ -618,10 +618,15 @@ class TestProgressFractionMeasuresDrivingNotPlacement:
     @staticmethod
     def _env():
         from tmai.env.tm_env import EnvConfig, TrackmaniaEnv
-        from tmai.game.simulated import SimulatedGameDriver
+        from tmai.game.simulated import SimulatedDriverConfig, SimulatedGameDriver
 
         track = build_synthetic("s_curve")
-        driver = SimulatedGameDriver(track)
+        # Walls disabled: this class tests the *metric* under identical physics. With the
+        # toy model's walls enabled, the same controls from different start stations hit
+        # the wall at different times and legitimately diverge; crash behaviour has its
+        # own test class below.
+        driver = SimulatedGameDriver(track, SimulatedDriverConfig(wall_margin=1e9,
+                                                                 fall_margin=1e9))
         driver.open()
         return TrackmaniaEnv(driver, track, EnvConfig()), track
 
