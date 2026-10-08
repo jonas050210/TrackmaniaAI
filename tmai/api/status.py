@@ -336,10 +336,13 @@ def run_history(
         if not pairs:
             continue
         if len(pairs) > max_points:
+            last_pair = pairs[-1]
             stride = len(pairs) / max_points
             pairs = [pairs[int(i * stride)] for i in range(max_points)]
-            if pairs[-1] != (int(metrics[-1].get("step", 0)), pairs[-1][1]):
-                pairs.append((int(metrics[-1]["step"]), float(metrics[-1][name])))
+            # The last metrics record may contain a different group (e.g. evaluation
+            # rather than environment metrics). Append this series' last known point.
+            if pairs[-1] != last_pair:
+                pairs.append(last_pair)
         history.series.append(
             Series(
                 name=name,
@@ -478,7 +481,7 @@ def list_runs(output_dir: str | Path) -> list[dict[str, Any]]:
         return []
     runs = []
     for child in sorted(output_dir.iterdir(), reverse=True):
-        if child.is_dir() and (child / MANIFEST_NAME).exists():
+        if child.is_dir() and not child.is_symlink() and (child / MANIFEST_NAME).exists():
             status = run_status(child)
             runs.append(
                 {

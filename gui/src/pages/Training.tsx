@@ -89,9 +89,10 @@ export function Training() {
     setValidation(null);
     try {
       const payload: Record<string, unknown> = {
-        config_yaml: yaml,
         allow_simulated_driver: allowSimulated,
       };
+      if (preset === "__custom__") payload.config_yaml = yaml;
+      else payload.config_path = preset;
       payload.overrides = {
         "director.enabled": String(directorEnabled),
         "driver.allow_simulated": String(allowSimulated),
@@ -149,11 +150,9 @@ export function Training() {
             <label>Configuration preset</label>
             <select
               value={preset}
-              onChange={async (e) => {
+              onChange={(e) => {
                 setPreset(e.target.value);
-                // load the preset's YAML text through the validator endpoint is not possible;
-                // the backend stores whatever YAML we send, so fetch the file via the config
-                // endpoint only for the default. For presets, send the path instead.
+                setValidation(null);
               }}
             >
               {CONFIG_PRESETS.map((p) => (
@@ -276,44 +275,7 @@ export function Training() {
           <div className="btn-row">
             <button
               className="btn primary"
-              onClick={async () => {
-                if (preset !== "__custom__") {
-                  // send the preset path directly
-                  setStarting(true);
-                  try {
-                    const payload: Record<string, unknown> = {
-                      config_path: preset,
-                      allow_simulated_driver: allowSimulated,
-                    };
-                    payload.overrides = {
-                      "director.enabled": String(directorEnabled),
-                      "driver.allow_simulated": String(allowSimulated),
-                    };
-                    if (runName.trim()) payload.run_name = runName.trim();
-                    if (steps !== "") payload.steps = Number(steps);
-                    if (resume.trim()) payload.resume = resume.trim();
-                    const { job } = await api.train(payload);
-                    toast(`Training job started: ${job.id}`, "success");
-                    setSelectedJob(job);
-                    loadJobs();
-                    waitForJob(job.id, (j) => setSelectedJob(j)).then((finished) => {
-                      loadJobs();
-                      toast(
-                        finished.state === "done"
-                          ? "Training finished"
-                          : `Training ${finished.state}: ${finished.error ?? ""}`,
-                        finished.state === "done" ? "success" : "error"
-                      );
-                    });
-                  } catch (err) {
-                    toast(err instanceof Error ? err.message : String(err), "error");
-                  } finally {
-                    setStarting(false);
-                  }
-                } else {
-                  onStart();
-                }
-              }}
+              onClick={onStart}
               disabled={starting}
             >
               {starting ? <Spinner size={12} /> : "▶"} Start training

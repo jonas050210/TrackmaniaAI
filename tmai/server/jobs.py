@@ -32,6 +32,7 @@ JOBS_FILE_NAME = "jobs.jsonl"
 class JobState(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    CANCELLING = "cancelling"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -157,12 +158,14 @@ class JobManager:
             job = self._jobs.get(job_id)
             if job is None or job.state not in (JobState.QUEUED, JobState.RUNNING):
                 return False
-            job.state = JobState.CANCELLED
+            queued = job.state is JobState.QUEUED
+            job.state = JobState.CANCELLED if queued else JobState.CANCELLING
             event = self._cancel.get(job_id)
-        if event is not None:
-            event.set()
-        job.finished_utc = datetime.now(timezone.utc).isoformat()
-        job.log("cancelled by operator")
+            if event is not None:
+                event.set()
+            if queued:
+                job.finished_utc = datetime.now(timezone.utc).isoformat()
+        job.log("cancelled before start" if queued else "cancellation requested by operator")
         self._persist(job)
         return True
 
@@ -208,16 +211,23 @@ class JobManager:
             try:
                 result = job.fn(job) if job.fn is not None else None
             except Exception as exc:  # noqa: BLE001 - a job's failure is data, not a crash
-                job.state = JobState.FAILED
-                job.error = f"{type(exc).__name__}: {exc}"
-                job.log(f"FAILED: {job.error}")
-                job.log(traceback.format_exc(limit=5))
-                logger.exception("job %s failed", job.id[:8])
+                if self.is_cancelled(job):
+                    job.state = JobState.CANCELLED
+                    job.log("stopped after cancellation request")
+                else:
+                    job.state = JobState.FAILED
+                    job.error = f"{type(exc).__name__}: {exc}"
+                    job.log(f"FAILED: {job.error}")
+                    job.log(traceback.format_exc(limit=5))
+                    logger.exception("job %s failed", job.id[:8])
             else:
-                if job.state is JobState.RUNNING:
+                if self.is_cancelled(job):
+                    job.state = JobState.CANCELLED
+                    job.log("stopped after cancellation request")
+                else:
                     job.state = JobState.DONE
-                job.result = result
-                job.log("done")
+                    job.result = result
+                    job.log("done")
             finally:
                 job.finished_utc = datetime.now(timezone.utc).isoformat()
                 self._persist(job)
@@ -259,7 +269,7 @@ class JobManager:
                 continue
             latest[record.get("id", "")] = record
         for job_id, record in latest.items():
-            if record.get("state") in (JobState.RUNNING.value, JobState.QUEUED.value):
+            if record.get("state") in (JobState.RUNNING.value, JobState.CANCELLING.value, JobState.QUEUED.value):
                 job = Job(
                     id=job_id,
                     kind=str(record.get("kind", "unknown")),

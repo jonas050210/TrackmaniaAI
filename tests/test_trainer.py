@@ -452,6 +452,61 @@ class TestEvaluation:
         assert 0.0 <= report.finish_rate <= 1.0
         assert 0.0 <= report.mean_progress_fraction <= 1.0
 
+    def test_multitrack_evaluation_attributes_episodes_to_actual_tracks(self):
+        from tmai.tracks.library import TrackLibrary
+        from tmai.tracks.synthetic import oval, straight
+        from tmai.training.factory import build_multi_track_env
+
+        library = TrackLibrary()
+        library.add(straight(length=150.0), split="train")
+        library.add(oval(), split="train")
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        env = build_multi_track_env(config, library, split="train", seed=0)
+
+        class StraightAhead:
+            def act(self, observation, deterministic=True):
+                return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+        try:
+            report = evaluate_policy(env, StraightAhead(), episodes=4, max_steps=1, split="train")
+            assert {track.track for track in report.tracks} == {"straight", "oval"}
+            assert sum(track.num_episodes for track in report.tracks) == 4
+            assert all(episode.track == track.track for track in report.tracks for episode in track.episodes)
+        finally:
+            env.close()
+
+    def test_track_evaluation_checks_cancellation_during_episode(self):
+        from tmai.training.evaluate import evaluate_tracks
+
+        env, learner, _ = self._setup()
+        calls = []
+
+        def stop_after_one_step():
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError("cancelled")
+
+        try:
+            with pytest.raises(RuntimeError, match="cancelled"):
+                evaluate_tracks(
+                    env, learner, tracks=[(env.track.name, "train")],
+                    episodes_per_track=1, max_steps=50, cancel_check=stop_after_one_step,
+                )
+            assert len(calls) == 2
+        finally:
+            env.close()
+
+    def test_invalid_finish_reduces_finish_rate(self):
+        report = EvaluationReport.from_episodes([
+            EpisodeResult(track="map", finished=True, race_time=30.0),
+            EpisodeResult(track="map", finished=True, invalid_finish=True, end_reason="finished"),
+        ])
+        assert report.finish_rate == pytest.approx(0.5)
+        assert report.tracks[0].finish_rate == pytest.approx(0.5)
+        assert report.failure_reasons == {"invalid_finish": 1}
+
     def test_score_rewards_finishing(self):
         unfinished = EvaluationReport.from_episodes([EpisodeResult(progress_fraction=0.5, finished=False)]
         )

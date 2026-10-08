@@ -13,20 +13,21 @@ driver:
   frame_timeout_s: 30.0
   allow_simulated: false
 track:
-  path: null
-  directory: data/tracks
+  # Record this centreline first; the real driver cannot switch maps during a run.
+  path: data/tracks/my_map.json
+  directory: null
   pattern: '*.json'
   recursive: false
   synthetic: null
   synthetic_kwargs: {}
   synthetic_suite: []
   split_weights:
-    train: 0.7
-    validation: 0.15
-    test: 0.15
+    train: 1.0
+    validation: 0.0
+    test: 0.0
   explicit_splits: {}
 multi:
-  sample_tracks: true
+  sample_tracks: false
   random_start_station: false
   start_station_fraction: 1.0
   start_lateral_std: 0.0
@@ -141,13 +142,13 @@ train:
   log_interval: 200
   eval_interval: 20000
   eval_episodes: 3
-  held_out_eval_interval: 20000
+  held_out_eval_interval: 0
   held_out_eval_episodes: 2
   checkpoint_interval: 20000
   keep_checkpoints: 3
   seed: 0
   device: null
-  run_name: sac-multitrack
+  run_name: sac-one-map
   output_dir: runs
   resume: null
   max_wall_seconds: null

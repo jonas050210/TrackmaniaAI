@@ -572,7 +572,14 @@ class Trainer:
         self.log.log_event("evaluation", step=step, report=report.as_dict())
         logger.info("evaluation at step %d: %s", step, report.summary())
 
-        self._maybe_evaluate_held_out(step)
+        held_out = self._maybe_evaluate_held_out(step)
+        if held_out is not None:
+            # The two evaluations are separate so the held-out driver cannot disturb the
+            # training episode, but the reported gap must compare both at the same step.
+            combined = EvaluationReport(tracks=[*report.tracks, *held_out.tracks])
+            gap = combined.generalization_gap
+            if gap is not None:
+                self.log.log_metrics(step, {"eval/generalization_gap": gap})
 
         if report.score > self._best_score:
             self._best_score = report.score

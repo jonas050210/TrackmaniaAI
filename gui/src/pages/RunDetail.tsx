@@ -7,7 +7,7 @@ import { LineChart, toChartSeries } from "../components/Chart";
 import { LogViewer } from "../components/LogViewer";
 import { Badge, Empty, ErrorBox, Loading, formatBytes, formatNumber, formatPercent, timeAgo } from "../components/ui";
 
-const REWARD_METRICS = ["env/episode_reward", "reward/episode_reward", "env/mean_reward_100"];
+const REWARD_METRICS = ["reward/total", "reward/progress", "reward/off_track"];
 const PROGRESS_METRICS = ["env/progress_fraction", "env/episode_progress_fraction"];
 const LEARNER_METRICS = ["sac/critic_loss", "sac/actor_loss", "learner/temperature"];
 const SYSTEM_METRICS = ["system/memory_used_fraction", "system/load1"];

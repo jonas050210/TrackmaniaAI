@@ -16,10 +16,10 @@ and benchmarking, a model registry, replay/ghost analysis, and a **local web com
 | | |
 |---|---|
 | Real Trackmania integration | Implemented against TMInterface's documented API. **Not yet verified on a live game** — it needs a Windows host with Trackmania, which this repository's CI does not have. See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md). |
-| RL environment, reward, termination | Implemented and unit-tested (**869 passed, 9 skipped offline in the current full suite**). Crash/out-of-bounds/fall/wrong-way terminate immediately with distinct penalties; crash detection distinguishes impact, scrape and parking. |
+| RL environment, reward, termination | Implemented and unit-tested offline. Crash/out-of-bounds/fall/wrong-way terminate with distinct penalties; crash detection distinguishes impact, scrape and parking. |
 | SAC learner | Implemented from scratch, tested, including a Bellman fixed-point check. |
 | Temporal observations | Frame stacking (`observation.history_length`) with an env-owned stacker; translation invariance holds under stacking. |
-| Multi-track training + generalisation | Implemented and tested: track library, train/validation/test splits, leakage prevention, held-out evaluation. |
+| Multi-track training + generalisation | Implemented and tested offline with the simulated driver: track library, splits, leakage prevention, held-out evaluation. The real driver cannot switch maps yet. |
 | Curriculum learning | Training-only track reveal by difficulty + episode-length caps; held-out evaluation is never filtered. |
 | Human demonstrations + behaviour cloning | `tmai record-demo` reads game-reported human inputs by design; `tmai pretrain` (or `bc:` in config) warm-starts the policy. The live human-recording path has not been verified in Trackmania. |
 | Observation normalisation | Implemented as a learner decorator, so replay data stays valid as statistics improve. |
@@ -98,7 +98,8 @@ tmai validate-config -c tmai/configs/default.yaml
 
 `validate-config` catches a broken run before it costs you three hours: conflicting track
 sources, warm-up longer than the run, a replay buffer smaller than the batch, and the
-real-game/start-randomisation conflict described below.
+real-game/start-randomisation conflict described below. The real-game preset expects
+`data/tracks/my_map.json` after you record that map; validation does not create the file.
 
 ### 2. Prove the pipeline runs (no game needed)
 
@@ -123,7 +124,17 @@ tmai train -c tmai/configs/pipeline_smoke.yaml
 That demo is explicitly synthetic test data, **not human driving** and not a Trackmania
 result. The trainer refuses `driver.kind: simulated` unless it is explicitly allowed.
 
-### 3. Teach it from your own driving (optional)
+### 3. Record the real map, then optionally teach it from your driving
+
+On the Windows host with the matching map loaded in Trackmania, calibrate the connection
+and record its centreline before any command that uses the default preset:
+
+```bash
+tmai doctor --calibrate
+tmai record-track --out data/tracks/my_map.json --name my_map   # drive one clean lap
+```
+
+To warm-start from a human demonstration (optional):
 
 ```bash
 tmai record-demo -c tmai/configs/default.yaml --out data/demos/my_lap.jsonl   # drive one lap
@@ -134,13 +145,11 @@ tmai train     -c tmai/configs/default.yaml --resume models/pretrained.pt
 or set `bc.enabled: true` with `bc.demo_paths` in the config to pretrain automatically at
 the start of a training run.
 
-### 4. Drive the real game
+### 4. Train on the recorded map
 
-On the Windows host running Trackmania through TMInterface:
+On that Windows host, with the same map loaded in Trackmania:
 
 ```bash
-tmai doctor --calibrate                  # verify + measure the integration
-tmai record-track --out data/tracks/my_map.json --name my_map   # drive one clean lap
 tmai train -c tmai/configs/default.yaml
 ```
 
@@ -162,10 +171,11 @@ tmai play -c tmai/configs/default.yaml \
 ```
 
 The real driver cannot identify/switch the map for you: do not run it with a multi-map
-library or a centreline for a different map. `tmai play` refuses multi-track real-game
-libraries rather than silently selecting one. The default config trains on every centreline
-in `data/tracks/` with a 70/15/15 train/validation/test split, and evaluates on the held-out
-maps every 20 000 steps.
+library or a centreline for a different map. Real-game training and `tmai play` both refuse
+multi-track libraries rather than silently selecting one. The default config uses only
+`data/tracks/my_map.json`, which you must record from the map currently loaded in the game.
+It does not claim held-out results. Multi-track splits and held-out evaluation currently
+exercise the simulated pipeline, not automatic switching between real maps.
 
 ### 5. Inspect, compare, promote what you have
 
@@ -215,8 +225,9 @@ Every command accepts `-c config.yaml` and repeatable `--set section.field=value
 
 ## Generalisation: driving maps it has never seen
 
-Training on one map and testing on that map measures memorisation, not driving. Four
-mechanisms make the distinction enforceable rather than a matter of discipline:
+Training on one map and testing on that map measures memorisation, not driving. The
+following multi-map workflow is implemented and tested with the **simulated driver**, not
+with automatic real-game map switching. Its mechanisms make the distinction enforceable:
 
 * **Deterministic, family-aware splits.** A track's split is a stable function of its identity
   (map UID, or a hash of its geometry), unless related maps share an explicit `metadata.family`

@@ -156,26 +156,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             game_rows.append(("track", str(exc).splitlines()[0], "warn"))
 
         if config.driver.kind != "simulated":
-            # A configured centreline is the operator's signal that this is a game-host
-            # diagnostics run. The connection itself does not need geometry; pass None so a
-            # synthetic test centreline can never be mistaken for the real map geometry.
-            driver = build_driver(config, None) if track is not None else None
-            if driver is None:
-                game_rows.append(("driver", "not built (no track available)", "warn"))
+            # Calibrate before recording a centreline: telemetry conventions do not depend
+            # on track geometry. Never pass a synthetic or mismatched track to the driver.
+            driver = build_driver(config, None)
+            # A driver whose open() raised is NOT usable, so it must not stay bound:
+            # the --calibrate path below tests `driver is None` to decide whether to
+            # skip. Leaving it set would send calibration into a closed driver and
+            # report a secondary "open() has not been called" error over the real cause.
+            try:
+                driver.open()
+                info = driver.describe()
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                driver = None
+                game_rows.append(("driver", str(exc).splitlines()[0], "fail"))
             else:
-                # A driver whose open() raised is NOT usable, so it must not stay bound:
-                # the --calibrate path below tests `driver is None` to decide whether to
-                # skip. Leaving it set would send calibration into a closed driver and
-                # report a secondary "open() has not been called" error over the real cause.
-                try:
-                    driver.open()
-                    info = driver.describe()
-                except Exception as exc:  # noqa: BLE001 - report and continue
-                    driver = None
-                    game_rows.append(("driver", str(exc).splitlines()[0], "fail"))
-                else:
-                    game_rows.append(("driver", f"connected ({driver.name})", "ok"))
-                    game_rows.append(("checkpoints on map", str(info.get("checkpoint_total")), "ok"))
+                game_rows.append(("driver", f"connected ({driver.name})", "ok"))
+                game_rows.append(("checkpoints on map", str(info.get("checkpoint_total")), "ok"))
         else:
             game_rows.append(("driver", "simulated (NOT the real game)", "warn"))
     except Exception as exc:  # noqa: BLE001 - the whole point is to report failures
@@ -1551,9 +1547,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="start the local GUI backend (API + WebSocket + web frontend)")
     serve.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="interface to bind (default: all interfaces; this is a local tool with no "
-        "authentication, so do not expose it to an untrusted network)",
+        default="127.0.0.1",
+        help="interface to bind (default: loopback; --host 0.0.0.0 exposes an "
+        "unauthenticated API and requires a trusted network)",
     )
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--runs-dir", default="runs")

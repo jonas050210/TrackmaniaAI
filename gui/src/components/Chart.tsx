@@ -256,10 +256,10 @@ export function toChartSeries(
   return names
     .map((name, index) => {
       const found = history.series.find((s) => s.name === name);
-      if (!found || !found.points.length) return null;
+      if (!found || !found.steps.length) return null;
       return {
         name,
-        points: found.points,
+        points: found.steps.map((step, i) => ({ step, value: found.values[i] })),
         color: colors?.[index] ?? colorFor(index),
       };
     })

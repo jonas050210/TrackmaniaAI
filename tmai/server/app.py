@@ -52,10 +52,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from tmai import __version__
@@ -73,11 +73,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 class ServerConfig:
     """Where the server finds its data and what it serves."""
 
-    #: Bind interface. The default listens on all interfaces so the GUI is reachable
-    #: from browsers other than the server host (preview proxies, VMs, ...). The API
-    #: has no authentication by design -- it is a local tool, so do not expose it to
-    #: an untrusted network.
-    host: str = "0.0.0.0"
+    #: No authentication: bind to loopback unless the operator explicitly chooses
+    #: a trusted network interface (e.g. --host 0.0.0.0 behind an access-controlled proxy).
+    host: str = "127.0.0.1"
     port: int = 8765
     runs_dir: str = "runs"
     tracks_dir: str = "data/tracks"
@@ -120,6 +118,14 @@ def _safe_name(name: str, *, what: str = "name") -> str:
     return name
 
 
+def _within(path: Path, base: Path, *, what: str) -> Path:
+    """Resolve symlinks and reject paths outside an API-managed directory."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        raise HTTPException(status_code=400, detail=f"{what} must be inside {base}")
+    return resolved
+
+
 def _run_dir(state: ServerState, name: str) -> Path:
     """Resolve a run reference to its directory.
 
@@ -130,10 +136,10 @@ def _run_dir(state: ServerState, name: str) -> Path:
     base = state.config.resolve(state.config.runs_dir)
     path = base / _safe_name(name, what="run name")
     if path.is_dir():
-        return path
+        return _within(path, base, what="run")
     if base.is_dir():
         for child in sorted(base.iterdir()):
-            if not child.is_dir():
+            if not child.is_dir() or child.is_symlink():
                 continue
             manifest = child / "manifest.json"
             if not manifest.is_file():
@@ -198,13 +204,13 @@ def _resolve_track(state: ServerState, name: str):
     base = state.config.resolve(state.config.tracks_dir)
     for candidate in (base / f"{name}.json", base / name):
         if candidate.is_file():
-            return CenterlineTrack.load(candidate)
+            return CenterlineTrack.load(_within(candidate, base, what="track"))
     # Files can be named independently of the embedded track name. Resolve the public name
     # from metadata as a fallback so replay analysis and the viewer agree with the library.
     if base.is_dir():
         for candidate in sorted(base.rglob("*.json")):
             try:
-                track = CenterlineTrack.load(candidate)
+                track = CenterlineTrack.load(_within(candidate, base, what="track"))
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             if track.name == name or track.uid == name:
@@ -222,7 +228,7 @@ def _runs_light(state: ServerState) -> list[dict[str, Any]]:
         return out
     now = time.time()
     for child in sorted(base.iterdir(), reverse=True):
-        if not child.is_dir():
+        if not child.is_dir() or child.is_symlink():
             continue
         metrics = child / "metrics.jsonl"
         updated = metrics.stat().st_mtime if metrics.is_file() else child.stat().st_mtime
@@ -251,6 +257,11 @@ def _runs_light(state: ServerState) -> list[dict[str, Any]]:
 
 
 # -- job callables -----------------------------------------------------------------------
+
+
+def _check_job_cancelled(state: ServerState, job: Job) -> None:
+    if state.jobs.is_cancelled(job):
+        raise RuntimeError("job cancelled by operator")
 
 
 def _subprocess_job(
@@ -300,6 +311,10 @@ def _subprocess_job(
                 break
             time.sleep(0.2)
         reader.join(timeout=5)
+    if proc.returncode != 0 and not state.jobs.is_cancelled(job):
+        raise RuntimeError(
+            f"command exited with status {proc.returncode}; see job log {log_path}"
+        )
     return {
         "exit_code": proc.returncode,
         "log": str(log_path),
@@ -388,12 +403,18 @@ def _eval_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict[str,
             raise FileNotFoundError(f"no checkpoint found in run {run!r}")
     job.log(f"evaluating {path}")
 
-    splits = params.get("splits") or ["validation"]
-    splits = [s for s in splits if library.by_split(s)] or ["train"]
+    splits = params.get("splits") or (["validation"] if library.by_split("validation") else ["train"])
+    for split in splits:
+        if not library.by_split(split):
+            raise ValueError(
+                f"requested split {split!r} is empty (library has {library.counts()}); "
+                "select a populated split rather than substituting training results"
+            )
     reports: list[dict[str, Any]] = []
     env = None
     try:
         for split in splits:
+            _check_job_cancelled(state, job)
             job.log(f"split {split!r}: {len(library.by_split(split))} track(s)")
             env = build_multi_track_env(config, library, split=split, seed=config.train.seed)
             learner = build_learner(env, config)
@@ -409,6 +430,7 @@ def _eval_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict[str,
                 seed=config.train.seed,
                 label=f"gui-eval:{split}",
                 step=int(payload.get("step", 0)),
+                cancel_check=lambda: _check_job_cancelled(state, job),
             )
             reports.append(report.as_dict())
             job.log(f"  {split}: {report.summary()}")
@@ -418,6 +440,7 @@ def _eval_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict[str,
         if env is not None:
             env.close()
 
+    _check_job_cancelled(state, job)
     out_dir = state.config.resolve(state.config.state_dir) / "evaluations"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{job.id}.json"
@@ -448,6 +471,7 @@ def _benchmark_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict
         episodes_per_track=int(params.get("episodes", 3)),
         name=name,
         seed_repeats=int(params.get("seed_repeats", 3)),
+        cancel_check=lambda: _check_job_cancelled(state, job),
     )
     job.log(f"paired evaluation seeds: {report.evaluation_seeds}")
     for model in report.models:
@@ -461,6 +485,7 @@ def _benchmark_job(state: ServerState, job: Job, params: dict[str, Any]) -> dict
             f"{comparison.episodes} paired episodes"
         )
 
+    _check_job_cancelled(state, job)
     out_dir = state.config.resolve(state.config.benchmarks_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -515,12 +540,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     )
     app.state.tmai = state
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # The frontend uses relative /api URLs (Vite proxies them in development).
+    # Do not opt every website into reading this unauthenticated local API.
 
     # -- health & system ------------------------------------------------------------
 
@@ -605,12 +626,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     # -- tracks ----------------------------------------------------------------------
 
+    def _track_directory(directory: str | None) -> Path:
+        root = config.resolve(config.tracks_dir)
+        if not directory:
+            return root
+        path = Path(directory)
+        path = path if path.is_absolute() else (PROJECT_ROOT / path)
+        return _within(path, root, what="track directory")
+
     @app.get("/api/tracks")
     def tracks(directory: str | None = None) -> dict[str, Any]:
         from tmai.tracks.library import TrackLibrary, TrackLibraryError
 
-        base = Path(directory) if directory else config.resolve(config.tracks_dir)
-        base = base if base.is_absolute() else (PROJECT_ROOT / base)
+        base = _track_directory(directory)
         if not base.is_dir():
             return {
                 "directory": str(base),
@@ -618,6 +646,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                 "error": "not found",
                 "synthetic": ["straight", "oval", "s_curve", "figure_eight"],
             }
+        # The library loader accepts symlinks for CLI use; the HTTP API must not read
+        # linked JSON files pointing outside the configured track directory.
+        for candidate in base.glob("*.json"):
+            _within(candidate, config.resolve(config.tracks_dir), what="track")
         try:
             library = TrackLibrary.from_directory(base)
         except TrackLibraryError as exc:
@@ -654,13 +686,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             track = _resolve_track(state, safe_track_name)
             if track is not None:
                 return _track_payload(track)
-        base = Path(directory) if directory else config.resolve(config.tracks_dir)
-        base = base if base.is_absolute() else (PROJECT_ROOT / base)
+        base = _track_directory(directory)
         path = base / safe_track_name
         candidates = [path] if path.suffix == ".json" else [path.with_suffix(".json"), path]
         for candidate in candidates:
             if candidate.is_file():
-                return _track_payload(CenterlineTrack.load(candidate))
+                return _track_payload(CenterlineTrack.load(_within(candidate, base, what="track")))
         raise HTTPException(404, f"track {name!r} not found in {base}")
 
     # -- models ----------------------------------------------------------------------
@@ -820,11 +851,24 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     def _replay_store(run: str):
         from tmai.replay import ReplayStore
 
-        base = Path(run)
-        if not base.is_absolute():
-            candidate = config.resolve(config.runs_dir) / run
-            base = candidate if candidate.is_dir() else (PROJECT_ROOT / run)
-        return ReplayStore(base / "replays")
+        base = _run_dir(state, run)
+        return ReplayStore(_within(base / "replays", base, what="replay directory"))
+
+    def _replay_path(store, name: str) -> Path:
+        path = store.path / _safe_name(name, what="replay file")
+        return _within(path, store.path, what="replay file")
+
+    def _user_file(value: str, *, roots: tuple[Path, ...], suffixes: tuple[str, ...]) -> Path:
+        """Resolve a GUI-supplied filename only within its allowed data directories."""
+        path = Path(value)
+        if path.suffix.lower() not in suffixes:
+            raise HTTPException(400, "unsupported file type")
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        resolved = path.resolve()
+        if not any(resolved.is_relative_to(root.resolve()) for root in roots):
+            raise HTTPException(400, "file must be inside the configured data directories")
+        return resolved
 
     @app.get("/api/runs/{name}/analysis")
     def run_analysis(
@@ -866,7 +910,8 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     def replay_detail(run: str, file: str) -> dict[str, Any]:
 
         try:
-            replay = _replay_store(run).load(_safe_name(file, what="replay file"))
+            store = _replay_store(run)
+            replay = store.load(_replay_path(store, file))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -884,13 +929,21 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(400, "run is required")
         store = _replay_store(run)
         try:
-            ai = store.load(str(payload.get("a") or ""))
+            ai = store.load(_replay_path(store, str(payload.get("a") or "")))
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-        # The ghost can be either another replay file or a human demonstration (JSONL);
-        # a demonstration is converted to a ghost replay on the fly.
-        ghost_path = Path(str(payload.get("b") or ""))
+        # The ghost can come from this/another run's replay directory or the demos
+        # directory, but not from an arbitrary server-side filesystem path.
+        ghost_value = str(payload.get("b") or "")
+        if Path(ghost_value).name == ghost_value and (store.path / ghost_value).is_file():
+            ghost_path = _replay_path(store, ghost_value)
+        else:
+            runs_root = config.resolve(config.runs_dir)
+            demos_root = config.resolve(config.demos_dir)
+            ghost_path = _user_file(ghost_value, roots=(runs_root, demos_root), suffixes=(".json", ".jsonl"))
+            if ghost_path.is_relative_to(runs_root.resolve()) and ghost_path.parent.name != "replays":
+                raise HTTPException(400, "ghost replay must be in a run's replays directory")
         try:
             ghost = EpisodeReplay.load(ghost_path)
         except (FileNotFoundError, ValueError, json.JSONDecodeError):
@@ -904,7 +957,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         track = None
         track_path = payload.get("track")
         if track_path:
-            track = CenterlineTrack.load(str(track_path))
+            track = CenterlineTrack.load(
+                _user_file(str(track_path), roots=(config.resolve(config.tracks_dir),), suffixes=(".json",))
+            )
         else:
             track = _resolve_track(state, ai.track or ghost.track)
         try:
@@ -981,6 +1036,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.websocket("/api/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
+        # CORS does not apply to WebSockets. Browsers always send Origin; refuse
+        # cross-site reads of job/system data even when bound to loopback.
+        origin = websocket.headers.get("origin")
+        if origin and (
+            urlsplit(origin).scheme not in ("http", "https")
+            or urlsplit(origin).netloc.lower() != websocket.headers.get("host", "").lower()
+        ):
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         try:
             while True:

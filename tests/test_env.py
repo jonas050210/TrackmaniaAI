@@ -557,6 +557,23 @@ class TestEnvContract:
         assert env.driver._time - before == pytest.approx(3 * config.control_dt)
         env.close()
 
+    def test_action_repeat_accumulates_progress_and_reward_metrics(self, straight_track):
+        env = build_env(straight_track, EnvConfig(action_repeat=3))
+        try:
+            _, initial = env.reset(seed=0)
+            for _ in range(40):
+                _, reward, terminated, truncated, info = env.step(Action(throttle=1.0))
+                assert info["reward/total"] == pytest.approx(reward)
+                if terminated or truncated:
+                    break
+            assert info["progress"] > initial["progress"]
+            assert info["progress_fraction"] == pytest.approx(
+                (info["progress"] - initial["progress"]) / straight_track.length
+            )
+            assert info["reward/progress_metres"] > 0
+        finally:
+            env.close()
+
     def test_elapsed_time_uses_game_clock_instead_of_nominal_config(self, straight_track):
         from tmai.game.simulated import SimulatedDriverConfig
 
