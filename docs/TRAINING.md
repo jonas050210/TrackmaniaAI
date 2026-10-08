@@ -5,6 +5,10 @@
 One `RunConfig` describes a whole run. Load it from YAML, override individual fields from the
 command line, and the resolved result is written verbatim into the run manifest.
 
+Unknown keys are an error, and the message lists every one: `train.total_step` fails instead of
+silently training with the default step count. The exception is a run's own saved `config.yaml`,
+which is read leniently so that a resume survives retired keys.
+
 ```bash
 tmai validate-config -c tmai/configs/default.yaml      # check it before committing to a run
 tmai train -c tmai/configs/default.yaml \
@@ -106,7 +110,9 @@ multi-track sampling schedule when present, and the config. A resumed run contin
 counters rather than restarting them, and records `resumed_from` in its manifest.
 
 The replay buffer is **not** restored: it would dominate checkpoint size for a 1 M-transition
-buffer. A resumed run refills it during warm-up. This is a deliberate trade-off, and it means
+buffer. A resumed run starts with an empty buffer and does not repeat random warm-up: warm-up is
+keyed on the global step, so a run resumed past `warmup_steps` collects with the policy at once,
+and gradient updates begin once the buffer holds a batch. This is a deliberate trade-off, and it means
 **a resumed run does not reproduce the uninterrupted trajectory step for step.** It resumes the
 *learning state* exactly; the data it learns from next is freshly collected. Both halves of
 that sentence are pinned by `tests/test_reproducibility.py`.

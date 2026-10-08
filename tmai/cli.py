@@ -69,6 +69,7 @@ def _run_dir_config(checkpoint: str | None) -> Path | None:
 
 def _load_config(args: argparse.Namespace) -> RunConfig:
     source = getattr(args, "config", None)
+    from_run = False
     if not source:
         # Both `eval --checkpoint <run>` and `train --resume <run>` point at an existing run,
         # and in both cases the run's own config.yaml is the right one: the observation layout,
@@ -79,9 +80,11 @@ def _load_config(args: argparse.Namespace) -> RunConfig:
             found = _run_dir_config(getattr(args, attr, None))
             if found is not None:
                 source = str(found)
+                from_run = True
                 logger.info("using the run's saved configuration: %s", found)
                 break
-    config = RunConfig.from_yaml(source) if source else RunConfig()
+    # A run's own config.yaml may carry keys from an earlier build; a user-written file may not.
+    config = RunConfig.from_yaml(source, strict=not from_run) if source else RunConfig()
     overrides = parse_overrides(getattr(args, "set", None))
     if getattr(args, "allow_simulated_driver", False):
         overrides["driver.allow_simulated"] = True
