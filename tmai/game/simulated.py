@@ -53,6 +53,17 @@ class SimulatedDriverConfig:
     max_steer_angle: float = 0.55  # rad at |steer| = 1
     off_track_drag: float = 8.0  # extra linear damping off the racing surface
     lane_half_width: float = 5.0  # m; outside this the car is "off track"
+    #: Metres past the lane edge at which an invisible wall stops the car. The collision
+    #: sets the game-style lateral-contact flag and kills most of the speed, so the
+    #: crash -> respawn -> penalty path is exercisable without the real game.
+    wall_margin: float = 1.0
+    #: Fraction of the car's speed destroyed by a wall impact.
+    wall_impact_loss: float = 0.75
+    #: Metres past the lane edge beyond which the car has left the track entirely: no
+    #: ground contact and it sinks, modelling "fell off the map".
+    fall_margin: float = 6.0
+    #: Downward speed once off the track, m/s.
+    fall_speed: float = 5.0
     checkpoint_every: float = 60.0  # m of arc length between synthetic checkpoints
     seed: int | None = None
 
@@ -90,6 +101,9 @@ class SimulatedGameDriver:
             reports_checkpoints=True,
             reports_finish=True,
             reports_sliding=False,
+            # The toy model reports the same contact signals the real game does (lateral
+            # wall contact, per-wheel ground contact) so crash handling is testable here.
+            reports_contact=True,
             headless_capable=True,
             # True here because this driver owns the car's pose. The real game does not, and
             # reports False -- see the capability docstring in tmai.game.protocol.
@@ -97,7 +111,9 @@ class SimulatedGameDriver:
             max_speed_ratio=1000.0,
             notes=(
                 "TOY MODEL - not Trackmania. Used for pipeline tests and CI only.",
-                "Kinematic bicycle model; no tyres, no drift, no collisions.",
+                "Kinematic bicycle model; no tyres, no drift. Walls and falling off the "
+                "track are modelled crudely (speed loss + contact flags) so that crash "
+                "handling can be tested without the game.",
             ),
         )
 
@@ -161,11 +177,14 @@ class SimulatedGameDriver:
     def step(self, action: Action) -> GameFrame:
         self._require_open()
         action = action.clipped()
+        self._last_action = action
         cfg = self.config
         dt = cfg.dt
 
         projection = self.track.project(self._position)
         on_track = abs(projection.lateral_offset) <= cfg.lane_half_width
+        at_wall = abs(projection.lateral_offset) > cfg.lane_half_width + cfg.wall_margin
+        off_map = abs(projection.lateral_offset) > cfg.lane_half_width + cfg.fall_margin
 
         accel = action.throttle * cfg.max_accel
         decel = action.brake * cfg.max_brake
@@ -187,6 +206,24 @@ class SimulatedGameDriver:
         forward = np.array([math.sin(self._yaw), 0.0, math.cos(self._yaw)])
         self._position = self._position + forward * (self._speed * dt)
 
+        # Wall: an invisible barrier just past the lane edge. The impact destroys most of
+        # the speed (an impact signature the crash detector looks for) and raises the
+        # game-style lateral-contact flag. The car is not teleported -- it keeps its pose
+        # and simply loses the speed the collision absorbed.
+        self._lateral_contact = False
+        if at_wall and not off_map:
+            self._lateral_contact = True
+            self._speed *= 1.0 - cfg.wall_impact_loss
+
+        # Off the map: no wheels on the ground and the car sinks below the track plane.
+        if off_map:
+            self._wheels_ground = 0
+            self._position[1] -= cfg.fall_speed * dt
+        else:
+            self._wheels_ground = 4
+            # Stay on the track plane while driving on it.
+            self._position[1] = projection.centre[1]
+
         self._time += dt
         self._update_progress()
         return self._frame()
@@ -205,6 +242,9 @@ class SimulatedGameDriver:
         self._checkpoint_index = 0
         self._finished = False
         self._respawns = 0
+        self._lateral_contact = False
+        self._wheels_ground = 4
+        self._last_action = Action()
 
     def _update_progress(self) -> None:
         projection = self.track.project(self._position)
@@ -245,7 +285,12 @@ class SimulatedGameDriver:
             rpm=abs(self._speed) * 90.0 + 900.0,
             gear=int(min(6, 1 + abs(self._speed) // 15.0)),
             is_sliding=False,
-            has_ground_contact=True,
+            has_ground_contact=self._wheels_ground > 0,
+            has_lateral_contact=self._lateral_contact,
+            num_wheels_ground_contact=self._wheels_ground,
+            input_steer=self._last_action.steer,
+            input_gas=self._last_action.throttle,
+            input_brake=self._last_action.brake,
         )
         phase = RacePhase.FINISHED if self._finished else RacePhase.RUNNING
         race = RaceState(

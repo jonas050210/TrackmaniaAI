@@ -90,6 +90,24 @@ class VehicleState:
     gear: int = 0
     is_sliding: bool = False
     has_ground_contact: bool = True
+    #: The game's own "any lateral contact" flag (``SceneVehicleCar.has_any_lateral_contact``
+    #: in TMInterface's structs): the car is touching a wall or obstacle on its side. This is
+    #: the most trustworthy contact signal the game offers, so crash detection prefers it over
+    #: derived signals whenever the driver reports it (see
+    #: ``DriverCapabilities.reports_contact``). A brief scrape sets it for a tick or two;
+    #: a genuine crash keeps it set while the car loses speed, which is what distinguishes the
+    #: two (see :mod:`tmai.env.termination`).
+    has_lateral_contact: bool = False
+    #: How many of the four wheels currently report ground contact
+    #: (``SimulationWheel.real_time_state.has_ground_contact``). Zero for a period of time
+    #: means the car is airborne or has left the track entirely.
+    num_wheels_ground_contact: int = 4
+    #: The inputs the *player* (or the injected AI) is currently commanding, read back from
+    #: the game (``SceneVehicleCarState.input_steer`` / ``input_gas`` / ``input_brake``).
+    #: Used by demonstration recording: when a human drives, these are the human's inputs.
+    input_steer: float = 0.0
+    input_gas: float = 0.0
+    input_brake: float = 0.0
 
     def yaw(self) -> float:
         """Heading around the world up axis, radians, from the vehicle's forward vector.
@@ -148,6 +166,8 @@ class GameFrame:
             "speed_forward": self.vehicle.speed_forward,
             "is_sliding": self.vehicle.is_sliding,
             "gear": self.vehicle.gear,
+            "has_lateral_contact": self.vehicle.has_lateral_contact,
+            "num_wheels_ground_contact": self.vehicle.num_wheels_ground_contact,
         }
 
 
@@ -166,6 +186,11 @@ class DriverCapabilities:
     reports_checkpoints: bool = False
     reports_finish: bool = False
     reports_sliding: bool = False
+    #: Whether the driver reports the game's own contact state (lateral wall contact and
+    #: per-wheel ground contact). Crash detection trusts these game-reported flags over any
+    #: derived signal when this is True; when it is False the environment falls back to
+    #: kinematic inference (speed loss, airborne time, corridor excursion).
+    reports_contact: bool = False
     headless_capable: bool = False
     #: Whether the driver can place the car at an arbitrary point on the track rather than
     #: only at the start line. The real game cannot do this without recorded checkpoint
@@ -185,6 +210,7 @@ class DriverCapabilities:
             "reports_checkpoints": self.reports_checkpoints,
             "reports_finish": self.reports_finish,
             "reports_sliding": self.reports_sliding,
+            "reports_contact": self.reports_contact,
             "headless_capable": self.headless_capable,
             "supports_start_repositioning": self.supports_start_repositioning,
             "max_speed_ratio": self.max_speed_ratio,

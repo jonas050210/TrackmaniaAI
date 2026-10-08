@@ -28,6 +28,7 @@ from tmai.env.observation import (
     ObservationEncoder,
     ObservationInputs,
     ObservationSpec,
+    ObservationStacker,
 )
 from tmai.env.reward import ProgressReward, RewardBreakdown, RewardConfig
 from tmai.env.termination import (
@@ -74,6 +75,16 @@ class EnvConfig:
                 "min_progress_per_step": self.termination.min_progress_per_step,
                 "min_steps_before_stall": self.termination.min_steps_before_stall,
                 "no_ground_contact_limit": self.termination.no_ground_contact_limit,
+                "crash_speed_loss": self.termination.crash_speed_loss,
+                "crash_contact_steps": self.termination.crash_contact_steps,
+                "crash_speed_fraction": self.termination.crash_speed_fraction,
+                "min_speed_for_crash": self.termination.min_speed_for_crash,
+                "out_of_bounds_margin": self.termination.out_of_bounds_margin,
+                "out_of_bounds_steps": self.termination.out_of_bounds_steps,
+                "fall_height": self.termination.fall_height,
+                "fall_steps": self.termination.fall_steps,
+                "wrong_way_progress": self.termination.wrong_way_progress,
+                "wrong_way_steps": self.termination.wrong_way_steps,
             },
         }
 
@@ -108,9 +119,13 @@ class TrackmaniaEnv(gym.Env):
         self._encoder = ObservationEncoder(track, self.config.observation)
         self._reward_fn = ProgressReward(track, self.config.reward)
         self._termination = TerminationTracker(track, self.config.termination)
+        # Temporal stacking: the policy sees the last `history_length` encoded frames.
+        self._stacker = ObservationStacker(
+            self._encoder.dim, self.config.observation.history_length
+        )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self._encoder.dim,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self._stacker.stacked_dim,), dtype=np.float32
         )
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
@@ -130,12 +145,16 @@ class TrackmaniaEnv(gym.Env):
         self._nonfinite_observations = 0
         self._t_episode_start = 0.0
         self._reward_breakdown: RewardBreakdown = RewardBreakdown()
+        # -- curriculum (single-track training only; the step-cap lever) -----------------
+        self._curriculum = None
+        self._curriculum_step = 0
 
     # -- introspection --------------------------------------------------------------
 
     @property
     def observation_dim(self) -> int:
-        return self._encoder.dim
+        """Width of the observation the policy consumes (after temporal stacking)."""
+        return self._stacker.stacked_dim
 
     @property
     def observation_names(self) -> list[str]:
@@ -153,6 +172,15 @@ class TrackmaniaEnv(gym.Env):
             "driver": self.driver.describe(),
             "config": self.config.to_dict(),
         }
+
+    # -- curriculum -----------------------------------------------------------------
+
+    def attach_curriculum(self, curriculum) -> None:
+        """Attach a curriculum; only the episode-length lever applies to a single track."""
+        self._curriculum = curriculum
+
+    def set_curriculum_step(self, step: int) -> None:
+        self._curriculum_step = int(step)
 
     # -- gymnasium API --------------------------------------------------------------
 
@@ -179,9 +207,20 @@ class TrackmaniaEnv(gym.Env):
         self._end_reason = EndReason.RUNNING
         self._reward_breakdown = RewardBreakdown()
         self._termination.reset()
+        # A per-episode step cap: an explicit reset option wins, then the curriculum's
+        # episode-length lever. ``None`` restores the configured limit.
+        cap = options.get("max_steps") if options else None
+        if cap is None and self._curriculum is not None:
+            cap = self._curriculum.episode_max_steps(
+                self._curriculum_step, self.config.termination.max_steps
+            )
+        self._termination.max_steps_override = int(cap) if cap else None
+        # (cap is None for a full-length stage, which clears the override.)
         self._t_episode_start = time.monotonic()
 
-        obs = self._encode(frame, projection, yaw_rate=0.0)
+        # The temporal stack starts filled with this first frame, so the policy never sees
+        # a zero-padded window at the start of an episode.
+        obs = self._stacker.reset(self._encode_frame(frame, projection, yaw_rate=0.0))
         return obs, self._info(projection, RewardBreakdown(), EndReason.RUNNING)
 
     def step(
@@ -234,6 +273,16 @@ class TrackmaniaEnv(gym.Env):
         self._episode_steps += 1
         self._episode_progress += breakdown.progress_metres
         self._end_reason = result.reason
+
+        # A confirmed crash / out-of-bounds / fell-off / wrong-way ends the episode and
+        # carries a one-off negative reward. The penalty is applied here, on the confirming
+        # step, so it lands in the transition the learner actually sees.
+        penalty_reason = result.penalty_reason
+        if penalty_reason is not None:
+            penalty = self._reward_fn.terminal_penalty(penalty_reason)
+            total_reward += penalty
+            self._episode_return += penalty
+            breakdown.terminal_penalty = penalty
         self._reward_breakdown = breakdown
 
         obs = self._encode(frame, projection, yaw_rate=yaw_rate)
@@ -314,9 +363,10 @@ class TrackmaniaEnv(gym.Env):
         delta = float(np.arctan2(np.sin(delta), np.cos(delta)))
         return delta / dt
 
-    def _encode(
+    def _encode_frame(
         self, frame: GameFrame, projection: TrackProjection, *, yaw_rate: float
     ) -> np.ndarray:
+        """Encode one frame (no temporal stacking)."""
         obs = self._encoder.encode(
             ObservationInputs(
                 frame=frame,
@@ -331,6 +381,15 @@ class TrackmaniaEnv(gym.Env):
         if not np.all(np.isfinite(obs)):
             self._nonfinite_observations += 1
         return obs
+
+    def _encode(
+        self, frame: GameFrame, projection: TrackProjection, *, yaw_rate: float
+    ) -> np.ndarray:
+        """Encode one frame and push it onto the temporal stack."""
+        stacked = self._stacker.push(self._encode_frame(frame, projection, yaw_rate=yaw_rate))
+        if not np.all(np.isfinite(stacked)):
+            self._nonfinite_observations += 1
+        return stacked
 
     def _info(
         self,
@@ -377,6 +436,10 @@ class TrackmaniaEnv(gym.Env):
             "end_reason": reason.value,
             "driver": self.driver.name,
             "nonfinite_observations": self._nonfinite_observations,
+            # Game-trusted contact state, for crash analysis and the GUI.
+            "has_lateral_contact": frame.vehicle.has_lateral_contact,
+            "num_wheels_ground_contact": frame.vehicle.num_wheels_ground_contact,
+            "has_ground_contact": frame.vehicle.has_ground_contact,
         }
         info.update(breakdown.as_metrics())
         return info

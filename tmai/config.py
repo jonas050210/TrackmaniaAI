@@ -24,6 +24,7 @@ import yaml
 from tmai.agents.replay import ReplayBufferConfig
 from tmai.agents.sac import SACConfig
 from tmai.env.tm_env import EnvConfig
+from tmai.training.curriculum import CurriculumSpec
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,48 @@ class MultiTrackSpec:
 
 
 @dataclass
+class BCSpec:
+    """Behaviour-cloning pretraining from recorded human demonstrations.
+
+    SAC starts from a random policy. When demonstrations exist (recorded with
+    ``tmai record-demo``), a supervised pretraining pass teaches the policy network the
+    human's action mapping first, which typically shortens the aimless early phase
+    considerably. Purely additive: with no demonstrations configured, nothing changes.
+    """
+
+    #: Master switch.
+    enabled: bool = False
+    #: Demonstration files (JSONL, one ``{"observation": [...], "action": [...]}`` per line).
+    demo_paths: list[str] = field(default_factory=list)
+    #: Supervised epochs over the demonstrations before RL starts.
+    epochs: int = 10
+    #: Minibatch size for the supervised updates.
+    batch_size: int = 256
+    #: Learning rate for the supervised updates (separate from the SAC actor LR).
+    lr: float = 1e-3
+    #: Fraction of demonstrations held out for a validation loss report, in ``[0, 1)``.
+    val_fraction: float = 0.1
+    #: Shuffle the demonstrations each epoch (recommended; seeded, so reproducible).
+    shuffle: bool = True
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if not self.enabled:
+            return problems
+        if not self.demo_paths:
+            problems.append("bc.enabled is true but no demo_paths are configured")
+        if self.epochs < 1:
+            problems.append(f"bc.epochs must be >= 1, got {self.epochs}")
+        if self.batch_size < 1:
+            problems.append(f"bc.batch_size must be >= 1, got {self.batch_size}")
+        if self.lr <= 0:
+            problems.append(f"bc.lr must be positive, got {self.lr}")
+        if not 0.0 <= self.val_fraction < 1.0:
+            problems.append(f"bc.val_fraction must be in [0, 1), got {self.val_fraction}")
+        return problems
+
+
+@dataclass
 class TrainSpec:
     """Training loop settings."""
 
@@ -163,6 +206,15 @@ class TrainSpec:
     resume: str | None = None
     #: Stop after this many wall-clock seconds (useful for CI and for scheduled runs).
     max_wall_seconds: float | None = None
+    #: Record per-episode trajectories (positions, speeds, actions, rewards) as replays
+    #: under ``<run>/replays/``. Powers replay/ghost analysis in the GUI.
+    record_replays: bool = False
+    #: Keep only every Nth step of a recorded replay (storage/decimation control).
+    replay_decimation: int = 2
+    #: Maximum number of replay files kept per run (the newest are kept).
+    max_replays: int = 200
+    #: Where registered models live (see ``tmai models``).
+    model_store: str = "models"
 
 
 @dataclass
@@ -177,6 +229,10 @@ class RunConfig:
     sac: SACConfig = field(default_factory=SACConfig)
     replay: ReplayBufferConfig = field(default_factory=ReplayBufferConfig)
     train: TrainSpec = field(default_factory=TrainSpec)
+    #: Progressive track reveal / episode-length curriculum over training steps.
+    curriculum: CurriculumSpec = field(default_factory=CurriculumSpec)
+    #: Behaviour-cloning pretraining from recorded human demonstrations.
+    bc: BCSpec = field(default_factory=BCSpec)
 
     # -- validation -----------------------------------------------------------------
 
@@ -257,6 +313,14 @@ class RunConfig:
             problems.append(
                 "the observation spec produced an empty vector; enable at least one feature"
             )
+        for problem in self.env.observation.validate():
+            problems.append(f"env.observation: {problem}")
+        for problem in self.env.termination.validate():
+            problems.append(f"env.termination: {problem}")
+        for problem in self.curriculum.validate():
+            problems.append(problem)
+        for problem in self.bc.validate():
+            problems.append(problem)
 
         t = self.train
         if t.total_steps <= 0:
@@ -284,6 +348,10 @@ class RunConfig:
                 f"replay.capacity ({self.replay.capacity}) is below train.batch_size "
                 f"({t.batch_size}); no minibatch could ever be drawn"
             )
+        if t.replay_decimation < 1:
+            problems.append(f"train.replay_decimation must be >= 1, got {t.replay_decimation}")
+        if t.max_replays < 0:
+            problems.append(f"train.max_replays must be non-negative, got {t.max_replays}")
         if self.sac.gamma <= 0 or self.sac.gamma >= 1:
             problems.append(f"sac.gamma must be in (0, 1), got {self.sac.gamma}")
         if self.sac.tau <= 0 or self.sac.tau > 1:
@@ -321,7 +389,12 @@ class RunConfig:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"config file not found: {path}")
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return RunConfig.from_yaml_text(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def from_yaml_text(text: str) -> RunConfig:
+        """Parse a config from a YAML document (the GUI's config editor posts text)."""
+        data = yaml.safe_load(text) or {}
         if not isinstance(data, dict):
             raise ValueError(f"config root must be a mapping, got {type(data).__name__}")
         return RunConfig.from_dict(data)

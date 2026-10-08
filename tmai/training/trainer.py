@@ -32,6 +32,7 @@ from tmai.agents.replay import ReplayBuffer
 from tmai.config import RunConfig
 from tmai.env.tm_env import TrackmaniaEnv
 from tmai.game.errors import GameError
+from tmai.replay import REPLAY_DIR_NAME, ReplayRecorder, ReplayStore
 from tmai.runlog import RunLogger, make_run_dir
 from tmai.training.checkpoint import (
     latest_checkpoint,
@@ -112,6 +113,7 @@ class Trainer:
         buffer: ReplayBuffer,
         run_logger: RunLogger,
         held_out_env: Any | None = None,
+        curriculum: Any | None = None,
     ) -> None:
         self.config = config
         self.env = env
@@ -122,11 +124,23 @@ class Trainer:
         #: no held-out split simply never reports a generalisation gap.
         self.held_out_env = held_out_env
         self._held_out_env = held_out_env
+        #: Progressive track/episode curriculum, attached to the training env only.
+        self._curriculum = curriculum
+        self._last_curriculum_stage = -1
         self._episode = 0
         self._best_score = float("-inf")
         self._accumulator = EpisodeAccumulator()
         self._update_debt = 0.0
         self._last_eval_step = -1
+        # -- replay recording ------------------------------------------------------------
+        #: Records the current episode's trajectory when ``train.record_replays`` is on.
+        self._replay_recorder: ReplayRecorder | None = None
+        self._replay_store: ReplayStore | None = None
+        if config.train.record_replays:
+            self._replay_recorder = ReplayRecorder(
+                decimation=max(1, config.train.replay_decimation)
+            )
+            self._replay_store = ReplayStore(self.log.run_dir / REPLAY_DIR_NAME)
 
     # -- public API -----------------------------------------------------------------
 
@@ -153,6 +167,8 @@ class Trainer:
             environment=self.env.describe(),
             resumed_from=cfg.resume,
         )
+        if self._curriculum is not None:
+            self.log.update_manifest(curriculum=self._curriculum.describe())
 
         observation, info = self._reset_env()
         self.log.log_event(
@@ -171,8 +187,11 @@ class Trainer:
                     self.log.log_event("wall_clock_limit", step=step)
                     break
 
+                self._advance_curriculum(step)
+
                 action = self._select_action(observation, step)
                 next_observation, reward, terminated, truncated, info = self.env.step(action)
+                self._record_replay_step(action, reward, info)
                 self.buffer.add(
                     Transition(
                         observation=observation,
@@ -241,10 +260,98 @@ class Trainer:
 
     # -- internals ------------------------------------------------------------------
 
+    def _advance_curriculum(self, step: int) -> None:
+        """Push the current step into the env and log stage transitions."""
+        if self._curriculum is None:
+            return
+        setter = getattr(self.env, "set_curriculum_step", None)
+        if setter is None:
+            return
+        setter(step)
+        stage = self._curriculum.stage_index_at(step)
+        if stage != self._last_curriculum_stage:
+            self._last_curriculum_stage = stage
+            active = self._curriculum.active_track_names(step)
+            logger.info(
+                "curriculum stage %d at step %d: %s",
+                stage,
+                step,
+                f"{len(active)} track(s)" if active is not None else "all tracks",
+            )
+            self.log.log_event(
+                "curriculum_stage",
+                step=step,
+                stage=stage,
+                num_stages=self._curriculum.num_stages,
+                active_tracks=active,
+                episode_max_steps=self._curriculum.episode_max_steps(
+                    step, self.config.env.termination.max_steps
+                ),
+            )
+
     def _reset_env(self) -> tuple[np.ndarray, dict[str, Any]]:
         observation, info = self.env.reset()
         self._accumulator.reset()
+        if self._replay_recorder is not None:
+            self._replay_recorder.reset()
+            frame = getattr(self.env, "last_frame", None)
+            if frame is not None:
+                self._replay_recorder.record(
+                    position=frame.vehicle.position,
+                    speed=frame.vehicle.speed_forward,
+                    action=np.zeros(3, dtype=np.float32),
+                    reward=0.0,
+                    progress=float(info.get("progress", 0.0)),
+                    race_time=float(info.get("race_time", 0.0)),
+                )
         return observation, info
+
+    # -- replay recording -------------------------------------------------------------
+
+    def _record_replay_step(
+        self, action: np.ndarray, reward: float, info: dict[str, Any]
+    ) -> None:
+        """Append one step to the current episode's replay, if recording is enabled."""
+        if self._replay_recorder is None:
+            return
+        frame = getattr(self.env, "last_frame", None)
+        if frame is None:
+            return
+        self._replay_recorder.record(
+            position=frame.vehicle.position,
+            speed=float(info.get("speed_forward", frame.vehicle.speed_forward)),
+            action=np.asarray(action, dtype=np.float64).reshape(-1),
+            reward=float(reward),
+            progress=float(info.get("progress", 0.0)),
+            race_time=float(info.get("race_time", frame.race.race_time)),
+        )
+
+    def _save_replay(self, step: int, info: dict[str, Any]) -> None:
+        """Write the finished episode's replay to ``<run>/replays/``."""
+        if self._replay_recorder is None or self._replay_store is None:
+            return
+        if self._replay_recorder.steps == 0:
+            return
+        replay = self._replay_recorder.build(
+            episode=self._episode,
+            step=step,
+            track=str(info.get("track", "")),
+            split=str(info.get("split", "train")),
+            end_reason=str(info.get("end_reason", "")),
+            finished=bool(info.get("finished", False)),
+            race_time=float(info.get("race_time", 0.0)),
+            total_reward=round(self._accumulator.reward, 4),
+            progress_fraction=float(info.get("progress_fraction", 0.0)),
+            source="training",
+            metadata={"episode_steps": self._accumulator.steps},
+        )
+        path = self._replay_store.save(
+            replay, max_replays=max(0, self.config.train.max_replays)
+        )
+        logger.info(
+            "recorded replay %s (%d samples, %s)",
+            path.name, replay.num_samples, replay.end_reason or "running",
+        )
 
     def _select_action(self, observation: np.ndarray, step: int) -> np.ndarray:
         if step <= self.config.train.warmup_steps:
@@ -272,6 +379,7 @@ class Trainer:
     def _on_episode_end(self, step: int, info: dict[str, Any]) -> None:
         self._episode += 1
         elapsed = max(1e-9, time.monotonic() - self._accumulator.started)
+        self._save_replay(step, info)
         self.log.log_event(
             "episode_end",
             step=step,
@@ -324,6 +432,13 @@ class Trainer:
         record.update(metrics)
         record.update(self.buffer.statistics())
         record["learner/temperature"] = float(getattr(self.learner, "temperature", 0.0))
+        if self._curriculum is not None:
+            record["curriculum/stage"] = float(self._curriculum.stage_index_at(step))
+        # Resource usage rides along with the metrics so a dashboard can plot it against
+        # reward without a second data source. Stdlib-only; missing counters are skipped.
+        from tmai.monitoring import flat_system_metrics
+
+        record.update(flat_system_metrics())
         self.log.log_metrics(step, record)
         logger.info(
             "step %d | ep %d | progress %.1f%% | %.1f steps/s | %s",
@@ -449,6 +564,7 @@ class Trainer:
 
 def train_from_config(config: RunConfig) -> TrainerResult:
     """Build everything from ``config`` and run training. The ``tmai train`` entry point."""
+    from tmai.training.curriculum import Curriculum
     from tmai.training.factory import (
         build_buffer,
         build_learner,
@@ -462,6 +578,24 @@ def train_from_config(config: RunConfig) -> TrainerResult:
     env = build_multi_track_env(config, library, split="train", seed=config.train.seed)
     learner = build_learner(env, config)
     buffer = build_buffer(env, config)
+
+    # The curriculum is resolved over the *training* tracks and attached to the training
+    # environment only; held-out evaluation always sees every track at full length.
+    curriculum = None
+    if config.curriculum.enabled:
+        entries = library.by_split("train")
+        if not entries:
+            raise ValueError("curriculum.enabled is true but the train split is empty")
+        curriculum = Curriculum(config.curriculum, entries)
+        attacher = getattr(env, "attach_curriculum", None)
+        if attacher is not None:
+            attacher(curriculum)
+        logger.info(
+            "curriculum: %d stage(s) over %d training track(s); reveal order %s",
+            curriculum.num_stages,
+            len(entries),
+            curriculum.difficulty_order(),
+        )
 
     # A held-out environment is built only when there is something to hold out and the run
     # asked for it. Building one unconditionally would open game connections for nothing.
@@ -482,7 +616,37 @@ def train_from_config(config: RunConfig) -> TrainerResult:
         seed=config.train.seed,
         extra_manifest={"tracks": library.report()},
     ) as run_logger:
-        trainer = Trainer(config, env, learner, buffer, run_logger, held_out_env=held_out_env)
+        # Behaviour cloning: warm-start the policy from demonstrations before RL begins.
+        # Skipped when resuming: the resumed checkpoint already carries whatever warm start
+        # it was trained with, and re-running BC here would be discarded work.
+        if config.bc.enabled and not config.train.resume:
+            from tmai.agents.bc import pretrain_policy
+            from tmai.training.demos import load_demonstrations
+
+            demos = load_demonstrations(
+                config.bc.demo_paths,
+                observation_dim=learner.observation_dim,
+                action_dim=int(env.action_space.shape[0]),
+            )
+            logger.info("behaviour cloning: %d demonstration steps from %d file(s)",
+                        len(demos), len(config.bc.demo_paths))
+            stats = pretrain_policy(
+                learner,
+                demos,
+                epochs=config.bc.epochs,
+                batch_size=config.bc.batch_size,
+                lr=config.bc.lr,
+                val_fraction=config.bc.val_fraction,
+                shuffle=config.bc.shuffle,
+                seed=config.train.seed,
+                log_every=max(1, config.bc.epochs // 5),
+            )
+            run_logger.log_event("bc_pretrain", **stats)
+
+        trainer = Trainer(
+            config, env, learner, buffer, run_logger,
+            held_out_env=held_out_env, curriculum=curriculum,
+        )
         try:
             return trainer.train()
         finally:

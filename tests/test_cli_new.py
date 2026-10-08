@@ -293,6 +293,10 @@ def _minimal_args(command: str) -> list[str]:
         "record-track": ["--out", "x.json"],
         "list-tracks": ["some/dir"],
         "compare": ["some/run"],
+        "record-demo": ["--out", "x.jsonl"],
+        "pretrain": ["--demo", "x.jsonl", "--out", "x.pt"],
+        "models": ["list"],
+        "replay": ["list"],
     }
     return required.get(command, [])
 
@@ -622,3 +626,156 @@ class TestStatusGapColumnIsPopulated:
         assert held
         for row in held:
             assert row.split()[-1] == "--", f"held-out row should not repeat the gap: {row}"
+
+class TestReplayCompareCli:
+    """`tmai replay compare` accepts a human demonstration (JSONL) as the ghost."""
+
+    def _run_with_replay(self, tmp_path):
+
+        from tmai.config import RunConfig
+        from tmai.replay import ReplayStore
+        from tmai.training.trainer import train_from_config
+
+        config = RunConfig()
+        config.driver.kind = "simulated"
+        config.driver.allow_simulated = True
+        config.track.synthetic = "straight"
+        # Short episodes so the run finishes episodes (and thus records replays) quickly.
+        config.env.termination.max_steps = 10
+        config.train.output_dir = str(tmp_path / "runs")
+        config.train.run_name = "replay-cli"
+        config.train.total_steps = 30
+        config.train.warmup_steps = 5
+        config.train.batch_size = 8
+        config.train.log_interval = 15
+        config.train.eval_interval = 0
+        config.train.held_out_eval_interval = 0
+        config.train.checkpoint_interval = 0
+        config.train.record_replays = True
+        config.train.replay_decimation = 1
+        config.train.max_replays = 5
+        config.sac.network.hidden_sizes = (16,)
+        run_dir = train_from_config(config).run_dir
+        store = ReplayStore(run_dir / "replays")
+        rows = store.list()
+        assert rows, "the run must have recorded replays"
+        return run_dir, rows[0]["name"]
+
+    def test_compare_against_a_demonstration_ghost(self, tmp_path, capsys):
+        import numpy as np
+
+        from tmai.training.demos import Demonstration
+
+        run_dir, replay_name = self._run_with_replay(tmp_path)
+        demo_path = tmp_path / "human.jsonl"
+        n = 30
+        Demonstration(
+            observations=np.zeros((n, 4), dtype=np.float32),
+            actions=np.zeros((n, 3), dtype=np.float32),
+            positions=np.stack([np.zeros(n), np.zeros(n), np.arange(n, dtype=float)], axis=1),
+            speeds=np.full(n, 20.0),
+            rewards=np.zeros(n),
+            race_times=np.arange(n, dtype=float) * 0.05,
+            metadata={"track": "straight", "finished": True},
+        ).save(demo_path)
+
+        # No --track: the track is resolved from the replay's own name (synthetic suite).
+        assert (
+            main(
+                [
+                    "replay", "compare",
+                    "--run", str(run_dir),
+                    "--replay", replay_name,
+                    "--other", str(demo_path),
+                    "--out", str(tmp_path / "gaps.json"),
+                ]
+            )
+            == 0
+        )
+        out = capsys.readouterr().out
+        assert "AI replay vs ghost" in out
+        assert "mean segment gap" in out
+        gaps = json.loads((tmp_path / "gaps.json").read_text())
+        assert gaps["ghost_finished"] is True
+        assert gaps["segment_gaps"]
+
+    def test_compare_rejects_a_missing_ghost(self, tmp_path, capsys):
+        run_dir, replay_name = self._run_with_replay(tmp_path)
+        assert (
+            main(
+                [
+                    "replay", "compare",
+                    "--run", str(run_dir),
+                    "--replay", replay_name,
+                    "--other", str(tmp_path / "nope.jsonl"),
+                ]
+            )
+            == 1
+        )
+
+
+class TestPretrainCli:
+    """`tmai pretrain` produces a resumable checkpoint from demonstrations."""
+
+    def test_pretrain_writes_a_checkpoint(self, tmp_path, capsys):
+        import numpy as np
+
+        from tmai.config import RunConfig
+        from tmai.training.checkpoint import load_checkpoint
+        from tmai.training.demos import Demonstration
+        from tmai.training.factory import build_learner, build_library, build_multi_track_env
+
+        config = RunConfig.from_yaml("tmai/configs/pipeline_smoke.yaml")
+        library = build_library(config)
+        env = build_multi_track_env(config, library, split="train", seed=0)
+        try:
+            dim = build_learner(env, config).observation_dim
+        finally:
+            env.close()
+
+        demo_path = tmp_path / "demo.jsonl"
+        Demonstration(
+            observations=np.random.default_rng(0).normal(size=(64, dim)).astype(np.float32),
+            actions=np.tile([0.1, 0.8, 0.0], (64, 1)).astype(np.float32),
+        ).save(demo_path)
+
+        out = tmp_path / "pretrained.pt"
+        assert (
+            main(
+                [
+                    "pretrain",
+                    "-c", "tmai/configs/pipeline_smoke.yaml",
+                    "--demo", str(demo_path),
+                    "--out", str(out),
+                    "--epochs", "2",
+                ]
+            )
+            == 0
+        )
+        assert out.is_file()
+        payload = load_checkpoint(out)
+        assert payload["extra"]["reason"] == "bc_pretrain"
+        assert payload["learner"]
+        assert "bc/final_train_loss" in capsys.readouterr().out
+
+    def test_pretrain_rejects_a_dimension_mismatch(self, tmp_path, capsys):
+        import numpy as np
+
+        from tmai.training.demos import Demonstration
+
+        demo_path = tmp_path / "demo.jsonl"
+        Demonstration(
+            observations=np.zeros((16, 999), dtype=np.float32),
+            actions=np.zeros((16, 3), dtype=np.float32),
+        ).save(demo_path)
+        assert (
+            main(
+                [
+                    "pretrain",
+                    "-c", "tmai/configs/pipeline_smoke.yaml",
+                    "--demo", str(demo_path),
+                    "--out", str(tmp_path / "x.pt"),
+                ]
+            )
+            == 1
+        )

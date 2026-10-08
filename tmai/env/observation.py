@@ -8,10 +8,21 @@ chance of transferring to another, and it keeps the input dimension small and fi
 
 The layout is explicit and ordered so it can be logged, diffed between runs and validated
 against a checkpoint. ``ObservationSpec.names()`` returns the human-readable layout.
+
+Temporal stacking
+-----------------
+A single frame is a partially observable snapshot: it carries no explicit acceleration or
+speed trend. ``ObservationSpec.history_length`` stacks the last N encoded frames into one
+observation vector (oldest first), which gives the policy an implicit temporal window --
+the standard frame-stacking remedy -- without changing the encoder or the track model.
+The default of 1 is the single-frame observation; raising it multiplies the observation
+dimension, which checkpoints detect and refuse to load across (the learner guards on
+``observation_dim``).
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,6 +70,9 @@ class ObservationSpec:
     include_edge_distances: bool = True
     include_last_action: bool = True
     include_checkpoint_progress: bool = True
+    #: How many consecutive encoded frames are stacked into one observation. 1 is the
+    #: single-frame observation; N > 1 gives the policy an implicit temporal window.
+    history_length: int = 1
     scales: ObservationScales = field(default_factory=ObservationScales)
 
     def feature_layout(self) -> list[tuple[str, int]]:
@@ -89,18 +103,48 @@ class ObservationSpec:
 
     @property
     def dim(self) -> int:
+        """Width of one encoded frame (before temporal stacking)."""
         return sum(width for _, width in self.feature_layout())
 
+    @property
+    def stacked_dim(self) -> int:
+        """Width of the observation the policy actually sees (after stacking)."""
+        return self.dim * self.history_length
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if self.history_length < 1:
+            problems.append(
+                f"history_length must be >= 1, got {self.history_length}"
+            )
+        if not self.curvature_lookahead:
+            problems.append("curvature_lookahead must not be empty when include_curvature")
+        elif any(d <= 0 for d in self.curvature_lookahead):
+            problems.append("curvature_lookahead distances must be positive")
+        return problems
+
     def names(self) -> list[str]:
-        out: list[str] = []
+        """Names of the stacked observation, oldest frame first.
+
+        With ``history_length == 1`` these are the plain feature names. With N > 1 each
+        frame's names get a ``[k]`` suffix, ``k=0`` being the oldest frame in the window.
+        """
+        base: list[str] = []
         for name, width in self.feature_layout():
-            out.extend([name] if width == 1 else [f"{name}[{i}]" for i in range(width)])
+            base.extend([name] if width == 1 else [f"{name}[{i}]" for i in range(width)])
+        if self.history_length == 1:
+            return base
+        out: list[str] = []
+        for k in range(self.history_length):
+            out.extend(f"{name}[{k}]" for name in base)
         return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "observation_version": OBSERVATION_VERSION,
             "dim": self.dim,
+            "history_length": self.history_length,
+            "stacked_dim": self.stacked_dim,
             "names": self.names(),
             "curvature_lookahead": list(self.curvature_lookahead),
             "scales": {
@@ -219,10 +263,56 @@ class ObservationEncoder:
         return obs
 
 
+class ObservationStacker:
+    """Stacks the last ``length`` encoded frames into one observation vector.
+
+    The stacker is owned by the environment, not the encoder: the encoder stays a pure
+    single-frame function, and the replay buffer stores whatever the policy consumed, so
+    stacked and unstacked runs are both just data. At episode start the stack is filled
+    with the first frame (the standard frame-stack initialisation), so the policy never
+    sees a partially zero-padded window mid-episode.
+    """
+
+    def __init__(self, dim: int, length: int) -> None:
+        if dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if length < 1:
+            raise ValueError(f"length must be >= 1, got {length}")
+        self.dim = int(dim)
+        self.length = int(length)
+        self._frames: deque[np.ndarray] = deque(maxlen=self.length)
+
+    @property
+    def stacked_dim(self) -> int:
+        return self.dim * self.length
+
+    def reset(self, first: np.ndarray) -> np.ndarray:
+        """Start a new episode: the stack is the first frame repeated ``length`` times."""
+        frame = np.asarray(first, dtype=np.float32).reshape(-1)
+        if frame.shape[0] != self.dim:
+            raise ValueError(f"frame has {frame.shape[0]} features, stacker expects {self.dim}")
+        self._frames.clear()
+        for _ in range(self.length):
+            self._frames.append(frame.copy())
+        return self._stack()
+
+    def push(self, frame: np.ndarray) -> np.ndarray:
+        """Add one frame and return the stacked observation (oldest first)."""
+        arr = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if arr.shape[0] != self.dim:
+            raise ValueError(f"frame has {arr.shape[0]} features, stacker expects {self.dim}")
+        self._frames.append(arr)
+        return self._stack()
+
+    def _stack(self) -> np.ndarray:
+        return np.concatenate(list(self._frames)).astype(np.float32)
+
+
 __all__ = [
     "OBSERVATION_VERSION",
     "ObservationEncoder",
     "ObservationInputs",
     "ObservationScales",
     "ObservationSpec",
+    "ObservationStacker",
 ]

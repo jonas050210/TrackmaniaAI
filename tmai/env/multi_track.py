@@ -131,6 +131,16 @@ class MultiTrackEnv(gym.Env):
         self._context = EpisodeContext()
         #: Track pinned for the next reset by :meth:`select_track`; ``None`` means sample.
         self._pinned: CenterlineTrack | None = None
+        # -- curriculum ---------------------------------------------------------------
+        #: Attached curriculum (training only), or ``None`` for "always everything".
+        self._curriculum = None
+        #: Training step the curriculum is resolved at; updated by the trainer.
+        self._curriculum_step = 0
+        #: All tracks in this environment, in sampler order (the curriculum filter draws
+        #: from this list with its own permutation, leaving the sampler untouched).
+        self._all_tracks = self.sampler.peek_all()
+        #: Permutation state for curriculum-filtered sampling.
+        self._filtered_order: list[int] = []
 
         # Build one environment up front so the action/observation spaces are real rather
         # than guessed. The track it gets is replaced on the first reset.
@@ -212,6 +222,62 @@ class MultiTrackEnv(gym.Env):
     def pinned_track(self) -> CenterlineTrack | None:
         return self._pinned
 
+    # -- curriculum -----------------------------------------------------------------
+
+    def attach_curriculum(self, curriculum) -> None:
+        """Attach a :class:`~tmai.training.curriculum.Curriculum` (training only).
+
+        Held-out evaluation must not be curriculum-filtered, so this is attached to the
+        training environment only; the held-out environment keeps sampling everything.
+        """
+        self._curriculum = curriculum
+
+    def set_curriculum_step(self, step: int) -> None:
+        """Tell the environment the current training step, for curriculum resolution."""
+        self._curriculum_step = int(step)
+
+    @property
+    def curriculum_stage(self) -> int | None:
+        if self._curriculum is None:
+            return None
+        return self._curriculum.stage_index_at(self._curriculum_step)
+
+    def _curriculum_filter(self) -> list[CenterlineTrack] | None:
+        """The tracks the curriculum currently allows, or ``None`` for all of them."""
+        if self._curriculum is None:
+            return None
+        names = self._curriculum.active_track_names(self._curriculum_step)
+        if names is None:
+            return None
+        wanted = set(names)
+        return [t for t in self._all_tracks if t.name in wanted]
+
+    def _curriculum_step_cap(self) -> int | None:
+        if self._curriculum is None:
+            return None
+        return self._curriculum.episode_max_steps(
+            self._curriculum_step, self.config.termination.max_steps
+        )
+
+    def _pick_track(self) -> CenterlineTrack:
+        """Pick the next track: pinned, curriculum-filtered, or the plain sampler."""
+        if self._pinned is not None:
+            track, self._pinned = self._pinned, None
+            return track
+        allowed = self._curriculum_filter()
+        if allowed is None:
+            if self.multi_config.sample_tracks:
+                return self.sampler.next()
+            return self.sampler.peek_all()[0]
+        # Curriculum-filtered sampling: a shuffled block permutation over the allowed
+        # tracks only, so every revealed track is still seen regularly.
+        if not self.multi_config.sample_tracks:
+            return allowed[0]
+        if not self._filtered_order:
+            self._filtered_order = list(self._rng.permutation(len(allowed)))
+        index = self._filtered_order.pop()
+        return allowed[index]
+
     def reset(
         self,
         *,
@@ -221,12 +287,7 @@ class MultiTrackEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        if self._pinned is not None:
-            track, self._pinned = self._pinned, None
-        elif self.multi_config.sample_tracks:
-            track = self.sampler.next()
-        else:
-            track = self.sampler.peek_all()[0]
+        track = self._pick_track()
         self._switch_to(track)
 
         station, lateral = self._sample_start(track)
@@ -239,11 +300,15 @@ class MultiTrackEnv(gym.Env):
             track_length=track.length,
         )
 
-        observation, info = self._inner_env.reset(
-            options={"start_station": station, "start_lateral": lateral}
-        )
+        reset_options: dict[str, Any] = {"start_station": station, "start_lateral": lateral}
+        cap = self._curriculum_step_cap()
+        if cap is not None:
+            reset_options["max_steps"] = cap
+        observation, info = self._inner_env.reset(options=reset_options)
         info.update(self._context.as_dict())
         info["track"] = track.name
+        if self._curriculum is not None:
+            info["curriculum_stage"] = self._curriculum.stage_index_at(self._curriculum_step)
         return observation, info
 
     def step(

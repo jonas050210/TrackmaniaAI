@@ -44,6 +44,8 @@ def make_vehicle(
     gear: int = 1,
     is_sliding: bool = False,
     has_ground_contact: bool = True,
+    has_lateral_contact: bool = False,
+    num_wheels_ground_contact: int = 4,
 ) -> VehicleState:
     return VehicleState(
         position=np.asarray(position, dtype=np.float64),
@@ -55,6 +57,8 @@ def make_vehicle(
         gear=gear,
         is_sliding=is_sliding,
         has_ground_contact=has_ground_contact,
+        has_lateral_contact=has_lateral_contact,
+        num_wheels_ground_contact=num_wheels_ground_contact,
     )
 
 

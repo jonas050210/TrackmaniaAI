@@ -11,6 +11,8 @@ dist/
 venv/
 
 # Tooling caches
+node_modules/
+*.tsbuildinfo
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -22,9 +24,14 @@ htmlcov/
 # not source. Keep them out of git (see docs/TRAINING.md for the layout).
 runs/
 checkpoints/
+models/
+benchmarks/
+.tmai-server/
 data/tracks/*.npz
 data/tracks/*.json
 !data/tracks/README.md
+data/demos/*.jsonl
+!data/demos/README.md
 
 # Editors / OS
 .idea/

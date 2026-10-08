@@ -73,6 +73,19 @@ tmai/agents/sac.py          SACLearner
 `Learner` protocol (`tmai/agents/base.py`): `act`, `update`, `state_dict`, `load_state_dict`,
 `describe`. The network can be reused unchanged.
 
+## Warm starts: temporal observations and behaviour cloning
+
+Two mechanisms shorten the distance from a random policy to a driving one, and both are
+orthogonal to the algorithm choice:
+
+* **Temporal observations.** `env.observation.history_length` stacks the last N frames, so
+  the policy sees *changes* (acceleration, steering rate) rather than a single snapshot. The
+  stack is environment-owned and reset-filled, so no zero-padded window appears mid-episode.
+* **Behaviour cloning.** `tmai pretrain` (or `bc:` in the config) fits the actor to recorded
+  human demonstrations before RL begins. It is a warm start, not the training objective:
+  SAC continues afterwards and can improve on the demonstrations. Skipped on resume, where
+  the checkpoint already carries its warm start.
+
 ## Implementation notes that matter
 
 * **Truncation vs termination.** `terminated` and `truncated` are stored separately and only

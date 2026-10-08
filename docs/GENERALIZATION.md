@@ -93,6 +93,17 @@ asserts the observation vectors are equal to within 1e-6. They are equal to with
 A second test asserts no observation feature is *named* like a world coordinate, so a future
 feature addition cannot quietly reintroduce one.
 
+### Curriculum over the training split only
+
+With `curriculum.enabled`, early training reveals the easiest tracks first (ordered by mean
+curvature plus corner density) and may shorten episodes (`episode_length_fraction`), which
+concentrates early learning where the signal is cleanest. Two properties keep it honest:
+
+* it applies **only to the training environment** — held-out evaluation always runs the full
+  suite, so a curriculum can never flatter the number it is measured by;
+* the active stage is logged (`curriculum_stage` events + a `curriculum/stage` metric), so a
+  run's manifest says exactly what the policy was exposed to at every step.
+
 ### Sampling without replacement blocks
 
 `TrackSampler` draws shuffled *blocks* rather than i.i.d. With a four-map library, i.i.d.
