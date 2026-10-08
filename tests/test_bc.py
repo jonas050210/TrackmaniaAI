@@ -26,13 +26,14 @@ def _make_learner(
     action_dim: int = 3,
     *,
     device: str | None = None,
+    dropout: float = 0.0,
     **sac_kwargs,
 ) -> SACLearner:
     """A small SAC learner. ``device=None`` lets the learner pick CUDA when it is available."""
     from tmai.models.networks import NetworkConfig
 
     config = RunConfig().sac
-    config.network = NetworkConfig(hidden_sizes=[32, 32])
+    config.network = NetworkConfig(hidden_sizes=[32, 32], dropout=dropout)
     for key, value in sac_kwargs.items():
         setattr(config, key, value)
     return SACLearner(
@@ -72,9 +73,7 @@ class TestPretrainPolicy:
 
     def test_val_loss_is_reported(self):
         learner = _make_learner()
-        metrics = pretrain_policy(
-            learner, _demo_from_policy(), epochs=2, val_fraction=0.2, seed=0
-        )
+        metrics = pretrain_policy(learner, _demo_from_policy(), epochs=2, val_fraction=0.2, seed=0)
         assert metrics["bc/val_loss"] == metrics["bc/val_loss"]  # not NaN
         assert metrics["bc/train_samples"] == 316  # purge gap before temporal validation
         assert metrics["bc/val_samples"] == 80
@@ -162,6 +161,21 @@ class TestPretrainPolicy:
             return self._policy_mse(learner, _demo_from_policy())
 
         assert run() == pytest.approx(run())
+
+    def test_validation_ignores_dropout(self):
+        """Validation runs in eval mode: dropout must not leak into the held-out loss."""
+        import torch
+
+        learner = _make_learner(dropout=0.5)
+        demos = _demo_from_policy()
+        metrics = pretrain_policy(learner, demos, epochs=2, val_fraction=0.2, seed=0)
+        # Single recording, purged temporal holdout: the last 80 of 400 steps are validation.
+        assert metrics["bc/val_samples"] == 80
+        val = Demonstration(observations=demos.observations[-80:], actions=demos.actions[-80:])
+        assert metrics["bc/val_loss"] == pytest.approx(self._policy_mse(learner, val), rel=1e-5)
+        # The training mode the learner had before validation is restored.
+        assert learner.network.policy.training
+        assert torch.is_tensor(learner.network.policy.trunk[0].weight)
 
     def test_seed_alone_fixes_the_shuffle_order(self):
         """``seed`` controls the batch order; ambient global RNG state must not change it."""
@@ -286,9 +300,7 @@ class TestTrainerIntegration:
         demo_path = self._write_demo(tmp_path, dim)
 
         # A checkpoint to resume from.
-        checkpoint = save_checkpoint(
-            tmp_path / "pre", step=0, learner=learner, config=config.to_dict()
-        )
+        checkpoint = save_checkpoint(tmp_path / "pre", step=0, learner=learner, config=config.to_dict())
         resume_config = self._config(tmp_path, demo_path, resume=str(checkpoint))
         result = train_from_config(resume_config)
         events = [

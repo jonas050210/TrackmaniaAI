@@ -664,6 +664,8 @@ def cmd_pretrain(args: argparse.Namespace) -> int:
         bc.batch_size = args.batch_size
     if args.lr is not None:
         bc.lr = args.lr
+    if args.device is not None:
+        config.train.device = args.device
     if not args.demo:
         print("pretrain needs at least one --demo file", file=sys.stderr)
         return 2
@@ -1488,6 +1490,7 @@ def build_parser() -> argparse.ArgumentParser:
     pre.add_argument("--epochs", type=int, help="override bc.epochs")
     pre.add_argument("--batch-size", type=int, help="override bc.batch_size")
     pre.add_argument("--lr", help="override bc.lr", type=float)
+    pre.add_argument("--device", help="override train.device (cpu/cuda)")
     pre.set_defaults(func=cmd_pretrain)
 
     models = sub.add_parser("models", help="manage the model registry")

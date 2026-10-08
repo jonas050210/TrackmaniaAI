@@ -608,6 +608,7 @@ class TestJobs:
         assert finished["result"]["exit_code"] == 0
         assert any("environment" in line for line in finished["log_tail"])
 
+    @pytest.mark.slow
     def test_train_job_end_to_end(self, client, server_dir, tmp_path):
         """The GUI's start-training path: a real subprocess training run."""
         config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
@@ -665,6 +666,7 @@ class TestJobs:
         assert any("Pass --allow-simulated-driver" in line for line in finished["log_tail"])
         assert not server_dir["runs"].exists() or not list(server_dir["runs"].iterdir())
 
+    @pytest.mark.slow
     def test_train_job_with_config_yaml_text(self, client, server_dir, tmp_path):
         """The config editor posts YAML text; the server stores it and trains from it."""
         config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
@@ -813,6 +815,7 @@ class TestJobs:
         assert finished["result"] is None
         assert not list(server_dir["benchmarks"].iterdir())
 
+    @pytest.mark.slow
     def test_jobs_are_listed_newest_first(self, client):
         first = client.post("/api/doctor", json={}).json()["job"]
         _wait_for_job(client, first["id"], timeout=120)

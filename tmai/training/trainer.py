@@ -798,7 +798,12 @@ def train_from_config(config: RunConfig) -> TrainerResult:
                 seed=config.train.seed,
                 log_every=max(1, config.bc.epochs // 5),
             )
-            run_logger.log_event("bc_pretrain", **stats)
+            run_logger.log_event(
+                "bc_pretrain",
+                device=str(getattr(learner, "device", "unknown")),
+                seed=config.train.seed,
+                **stats,
+            )
 
         trainer = Trainer(
             config, env, learner, buffer, run_logger,

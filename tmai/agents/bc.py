@@ -72,11 +72,7 @@ def _split_demonstrations(
     except (TypeError, ValueError):
         lengths = np.asarray([], dtype=np.int64)
 
-    if (
-        lengths.size >= 2
-        and np.all(lengths > 0)
-        and int(lengths.sum()) == count
-    ):
+    if lengths.size >= 2 and np.all(lengths > 0) and int(lengths.sum()) == count:
         target = max(1, int(count * val_fraction))
         order = rng.permutation(lengths.size)
         validation_groups: list[int] = []
@@ -88,9 +84,9 @@ def _split_demonstrations(
                 validation_groups.append(int(group))
                 validation_count += int(lengths[group])
         offsets = np.concatenate([[0], np.cumsum(lengths)])
-        val_idx = np.concatenate(
-            [np.arange(offsets[g], offsets[g + 1]) for g in validation_groups]
-        ).astype(int)
+        val_idx = np.concatenate([np.arange(offsets[g], offsets[g + 1]) for g in validation_groups]).astype(
+            int
+        )
         train_mask = np.ones(count, dtype=bool)
         train_mask[val_idx] = False
         return np.flatnonzero(train_mask), val_idx, "whole_demo_files"
@@ -151,8 +147,7 @@ def pretrain_policy(
         )
     if demos.action_dim != sac.action_dim:
         raise ValueError(
-            f"demonstrations have action_dim {demos.action_dim}, learner expects "
-            f"{sac.action_dim}"
+            f"demonstrations have action_dim {demos.action_dim}, learner expects {sac.action_dim}"
         )
     if len(demos) < 2:
         raise ValueError(f"need at least 2 demonstration steps to pretrain, got {len(demos)}")
@@ -210,7 +205,7 @@ def pretrain_policy(
         epoch_loss = 0.0
         batches = 0
         for start in range(0, len(order_t), batch_size):
-            idx = order_t[start:start + batch_size]
+            idx = order_t[start : start + batch_size]
             mean_action, _ = policy.sample(obs_t[idx], deterministic=True)
             loss = F.mse_loss(mean_action, act_t[idx])
             optimizer.zero_grad(set_to_none=True)
@@ -220,13 +215,23 @@ def pretrain_policy(
             batches += 1
         train_loss = epoch_loss / max(batches, 1)
         if len(val_idx):
-            with torch.no_grad():
-                val_action, _ = policy.sample(obs_t[val_idx_t], deterministic=True)
-                val_loss = float(F.mse_loss(val_action, act_t[val_idx_t]).item())
+            # Validation must be deterministic and must not be affected by dropout, which is
+            # active during training. Restore the previous mode afterwards.
+            was_training = policy.training
+            policy.eval()
+            try:
+                with torch.no_grad():
+                    val_action, _ = policy.sample(obs_t[val_idx_t], deterministic=True)
+                    val_loss = float(F.mse_loss(val_action, act_t[val_idx_t]).item())
+            finally:
+                policy.train(was_training)
         if log_every and (epoch + 1) % log_every == 0:
             logger.info(
                 "bc epoch %d/%d: train_loss=%.5f val_loss=%.5f",
-                epoch + 1, epochs, train_loss, val_loss,
+                epoch + 1,
+                epochs,
+                train_loss,
+                val_loss,
             )
 
     metrics = {
@@ -241,7 +246,13 @@ def pretrain_policy(
     logger.info(
         "behaviour cloning done: %d samples (%d train, %d validation; %s split), "
         "%d epochs, final train loss %.5f, val %.5f",
-        len(demos), len(train_idx), len(val_idx), split_kind, epochs, train_loss, val_loss,
+        len(demos),
+        len(train_idx),
+        len(val_idx),
+        split_kind,
+        epochs,
+        train_loss,
+        val_loss,
     )
     return metrics
 

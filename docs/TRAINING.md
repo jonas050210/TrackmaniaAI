@@ -176,6 +176,13 @@ configuration error, not data to truncate), and `record-demo` refuses the simula
 unless `--allow-simulated-driver` is passed, because the toy model just echoes the AI's own
 outputs — a "human" demonstration recorded against it contains nothing a human did.
 
+## Running the tests on a GPU
+
+CI has no GPU, so the CUDA-only tests run on a self-hosted runner. To register one, install the
+GitHub Actions runner on a machine with an NVIDIA GPU and CUDA-enabled PyTorch, and give it the
+label `gpu`. Then start the **CI** workflow manually from the Actions tab (`workflow_dispatch`).
+Locally, `pytest tests/test_bc.py tests/test_device.py -rs` shows which of those tests ran.
+
 ## Replays and ghosts
 
 ```bash
