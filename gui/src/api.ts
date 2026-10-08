@@ -61,7 +61,9 @@ export interface SeriesPoint {
 
 export interface Series {
   name: string;
-  points: SeriesPoint[];
+  group: string;
+  steps: number[];
+  values: number[];
 }
 
 export interface RunHistory {
@@ -163,7 +165,7 @@ export interface Job {
   id: string;
   kind: string;
   description: string;
-  state: "queued" | "running" | "done" | "failed" | "cancelled" | "interrupted";
+  state: "queued" | "running" | "cancelling" | "done" | "failed" | "cancelled" | "interrupted";
   created_utc: string;
   started_utc: string | null;
   finished_utc: string | null;

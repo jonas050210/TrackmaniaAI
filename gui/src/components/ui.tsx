@@ -175,6 +175,7 @@ import type { Job } from "../api";
 const JOB_TONES: Record<Job["state"], BadgeTone> = {
   queued: "neutral",
   running: "blue",
+  cancelling: "amber",
   done: "green",
   failed: "red",
   cancelled: "amber",

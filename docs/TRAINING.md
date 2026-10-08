@@ -8,7 +8,6 @@ command line, and the resolved result is written verbatim into the run manifest.
 ```bash
 tmai validate-config -c tmai/configs/default.yaml      # check it before committing to a run
 tmai train -c tmai/configs/default.yaml \
-    --set track.directory=data/tracks \
     --set driver.speed_ratio=8 \
     --set train.updates_per_step=2 \
     --set sac.gamma=0.98
@@ -35,11 +34,13 @@ being silently ignored.
 | `bc` | `enabled`, `demo_paths`, `epochs`, `batch_size`, `lr`, `val_fraction`, `shuffle` — behaviour cloning from demonstrations |
 | `train` | steps, warm-up, batch size, UTD ratio, intervals, held-out evaluation, seed, device, resume, `record_replays`/`replay_decimation`/`max_replays`, `model_store` |
 
-Three shipped configs, all of which pass `tmai validate-config`:
+Shipped configs (all pass `tmai validate-config`):
 
-* `default.yaml` — real game (`driver.kind: tminterface`), trains on every centreline in
-  `data/tracks/` with a 70/15/15 split, held-out evaluation on, start randomisation **off**
-  (the real game cannot reposition the car).
+* `default.yaml` — real game (`driver.kind: tminterface`), one recorded centreline at
+  `data/tracks/my_map.json`, held-out evaluation and start randomisation **off**. Record that
+  map before training; validation checks the config but does not create its track file.
+  The real driver cannot switch maps or reposition the car, so multi-map held-out results
+  require the simulated pipeline until real-game map switching is implemented.
 * `smoke.yaml` — the labelled toy model, one synthetic track, a few hundred steps. For
   validating plumbing and CI.
 * `multitrack_smoke.yaml` — the toy model across four synthetic tracks and two splits, with
@@ -68,8 +69,10 @@ Properties worth knowing:
   exiting. A multi-day run does not lose the last hours of work.
 * **Bounded by wall clock.** `train.max_wall_seconds` lets CI and scheduled runs stop cleanly
   without a step-count hack.
-* **A different track every episode.** With `track.directory` or `track.synthetic_suite`, a new
-  track is sampled at each reset. See [GENERALIZATION.md](GENERALIZATION.md).
+* **A different track every episode in simulation.** With `track.directory` or
+  `track.synthetic_suite`, a new track is sampled at each reset by the simulated driver.
+  The real driver rejects multi-map training because it cannot switch the game map.
+  See [GENERALIZATION.md](GENERALIZATION.md).
 * **Held-out evaluation cannot kill the run.** It executes on a separate environment and is
   wrapped, so a failure there is logged and training continues.
 * **Curriculum advances with the step counter.** `curriculum.enabled` reveals tracks from
@@ -129,10 +132,14 @@ reproduce exactly even with a fixed seed — the simulated driver will.
 ## Demonstrations and behaviour cloning
 
 SAC has to discover "throttle drives the car" from reward alone. A human lap teaches it
-directly, and the pipeline supports the whole loop:
+directly, and the pipeline supports the whole loop. On the Windows game host, load the map,
+then calibrate and record its centreline before using the default preset:
 
 ```bash
-# 1. drive one clean lap of a real map (the game reports YOUR inputs, not the AI's)
+tmai doctor --calibrate
+tmai record-track --out data/tracks/my_map.json --name my_map
+
+# 1. drive one clean lap of the same map (the game reports YOUR inputs, not the AI's)
 tmai record-demo -c tmai/configs/default.yaml --out data/demos/my_lap.jsonl
 
 # 2a. pretrain a checkpoint from it (resumable like any other checkpoint)
@@ -302,8 +309,8 @@ jq -c 'select(.event=="episode_end") | {steps, end_reason, progress}' runs/<run>
 # evaluations, with the held-out number alongside the training number
 jq -c 'select(.event=="held_out_evaluation") | {step, report: .report.mean_progress_fraction}' runs/<run>/events.jsonl
 
-# the generalisation gap: train progress minus held-out progress
-jq -c 'select(.event=="evaluation") | .report.generalization_gap' runs/<run>/events.jsonl
+# the generalisation gap: train progress minus held-out progress (simulated multi-map runs)
+jq -c 'select(."eval/generalization_gap" != null) | {step, gap: ."eval/generalization_gap"}' runs/<run>/metrics.jsonl
 
 # which track each episode ran on
 jq -c 'select(.event=="episode_end") | {track, end_reason, progress}' runs/<run>/events.jsonl

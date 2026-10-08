@@ -61,6 +61,17 @@ def two_runs(tmp_path_factory) -> list[str]:
 
 
 class TestValidateConfig:
+    def test_real_game_preset_targets_one_recorded_map(self):
+        from tmai.config import RunConfig
+
+        config = RunConfig.from_yaml("tmai/configs/default.yaml")
+        assert config.driver.kind == "tminterface"
+        assert config.track.path == "data/tracks/my_map.json"
+        assert config.track.directory is None
+        assert config.multi.sample_tracks is False
+        assert config.train.held_out_eval_interval == 0
+        assert config.validate() == []
+
     def test_valid_config_exits_zero(self, tmp_path, capsys):
         path = tmp_path / "good.yaml"
         path.write_text(
@@ -613,6 +624,44 @@ class TestDoctorCalibrateIsNotSilent:
         assert main(["doctor", "-c", str(smoke)]) == 0
         out = capsys.readouterr().out
         assert "simulated (NOT the real game)" in out
+
+    def test_calibration_can_run_before_a_centreline_is_recorded(self, tmp_path, monkeypatch, capsys):
+        """Doctor must connect without track geometry so the operator can calibrate first."""
+        from types import SimpleNamespace
+
+        import tmai.game.calibration as calibration
+        import tmai.training.factory as factory
+
+        cfg = tmp_path / "unrecorded.yaml"
+        cfg.write_text("driver:\n  kind: tminterface\ntrack:\n  path: missing.json\n")
+        calls = []
+
+        class FakeDriver:
+            name = "mock-game"
+
+            def open(self):
+                calls.append("open")
+
+            def describe(self):
+                return {"checkpoint_total": 2}
+
+            def close(self):
+                calls.append("close")
+
+        def fake_build_driver(config, track):
+            assert track is None
+            return FakeDriver()
+
+        def fake_calibrate(driver, **kwargs):
+            calls.append("calibrate")
+            assert kwargs["steps"] == 5
+            return SimpleNamespace(ok=True, format=lambda: "calibration ok")
+
+        monkeypatch.setattr(factory, "build_driver", fake_build_driver)
+        monkeypatch.setattr(calibration, "calibrate_driver", fake_calibrate)
+        assert main(["doctor", "-c", str(cfg), "--calibrate", "--calibrate-steps", "5"]) == 0
+        assert calls == ["open", "calibrate", "close"]
+        assert "calibration ok" in capsys.readouterr().out
 
     def test_failed_driver_does_not_send_calibration_into_a_closed_driver(self, tmp_path, capsys):
         """A driver whose open() raised must be treated as absent, not as connected.

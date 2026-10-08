@@ -66,7 +66,7 @@ export function Evaluate() {
 
   // eval form
   const [evalTarget, setEvalTarget] = useState("");
-  const [evalSplits, setEvalSplits] = useState("validation");
+  const [evalSplits, setEvalSplits] = useState("");
   const [evalEpisodes, setEvalEpisodes] = useState(3);
   const [evalJob, setEvalJob] = useState<Job | null>(null);
   const [evalRunning, setEvalRunning] = useState(false);
@@ -108,21 +108,26 @@ export function Evaluate() {
     return () => clearInterval(interval);
   }, []);
 
-  // follow running jobs
+  // Follow each job independently: polling one must never replace the other's report.
   useEffect(() => {
-    const job = evalJob ?? benchJob;
-    if (!job || ["done", "failed", "cancelled", "interrupted"].includes(job.state)) return;
-    const interval = setInterval(async () => {
-      try {
-        const fresh = await api.job(job.id);
-        if (evalJob) setEvalJob(fresh);
-        if (benchJob) setBenchJob(fresh);
-      } catch {
-        /* ignore */
-      }
+    if (!evalJob || ["done", "failed", "cancelled", "interrupted"].includes(evalJob.state)) return;
+    const id = evalJob.id;
+    const interval = setInterval(() => {
+      api.job(id).then((fresh) => setEvalJob((current) => current?.id === id ? fresh : current))
+        .catch(() => {});
     }, 1_500);
     return () => clearInterval(interval);
-  }, [evalJob, benchJob]);
+  }, [evalJob?.id, evalJob?.state]);
+
+  useEffect(() => {
+    if (!benchJob || ["done", "failed", "cancelled", "interrupted"].includes(benchJob.state)) return;
+    const id = benchJob.id;
+    const interval = setInterval(() => {
+      api.job(id).then((fresh) => setBenchJob((current) => current?.id === id ? fresh : current))
+        .catch(() => {});
+    }, 1_500);
+    return () => clearInterval(interval);
+  }, [benchJob?.id, benchJob?.state]);
 
   async function startEval() {
     setEvalRunning(true);
@@ -213,7 +218,8 @@ export function Evaluate() {
           <div className="grid cols-2" style={{ gap: 12 }}>
             <div className="field">
               <label>Splits (comma separated)</label>
-              <input value={evalSplits} onChange={(e) => setEvalSplits(e.target.value)} />
+              <input value={evalSplits} onChange={(e) => setEvalSplits(e.target.value)} placeholder="auto" />
+              <span className="hint">Blank selects validation if available, otherwise train. Requesting an unavailable split fails instead of silently evaluating train.</span>
             </div>
             <div className="field">
               <label>Episodes per track</label>

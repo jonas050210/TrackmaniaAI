@@ -26,7 +26,10 @@ In development you can also run the Vite dev server (`npm run dev` in `gui/`), w
   never disagree with the command line, because there is no second implementation.
 * **Long work is a job.** Training, evaluation, benchmarking, calibration and the doctor
   run as managed background jobs: a state machine (`queued → running → done | failed |
-  cancelled`), a captured log, and a JSON result. The UI stays responsive, and a job's log
+  cancelling → cancelled`), a captured log, and a JSON result. Running jobs show
+  `cancelling` until the subprocess exits or the in-process evaluation/benchmark reaches
+  a cancellation check; cancellation is not instantaneous during checkpoint loading or
+  report generation. The UI stays responsive, and a job's log
   survives a page reload. Jobs are persisted to `.tmai-server/jobs/jobs.jsonl`; a job that
   was running when the server restarted is reported as `interrupted`, not silently dropped.
 * **Training runs as a subprocess.** A training job spawns `python -m tmai.cli train`, so a
@@ -36,16 +39,19 @@ In development you can also run the Vite dev server (`npm run dev` in `gui/`), w
 
 ## Security model (read this)
 
-The backend has **no authentication and no authorisation**. It is a local tool: it can start
-training runs, delete models and read every file the server process can read. It binds to
-`0.0.0.0` by default so it is reachable from browsers on other machines (preview proxies,
-VMs, a second monitor's browser), which means:
+The backend has **no authentication and no authorisation**. It is a local tool: it can
+start training runs, delete models and read files accessible to its process. By default it
+binds to **127.0.0.1 only**, does not grant cross-origin HTTP access, and rejects
+cross-origin browser WebSocket connections. Vite development uses a same-origin `/api`
+proxy. To serve another machine, explicitly use `--host 0.0.0.0` **only behind access
+controls or on a trusted network**; changing the bind address does not
+add authentication, and CORS restrictions are not an authentication mechanism.
 
-> **Do not run `tmai serve` on an untrusted network.** If you need it on a shared machine,
-> bind it to the loopback interface: `tmai serve --host 127.0.0.1`.
-
-Path safety: run names, replay files and model names are validated against path traversal
-before they are joined onto a directory.
+Path safety: run and replay directory references, replay files, and track file/directory
+requests are checked against configured data roots after resolving symlinks. Ghost
+comparisons accept files from run replay directories or the configured demos directory. This does **not** make the entire API safe for untrusted
+clients: job requests can still specify local config/checkpoint paths, and loading an
+untrusted PyTorch checkpoint is unsafe. Do not expose the service to untrusted users.
 
 ## Pages
 
@@ -123,7 +129,7 @@ works out of the box.
 ## Server options
 
 ```
-tmai serve --host 0.0.0.0 --port 8765
+tmai serve --host 127.0.0.1 --port 8765
            --runs-dir runs --tracks-dir data/tracks --models-dir models
            --demos-dir data/demos --benchmarks-dir benchmarks
            --static-dir gui/dist --config tmai/configs/default.yaml --no-open

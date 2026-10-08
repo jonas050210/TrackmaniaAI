@@ -92,6 +92,9 @@ class TestRunStatus:
         # final evaluation record.
         assert "env/progress_fraction" in latest
         assert "throughput/env_steps_per_second" in latest
+        assert "eval/generalization_gap" in {
+            curve.name for curve in run_history(completed_run).series
+        }
 
     def test_counts_episodes_evaluations_and_checkpoints(self, completed_run):
         status = run_status(completed_run)
@@ -131,6 +134,20 @@ class TestRunHistory:
         for curve in history.series:
             # One extra point is appended to guarantee the final value is present.
             assert len(curve.steps) <= 4
+
+    def test_downsampling_keeps_last_point_of_sparse_series(self, tmp_path):
+        from tmai.runlog import RunLogger
+
+        with RunLogger(tmp_path, run_name="sparse") as logger:
+            for step in range(10):
+                logger.log_metrics(step, {"env/progress_fraction": step / 10})
+            logger.log_metrics(10, {"eval/finish_rate": 0.5})
+
+        history = run_history(tmp_path, max_points=3)
+        curve = history.get("env/progress_fraction")
+        assert curve is not None
+        assert curve.steps[-1] == 9
+        assert curve.values[-1] == pytest.approx(0.9)
 
     def test_steps_and_values_align(self, completed_run):
         for curve in run_history(completed_run).series:

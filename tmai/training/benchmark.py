@@ -16,7 +16,7 @@ import hashlib
 import json
 import logging
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -496,6 +496,7 @@ def run_benchmark(
     max_steps: int | None = None,
     deterministic: bool = True,
     seed_repeats: int = 3,
+    cancel_check: Callable[[], None] | None = None,
 ) -> BenchmarkReport:
     """Evaluate every model on every split and build a comparison report.
 
@@ -561,8 +562,12 @@ def run_benchmark(
     envs: dict[str, Any] = {}
     try:
         for split in splits:
+            if cancel_check is not None:
+                cancel_check()
             envs[split] = build_multi_track_env(config, library, split=split, seed=config.train.seed)
         for label, target in normalized_models:
+            if cancel_check is not None:
+                cancel_check()
             target_text = str(target)
             baseline_kind: str | None = None
             payload: dict[str, Any]
@@ -587,6 +592,8 @@ def run_benchmark(
             )
 
             for split, env in envs.items():
+                if cancel_check is not None:
+                    cancel_check()
                 learner: Learner
                 if baseline_kind == "curvature":
                     learner = CurvaturePilot(
@@ -610,6 +617,7 @@ def run_benchmark(
                         seed=evaluation_seed,
                         label=f"benchmark:{label}:{split}:seed={evaluation_seed}",
                         step=int(payload.get("step", 0)),
+                        cancel_check=cancel_check,
                     )
                     for evaluation_seed in evaluation_seeds
                 ]

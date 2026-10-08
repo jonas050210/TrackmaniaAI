@@ -293,6 +293,8 @@ class ReplayStore:
             return []
         out: list[dict[str, Any]] = []
         for path in sorted(self.directory.glob("episode_*.json")):
+            if path.is_symlink():
+                continue
             try:
                 replay = EpisodeReplay.load(path)
             except (ValueError, json.JSONDecodeError) as exc:

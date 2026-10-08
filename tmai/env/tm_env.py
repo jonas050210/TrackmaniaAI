@@ -261,14 +261,23 @@ class TrackmaniaEnv(gym.Env):
                 hint_s=prev_progress,
                 search_window=cfg.projection_window,
             )
-            breakdown = self._reward_fn.compute(
+            tick_reward = self._reward_fn.compute(
                 frame=frame,
                 projection=projection,
                 prev_progress=prev_progress,
                 finished=self._valid_finish(frame.race),
                 dt=frame_dt,
             )
-            total_reward += breakdown.total
+            total_reward += tick_reward.total
+            # One environment transition can span several game frames. Accumulate every
+            # component, especially credited progress: using only the final frame would
+            # underreport lap progress whenever action_repeat > 1.
+            for component in (
+                "total", "progress", "speed", "off_track", "heading", "slip", "slide",
+                "step", "idle", "finish", "contact", "progress_metres", "raw_progress_metres",
+            ):
+                setattr(breakdown, component, getattr(breakdown, component) + getattr(tick_reward, component))
+            breakdown.clamped = breakdown.clamped or tick_reward.clamped
             previous_frame = frame
             # Stop at the game's finish event even if checkpoint validation later marks it
             # invalid. Only a valid finish earns the reward bonus, but the game cannot be
@@ -311,6 +320,7 @@ class TrackmaniaEnv(gym.Env):
             total_reward += penalty
             self._episode_return += penalty
             breakdown.terminal_penalty = penalty
+            breakdown.total += penalty
         self._reward_breakdown = breakdown
 
         obs = self._encode(frame, projection, yaw_rate=yaw_rate)

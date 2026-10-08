@@ -101,10 +101,10 @@ class TrackResult:
 
     @property
     def finish_rate(self) -> float:
-        valid = [e for e in self.episodes if not e.invalid_finish]
-        if not valid:
+        if not self.episodes:
             return 0.0
-        return sum(1 for e in valid if e.finished) / len(valid)
+        # An invalid finish is a failed attempt, not an attempt to discard.
+        return sum(1 for e in self.episodes if e.finished and not e.invalid_finish) / len(self.episodes)
 
     @property
     def mean_progress_fraction(self) -> float:
@@ -168,7 +168,7 @@ class TrackResult:
         for episode in self.episodes:
             if episode.finished and not episode.invalid_finish:
                 continue
-            reason = episode.end_reason or "unknown"
+            reason = "invalid_finish" if episode.invalid_finish else (episode.end_reason or "unknown")
             counts[reason] = counts.get(reason, 0) + 1
         return counts
 
@@ -247,10 +247,10 @@ class EvaluationReport:
 
     @property
     def finish_rate(self) -> float:
-        episodes = [e for e in self.episodes if not e.invalid_finish]
+        episodes = self.episodes
         if not episodes:
             return 0.0
-        return sum(1 for e in episodes if e.finished) / len(episodes)
+        return sum(1 for e in episodes if e.finished and not e.invalid_finish) / len(episodes)
 
     @property
     def mean_progress_fraction(self) -> float:
@@ -561,7 +561,7 @@ def evaluate_policy(
     evaluation goes through :func:`evaluate_tracks`, which reuses this function per track so
     there is exactly one implementation of "run an episode".
     """
-    track = TrackResult(track=track_name or getattr(env.track, "name", "unknown"), split=split)
+    buckets: dict[str, TrackResult] = {}
     for i in range(episodes):
         episode_seed = None if seed is None else seed + 1000 + i
         episode = run_episode(
@@ -570,19 +570,22 @@ def evaluate_policy(
             max_steps=max_steps,
             deterministic=deterministic,
             seed=episode_seed,
-            track_name=track.track,
+            # MultiTrackEnv may sample a different track on each reset. Let the reset
+            # info identify it instead of assigning all episodes to the previous track.
+            track_name=track_name,
             split=split,
         )
-        track.episodes.append(episode)
+        name = episode.track or getattr(env.track, "name", "unknown")
+        buckets.setdefault(name, TrackResult(track=name, split=split)).episodes.append(episode)
         logger.info(
             "eval episode %d/%d on %s: progress %.1f%%, %s",
             i + 1,
             episodes,
-            track.track,
+            name,
             episode.progress_fraction * 100,
             episode.end_reason,
         )
-    return EvaluationReport(tracks=[track], deterministic=deterministic, label=label, step=step)
+    return EvaluationReport(tracks=list(buckets.values()), deterministic=deterministic, label=label, step=step)
 
 
 def evaluate_tracks(
@@ -596,6 +599,7 @@ def evaluate_tracks(
     seed: int | None = None,
     label: str = "",
     step: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> EvaluationReport:
     """Evaluate across many tracks using a :class:`~tmai.env.multi_track.MultiTrackEnv`.
 
@@ -614,6 +618,8 @@ def evaluate_tracks(
     if tracks is None:
         buckets: dict[str, TrackResult] = {}
         for i in range(max(1, episodes_per_track)):
+            if cancel_check is not None:
+                cancel_check()
             episode_seed = None if seed is None else seed + 5000 + i
             episode = run_episode(
                 env,
@@ -621,6 +627,7 @@ def evaluate_tracks(
                 max_steps=max_steps,
                 deterministic=deterministic,
                 seed=episode_seed,
+                on_step=(lambda *_: cancel_check()) if cancel_check is not None else None,
             )
             bucket = buckets.setdefault(episode.track, TrackResult(track=episode.track, split="sampled"))
             bucket.episodes.append(episode)
@@ -628,6 +635,8 @@ def evaluate_tracks(
         return report
 
     for name, split in tracks:
+        if cancel_check is not None:
+            cancel_check()
         bucket = TrackResult(track=name, split=split)
         if hasattr(env, "select_track"):
             env.select_track(name)
@@ -642,6 +651,8 @@ def evaluate_tracks(
                     f"{env_track!r}; use a multi-track split or a matching configuration"
                 )
         for i in range(episodes_per_track):
+            if cancel_check is not None:
+                cancel_check()
             episode_seed = None if seed is None else seed + 7000 + i
             bucket.episodes.append(
                 run_episode(
@@ -652,6 +663,7 @@ def evaluate_tracks(
                     seed=episode_seed,
                     track_name=name,
                     split=split,
+                    on_step=(lambda *_: cancel_check()) if cancel_check is not None else None,
                 )
             )
         report.tracks.append(bucket)

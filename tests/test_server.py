@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from tmai.config import RunConfig
 from tmai.server.app import ServerConfig, create_app
@@ -137,6 +138,15 @@ def _wait_for_job(client: TestClient, job_id: str, timeout: float = 120.0):
 
 
 class TestHealthAndSystem:
+    def test_server_defaults_to_loopback_without_cross_origin_access(self, client):
+        from tmai.cli import build_parser
+
+        assert ServerConfig().host == "127.0.0.1"
+        assert build_parser().parse_args(["serve", "--no-open"]).host == "127.0.0.1"
+        response = client.get("/api/health", headers={"Origin": "https://untrusted.example"})
+        assert response.status_code == 200
+        assert "access-control-allow-origin" not in response.headers
+
     def test_health(self, client):
         response = client.get("/api/health")
         assert response.status_code == 200
@@ -229,6 +239,12 @@ class TestRuns:
         assert rows[0]["name"] == "2026-01-01T00-00-00Z_alpha"
         assert rows[0]["run_name"] == "alpha-label"
 
+    def test_symlink_run_cannot_escape_runs_directory(self, client, server_dir, tmp_path):
+        outside = _write_run(tmp_path, "private")
+        (server_dir["runs"] / "linked").symlink_to(outside, target_is_directory=True)
+        assert client.get("/api/runs/linked").status_code == 400
+        assert "linked" not in {row["name"] for row in client.get("/api/runs").json()["runs"]}
+
     def test_path_traversal_rejected(self, client):
         # ".." and "a/b" must never resolve outside the runs directory; the encoded form
         # (%2F) is the interesting one, because it arrives as a literal in the path param.
@@ -261,10 +277,22 @@ class TestTracks:
         assert entry["split_group"] == "family:winter-cup"
         assert sum(report["families_by_split"].values()) == 1
 
-    def test_missing_directory_is_reported_not_raised(self, client):
-        data = client.get("/api/tracks", params={"directory": "/nonexistent/dir"}).json()
+    def test_missing_directory_is_reported_not_raised(self, client, server_dir):
+        data = client.get("/api/tracks", params={"directory": str(server_dir["tracks"] / "missing")}).json()
         assert data["report"] is None
         assert "not found" in data["error"]
+
+    def test_arbitrary_track_directories_are_rejected(self, client, server_dir, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _write_track(outside, "oval")
+        assert client.get("/api/tracks", params={"directory": str(outside)}).status_code == 400
+        assert client.get("/api/tracks/geometry", params={
+            "directory": str(outside), "name": "oval",
+        }).status_code == 400
+        (server_dir["tracks"] / "linked.json").symlink_to(outside / "oval.json")
+        assert client.get("/api/tracks/geometry", params={"name": "linked.json"}).status_code == 400
+        assert client.get("/api/tracks").status_code == 400
 
     def test_geometry_for_recorded_track(self, client, server_dir):
         _write_track(server_dir["tracks"], "oval")
@@ -431,6 +459,20 @@ class TestReplays:
         name = self._run_with_replays(server_dir)
         assert client.get(f"/api/replays/{name}/nope.json").status_code == 404
 
+    def test_replay_paths_cannot_escape_the_run(self, client, server_dir, tmp_path):
+        name = self._run_with_replays(server_dir)
+        assert client.get("/api/replays", params={"run": str(tmp_path)}).status_code == 400
+        assert client.get("/api/replays", params={"run": "../other"}).status_code == 400
+        other = tmp_path / "outside.json"
+        other.write_text("{}")
+        (server_dir["runs"] / name / "replays" / "episode_000002.json").symlink_to(other)
+        assert client.get(f"/api/replays/{name}/episode_000002.json").status_code == 400
+        listed = client.get("/api/replays", params={"run": name}).json()["replays"]
+        assert [row["name"] for row in listed] == ["episode_000001.json"]
+        assert client.post("/api/replays/compare", json={
+            "run": name, "a": "episode_000001.json", "b": str(other),
+        }).status_code == 400
+
     def test_run_analysis_returns_sector_and_heatmap_data(self, client, server_dir):
         name = self._run_with_replays(server_dir)
         response = client.get(
@@ -558,7 +600,8 @@ class TestJobs:
         assert client.post("/api/jobs/nope/cancel").status_code == 404
 
     def test_doctor_job_runs_and_reports(self, client):
-        response = client.post("/api/doctor", json={})
+        # A synthetic config does not attempt to connect to a missing Windows game host.
+        response = client.post("/api/doctor", json={"config_path": "tmai/configs/smoke.yaml"})
         job = response.json()["job"]
         finished = _wait_for_job(client, job["id"], timeout=120)
         assert finished["state"] == "done", finished["error"]
@@ -617,9 +660,10 @@ class TestJobs:
         job = response.json()["job"]
         finished = _wait_for_job(client, job["id"], timeout=60)
 
-        assert finished["result"]["exit_code"] != 0
+        assert finished["state"] == "failed"
+        assert "command exited with status" in finished["error"]
         assert any("Pass --allow-simulated-driver" in line for line in finished["log_tail"])
-        assert finished["result"]["run"] is None
+        assert not server_dir["runs"].exists() or not list(server_dir["runs"].iterdir())
 
     def test_train_job_with_config_yaml_text(self, client, server_dir, tmp_path):
         """The config editor posts YAML text; the server stores it and trains from it."""
@@ -679,6 +723,23 @@ class TestJobs:
         assert result["reports"][0]["num_episodes"] >= 1
         assert Path(result["path"]).is_file()
 
+    def test_eval_does_not_substitute_train_for_empty_validation(self, client, tmp_path):
+        config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
+        config_path = tmp_path / "smoke.yaml"
+        config.save(config_path)
+        checkpoint = tmp_path / "unused.pt"
+        checkpoint.write_bytes(b"not loaded because validation is empty")
+
+        response = client.post("/api/eval", json={
+            "config_path": str(config_path),
+            "checkpoint": str(checkpoint),
+            "splits": ["validation"],
+            "episodes": 1,
+        })
+        finished = _wait_for_job(client, response.json()["job"]["id"])
+        assert finished["state"] == "failed"
+        assert "requested split 'validation' is empty" in finished["error"]
+
     def test_benchmark_job(self, client, server_dir, tmp_path):
 
         from tmai.training.checkpoint import save_checkpoint
@@ -720,6 +781,37 @@ class TestJobs:
         listing = client.get("/api/benchmarks").json()
         saved = next(b for b in listing["benchmarks"] if b["benchmark"] == "api-bench")
         assert saved["seed_repeats"] == 3
+
+    def test_benchmark_cancellation_waits_for_in_process_work(self, client, server_dir, monkeypatch):
+        import threading
+
+        import tmai.training.benchmark as benchmark_module
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_benchmark(*args, cancel_check, **kwargs):
+            started.set()
+            release.wait(timeout=5)
+            cancel_check()
+            raise AssertionError("must not save a cancelled report")
+
+        monkeypatch.setattr(benchmark_module, "run_benchmark", slow_benchmark)
+        response = client.post("/api/benchmark", json={
+            "models": [{"label": "test", "checkpoint": "unused.pt"}], "splits": ["train"],
+        })
+        job_id = response.json()["job"]["id"]
+        assert started.wait(5)
+        try:
+            cancelling = client.post(f"/api/jobs/{job_id}/cancel").json()["job"]
+            assert cancelling["state"] == "cancelling"
+            assert cancelling["finished_utc"] is None
+        finally:
+            release.set()
+        finished = _wait_for_job(client, job_id)
+        assert finished["state"] == "cancelled"
+        assert finished["result"] is None
+        assert not list(server_dir["benchmarks"].iterdir())
 
     def test_jobs_are_listed_newest_first(self, client):
         first = client.post("/api/doctor", json={}).json()["job"]
@@ -770,6 +862,30 @@ class TestJobManager:
         finished = manager.wait(job.id, timeout=10)
         assert finished.state is JobState.CANCELLED
 
+    def test_running_job_stays_cancelling_until_worker_really_stops(self, tmp_path):
+        import threading
+
+        manager = JobManager(tmp_path / "state")
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow(job):
+            started.set()
+            release.wait(timeout=5)
+            return {"should_not_be_published": True}
+
+        job = manager.submit("test", "slow", slow)
+        assert started.wait(5)
+        assert manager.cancel(job.id)
+        assert job.state is JobState.CANCELLING
+        assert job.finished_utc is None
+        assert manager.wait(job.id, timeout=0.02).state is JobState.CANCELLING
+        release.set()
+        finished = manager.wait(job.id, timeout=5)
+        assert finished.state is JobState.CANCELLED
+        assert finished.result is None
+        assert finished.finished_utc is not None
+
     def test_interrupted_jobs_recovered_on_restart(self, tmp_path):
         state_dir = tmp_path / "state"
         manager = JobManager(state_dir)
@@ -788,6 +904,14 @@ class TestJobManager:
 
 
 class TestWebSocket:
+    def test_rejects_foreign_browser_origin(self, client):
+        with pytest.raises(WebSocketDisconnect), client.websocket_connect(
+            "/api/ws", headers={"Origin": "https://untrusted.example"}
+        ):
+            pass
+        with client.websocket_connect("/api/ws", headers={"Origin": "http://testserver"}) as ws:
+            assert ws.receive_json()["type"] == "tick"
+
     def test_tick(self, client, server_dir):
         _write_run(server_dir["runs"], "2026-01-01T00-00-00Z_ws")
         with client.websocket_connect("/api/ws") as websocket:
