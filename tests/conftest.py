@@ -8,6 +8,14 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import os
+
+# ``TMAI_TEST_DEVICE=cpu`` hides every CUDA device from PyTorch for the whole run, so the CPU
+# suite is genuinely CPU-only even on a GPU host (CI uses this). The default leaves devices
+# visible: learners then pick CUDA when present, and the CUDA-only tests run. This must happen
+# before torch initialises CUDA, which is why it sits above every other import.
+if os.environ.get("TMAI_TEST_DEVICE", "auto").lower() == "cpu":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 import pytest

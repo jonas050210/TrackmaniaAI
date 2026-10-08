@@ -280,37 +280,49 @@ def _subprocess_job(
         import os
 
         env = {**os.environ, **extra_env}
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
     with log_path.open("w", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
 
         def pump() -> None:
             assert proc.stdout is not None
-            for line in proc.stdout:
-                job.log(line.rstrip("\n"))
-                log_file.write(line)
-                log_file.flush()
+            try:
+                for line in proc.stdout:
+                    job.log(line.rstrip("\n"))
+                    log_file.write(line)
+                    log_file.flush()
+            finally:
+                # The reader owns the pipe and releases it when it finishes. Without this the
+                # descriptor leaked once per job on a long-running server.
+                proc.stdout.close()
 
         reader = threading.Thread(target=pump, daemon=True)
         reader.start()
-        while proc.poll() is None:
-            if state.jobs.is_cancelled(job):
-                proc.terminate()
-                job.log("terminated by operator")
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:  # pragma: no cover - stubborn child
-                    proc.kill()
-                break
-            time.sleep(0.2)
-        reader.join(timeout=5)
+        try:
+            while proc.poll() is None:
+                if state.jobs.is_cancelled(job):
+                    proc.terminate()
+                    job.log("terminated by operator")
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:  # pragma: no cover - stubborn child
+                        proc.kill()
+                    break
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                # Something other than a clean exit or cancellation interrupted the wait; do
+                # not leave an orphaned child running.
+                proc.kill()
+                proc.wait()
+            reader.join(timeout=5)
     if proc.returncode != 0 and not state.jobs.is_cancelled(job):
         raise RuntimeError(
             f"command exited with status {proc.returncode}; see job log {log_path}"
@@ -372,7 +384,8 @@ def _config_for_params(state: ServerState, params: dict[str, Any]) -> RunConfig:
         run_path = _run_dir(state, str(run))
         saved = run_path / "config.yaml"
         if saved.is_file():
-            return RunConfig.from_yaml(str(saved))
+            # Saved by an earlier build may carry retired keys; do not refuse to resume over them.
+            return RunConfig.from_yaml(str(saved), strict=False)
     if state.config.config_path:
         return RunConfig.from_yaml(state.config.config_path)
     return RunConfig()

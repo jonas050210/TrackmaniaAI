@@ -7,6 +7,7 @@ import json
 import numpy as np
 import pytest
 
+from tmai.agents.base import Learner
 from tmai.agents.bc import pretrain_policy
 from tmai.agents.normalize import NormalizingLearner
 from tmai.agents.sac import SACLearner
@@ -14,11 +15,25 @@ from tmai.config import RunConfig
 from tmai.training.demos import Demonstration
 
 
-def _make_learner(observation_dim: int = 4, action_dim: int = 3, **sac_kwargs) -> SACLearner:
+def _cuda_available() -> bool:
+    import torch
+
+    return torch.cuda.is_available()
+
+
+def _make_learner(
+    observation_dim: int = 4,
+    action_dim: int = 3,
+    *,
+    device: str | None = None,
+    dropout: float = 0.0,
+    **sac_kwargs,
+) -> SACLearner:
+    """A small SAC learner. ``device=None`` lets the learner pick CUDA when it is available."""
     from tmai.models.networks import NetworkConfig
 
     config = RunConfig().sac
-    config.network = NetworkConfig(hidden_sizes=[32, 32])
+    config.network = NetworkConfig(hidden_sizes=[32, 32], dropout=dropout)
     for key, value in sac_kwargs.items():
         setattr(config, key, value)
     return SACLearner(
@@ -27,6 +42,7 @@ def _make_learner(observation_dim: int = 4, action_dim: int = 3, **sac_kwargs) -
         config=config,
         action_low=np.array([-1.0, 0.0, 0.0]),
         action_high=np.array([1.0, 1.0, 1.0]),
+        device=device,
         seed=0,
     )
 
@@ -57,9 +73,7 @@ class TestPretrainPolicy:
 
     def test_val_loss_is_reported(self):
         learner = _make_learner()
-        metrics = pretrain_policy(
-            learner, _demo_from_policy(), epochs=2, val_fraction=0.2, seed=0
-        )
+        metrics = pretrain_policy(learner, _demo_from_policy(), epochs=2, val_fraction=0.2, seed=0)
         assert metrics["bc/val_loss"] == metrics["bc/val_loss"]  # not NaN
         assert metrics["bc/train_samples"] == 316  # purge gap before temporal validation
         assert metrics["bc/val_samples"] == 80
@@ -99,9 +113,11 @@ class TestPretrainPolicy:
 
         wrapped = NormalizingLearner(sac, RunningNormalizer(4, warmup_steps=0))
         demos = _demo_from_policy()
-        before = self._policy_mse(sac, demos)
+        before = self._policy_mse(wrapped, demos)
         pretrain_policy(wrapped, demos, epochs=20, batch_size=64, lr=3e-3, seed=0)
-        after = self._policy_mse(sac, demos)
+        # The network was fitted on normalised observations, so the fit is judged through the
+        # wrapper: that is the path a deployed policy takes (raw observation in, action out).
+        after = self._policy_mse(wrapped, demos)
         assert after < before * 0.2
         # Normalization statistics use only the training partition, not held-out frames.
         assert 0.85 * len(demos) < wrapped.normalizer.count < len(demos)
@@ -146,15 +162,57 @@ class TestPretrainPolicy:
 
         assert run() == pytest.approx(run())
 
-    @staticmethod
-    def _policy_mse(learner: SACLearner, demos: Demonstration) -> float:
+    def test_validation_ignores_dropout(self):
+        """Validation runs in eval mode: dropout must not leak into the held-out loss."""
         import torch
 
-        with torch.no_grad():
-            action, _ = learner.network.policy.sample(
-                torch.as_tensor(demos.observations), deterministic=True
-            )
-        return float(((action.numpy() - demos.actions) ** 2).mean())
+        learner = _make_learner(dropout=0.5)
+        demos = _demo_from_policy()
+        metrics = pretrain_policy(learner, demos, epochs=2, val_fraction=0.2, seed=0)
+        # Single recording, purged temporal holdout: the last 80 of 400 steps are validation.
+        assert metrics["bc/val_samples"] == 80
+        val = Demonstration(observations=demos.observations[-80:], actions=demos.actions[-80:])
+        assert metrics["bc/val_loss"] == pytest.approx(self._policy_mse(learner, val), rel=1e-5)
+        # The training mode the learner had before validation is restored.
+        assert learner.network.policy.training
+        assert torch.is_tensor(learner.network.policy.trunk[0].weight)
+
+    def test_seed_alone_fixes_the_shuffle_order(self):
+        """``seed`` controls the batch order; ambient global RNG state must not change it."""
+
+        def run(global_seed: int) -> float:
+            import torch
+
+            learner = _make_learner()
+            # Perturb the global torch RNG after the learner is built and before pretraining.
+            torch.manual_seed(global_seed)
+            metrics = pretrain_policy(learner, _demo_from_policy(), epochs=3, seed=7)
+            return metrics["bc/final_train_loss"]
+
+        assert run(1) == run(2)  # bit-for-bit on the same device
+
+    @pytest.mark.skipif(not _cuda_available(), reason="requires a CUDA device")
+    def test_fits_on_cuda_with_cpu_inputs(self):
+        """On a CUDA host the learner trains and evaluates on the GPU; callers stay on the CPU."""
+        learner = _make_learner(device="cuda")
+        assert learner.device.type == "cuda"
+        demos = _demo_from_policy()
+        before = self._policy_mse(learner, demos)
+        metrics = pretrain_policy(learner, demos, epochs=30, batch_size=64, lr=3e-3, seed=0)
+        after = self._policy_mse(learner, demos)
+        assert np.isfinite(metrics["bc/final_train_loss"])
+        assert after < before * 0.2
+        assert learner.device.type == "cuda"
+
+    @staticmethod
+    def _policy_mse(learner: Learner, demos: Demonstration) -> float:
+        """Held-out-style fit check through the learner's own inference path.
+
+        ``act`` moves observations to the learner's device and returns host numpy actions, so
+        the check is valid on CPU and CUDA alike.
+        """
+        actions = np.asarray(learner.act(demos.observations, deterministic=True), dtype=np.float64)
+        return float(((actions - demos.actions) ** 2).mean())
 
 
 class TestTrainerIntegration:
@@ -242,9 +300,7 @@ class TestTrainerIntegration:
         demo_path = self._write_demo(tmp_path, dim)
 
         # A checkpoint to resume from.
-        checkpoint = save_checkpoint(
-            tmp_path / "pre", step=0, learner=learner, config=config.to_dict()
-        )
+        checkpoint = save_checkpoint(tmp_path / "pre", step=0, learner=learner, config=config.to_dict())
         resume_config = self._config(tmp_path, demo_path, resume=str(checkpoint))
         result = train_from_config(resume_config)
         events = [

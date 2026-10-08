@@ -967,6 +967,50 @@ class TestPretrainCli:
         assert payload["learner"]
         assert "bc/final_train_loss" in capsys.readouterr().out
 
+    def test_pretrain_honours_the_device_flag(self, tmp_path):
+        import numpy as np
+
+        from tmai.config import RunConfig
+        from tmai.training.checkpoint import load_checkpoint
+        from tmai.training.demos import Demonstration
+
+        demo_path = tmp_path / "demo.jsonl"
+        # The observation layout comes from the config, so size the demo from the real learner.
+        from tmai.training.factory import build_learner, build_library, build_multi_track_env
+
+        config = RunConfig.from_yaml("tmai/configs/pipeline_smoke.yaml")
+        env = build_multi_track_env(config, build_library(config), split="train", seed=0)
+        try:
+            dim = build_learner(env, config).observation_dim
+        finally:
+            env.close()
+        Demonstration(
+            observations=np.random.default_rng(0).normal(size=(64, dim)).astype(np.float32),
+            actions=np.tile([0.1, 0.8, 0.0], (64, 1)).astype(np.float32),
+        ).save(demo_path)
+
+        out = tmp_path / "pretrained.pt"
+        assert (
+            main(
+                [
+                    "pretrain",
+                    "-c",
+                    "tmai/configs/pipeline_smoke.yaml",
+                    "--demo",
+                    str(demo_path),
+                    "--out",
+                    str(out),
+                    "--epochs",
+                    "1",
+                    "--device",
+                    "cpu",
+                ]
+            )
+            == 0
+        )
+        # The override is what the checkpoint records as the device it was trained on.
+        assert load_checkpoint(out)["config"]["train"]["device"] == "cpu"
+
     def test_pretrain_rejects_a_dimension_mismatch(self, tmp_path, capsys):
         import numpy as np
 

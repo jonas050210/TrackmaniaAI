@@ -677,7 +677,9 @@ class Trainer:
             if callable(clearer):
                 clearer()
         self._episode = int(payload.get("episode", 0))
-        self._best_score = float(payload.get("best_score") or float("-inf"))
+        stored_best = payload.get("best_score")
+        # ``is None``, not truthiness: a best score of exactly 0.0 is a real score.
+        self._best_score = float(stored_best) if stored_best is not None else float("-inf")
         step = int(payload.get("step", 0))
         logger.info(
             "resumed from %s (step %d, gradient_steps %s, episode %d)",
@@ -798,7 +800,12 @@ def train_from_config(config: RunConfig) -> TrainerResult:
                 seed=config.train.seed,
                 log_every=max(1, config.bc.epochs // 5),
             )
-            run_logger.log_event("bc_pretrain", **stats)
+            run_logger.log_event(
+                "bc_pretrain",
+                device=str(getattr(learner, "device", "unknown")),
+                seed=config.train.seed,
+                **stats,
+            )
 
         trainer = Trainer(
             config, env, learner, buffer, run_logger,

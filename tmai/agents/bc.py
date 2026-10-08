@@ -72,11 +72,7 @@ def _split_demonstrations(
     except (TypeError, ValueError):
         lengths = np.asarray([], dtype=np.int64)
 
-    if (
-        lengths.size >= 2
-        and np.all(lengths > 0)
-        and int(lengths.sum()) == count
-    ):
+    if lengths.size >= 2 and np.all(lengths > 0) and int(lengths.sum()) == count:
         target = max(1, int(count * val_fraction))
         order = rng.permutation(lengths.size)
         validation_groups: list[int] = []
@@ -88,9 +84,9 @@ def _split_demonstrations(
                 validation_groups.append(int(group))
                 validation_count += int(lengths[group])
         offsets = np.concatenate([[0], np.cumsum(lengths)])
-        val_idx = np.concatenate(
-            [np.arange(offsets[g], offsets[g + 1]) for g in validation_groups]
-        ).astype(int)
+        val_idx = np.concatenate([np.arange(offsets[g], offsets[g + 1]) for g in validation_groups]).astype(
+            int
+        )
         train_mask = np.ones(count, dtype=bool)
         train_mask[val_idx] = False
         return np.flatnonzero(train_mask), val_idx, "whole_demo_files"
@@ -151,8 +147,7 @@ def pretrain_policy(
         )
     if demos.action_dim != sac.action_dim:
         raise ValueError(
-            f"demonstrations have action_dim {demos.action_dim}, learner expects "
-            f"{sac.action_dim}"
+            f"demonstrations have action_dim {demos.action_dim}, learner expects {sac.action_dim}"
         )
     if len(demos) < 2:
         raise ValueError(f"need at least 2 demonstration steps to pretrain, got {len(demos)}")
@@ -184,8 +179,16 @@ def pretrain_policy(
         normalizer.update(observations[train_idx])
         observations = normalizer.normalize(observations)
 
+    # Tensors that feed the network live on the learner's device (CPU or CUDA). Index
+    # bookkeeping stays on the host, so the batch order is a property of ``seed`` alone:
+    # the same seed yields the same shuffle on either device, and the ambient global torch
+    # RNG state (which differs between CPU and CUDA draws) plays no part in it.
     obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
     act_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
+    val_idx_t = torch.as_tensor(val_idx, dtype=torch.long, device=device)
+    shuffle_gen = torch.Generator(device="cpu")
+    shuffle_gen.manual_seed(int(rng.integers(0, 2**63 - 1)))
+    train_order = np.asarray(train_idx, dtype=np.int64)
 
     policy = sac.network.policy
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
@@ -194,16 +197,15 @@ def pretrain_policy(
     val_loss = float("nan")
     for epoch in range(epochs):
         if shuffle:
-            perm = torch.randperm(len(train_idx), device=device)
-            train_idx_t = torch.as_tensor(train_idx, device=device)[perm]
+            perm = torch.randperm(len(train_order), generator=shuffle_gen).numpy()
+            epoch_order = train_order[perm]
         else:
-            train_idx_t = torch.as_tensor(train_idx, device=device)
+            epoch_order = train_order
+        order_t = torch.as_tensor(epoch_order, dtype=torch.long, device=device)
         epoch_loss = 0.0
         batches = 0
-        for start in range(0, len(train_idx_t), batch_size):
-            idx = train_idx_t[start:start + batch_size]
-            if len(idx) == 0:
-                continue
+        for start in range(0, len(order_t), batch_size):
+            idx = order_t[start : start + batch_size]
             mean_action, _ = policy.sample(obs_t[idx], deterministic=True)
             loss = F.mse_loss(mean_action, act_t[idx])
             optimizer.zero_grad(set_to_none=True)
@@ -213,16 +215,23 @@ def pretrain_policy(
             batches += 1
         train_loss = epoch_loss / max(batches, 1)
         if len(val_idx):
-            with torch.no_grad():
-                val_action, _ = policy.sample(obs_t[torch.as_tensor(val_idx, device=device)],
-                                               deterministic=True)
-                val_loss = float(F.mse_loss(
-                    val_action, act_t[torch.as_tensor(val_idx, device=device)]
-                ).item())
+            # Validation must be deterministic and must not be affected by dropout, which is
+            # active during training. Restore the previous mode afterwards.
+            was_training = policy.training
+            policy.eval()
+            try:
+                with torch.no_grad():
+                    val_action, _ = policy.sample(obs_t[val_idx_t], deterministic=True)
+                    val_loss = float(F.mse_loss(val_action, act_t[val_idx_t]).item())
+            finally:
+                policy.train(was_training)
         if log_every and (epoch + 1) % log_every == 0:
             logger.info(
                 "bc epoch %d/%d: train_loss=%.5f val_loss=%.5f",
-                epoch + 1, epochs, train_loss, val_loss,
+                epoch + 1,
+                epochs,
+                train_loss,
+                val_loss,
             )
 
     metrics = {
@@ -237,7 +246,13 @@ def pretrain_policy(
     logger.info(
         "behaviour cloning done: %d samples (%d train, %d validation; %s split), "
         "%d epochs, final train loss %.5f, val %.5f",
-        len(demos), len(train_idx), len(val_idx), split_kind, epochs, train_loss, val_loss,
+        len(demos),
+        len(train_idx),
+        len(val_idx),
+        split_kind,
+        epochs,
+        train_loss,
+        val_loss,
     )
     return metrics
 

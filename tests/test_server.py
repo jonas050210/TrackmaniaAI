@@ -608,6 +608,7 @@ class TestJobs:
         assert finished["result"]["exit_code"] == 0
         assert any("environment" in line for line in finished["log_tail"])
 
+    @pytest.mark.slow
     def test_train_job_end_to_end(self, client, server_dir, tmp_path):
         """The GUI's start-training path: a real subprocess training run."""
         config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
@@ -665,6 +666,7 @@ class TestJobs:
         assert any("Pass --allow-simulated-driver" in line for line in finished["log_tail"])
         assert not server_dir["runs"].exists() or not list(server_dir["runs"].iterdir())
 
+    @pytest.mark.slow
     def test_train_job_with_config_yaml_text(self, client, server_dir, tmp_path):
         """The config editor posts YAML text; the server stores it and trains from it."""
         config = RunConfig.from_yaml("tmai/configs/smoke.yaml")
@@ -813,6 +815,7 @@ class TestJobs:
         assert finished["result"] is None
         assert not list(server_dir["benchmarks"].iterdir())
 
+    @pytest.mark.slow
     def test_jobs_are_listed_newest_first(self, client):
         first = client.post("/api/doctor", json={}).json()["job"]
         _wait_for_job(client, first["id"], timeout=120)
@@ -921,3 +924,29 @@ class TestWebSocket:
         assert "runs" in tick
         assert "jobs" in tick
         assert any(r["name"] == "2026-01-01T00-00-00Z_ws" for r in tick["runs"])
+
+
+def test_subprocess_jobs_release_their_pipes(tmp_path):
+    """Each CLI job must close its stdout pipe itself, not leave it for the garbage collector."""
+    import gc
+    import sys
+    import warnings
+    from types import SimpleNamespace
+
+    from tmai.server.app import ServerConfig, ServerState, _subprocess_job
+
+    state = ServerState(
+        config=ServerConfig(state_dir=str(tmp_path / "state")),
+        jobs=SimpleNamespace(is_cancelled=lambda job: False),  # type: ignore[arg-type]
+    )
+    job = SimpleNamespace(id="pipe-check", log=lambda message: None)
+    argv = [sys.executable, "-c", "print('ok')"]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            _subprocess_job(state, job, argv)
+        gc.collect()  # an unclosed pipe is only reported when the collector finalises it
+
+    leaked = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    assert not leaked, [str(w.message) for w in leaked]

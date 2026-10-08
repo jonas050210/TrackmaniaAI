@@ -97,14 +97,24 @@ class TestConfigRoundtrip:
         with pytest.raises(ValueError, match="mapping"):
             RunConfig.from_yaml(path)
 
-    def test_unknown_keys_are_ignored_with_warning(self, tmp_path, caplog):
+    def test_unknown_keys_are_rejected_by_default(self, tmp_path):
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            yaml.safe_dump({"train": {"total_steps": 10, "not_a_real_field": True}}),
+            encoding="utf-8",
+        )
+        # A silently ignored key is how a typo'd step count became a 100,000-step run.
+        with pytest.raises(ValueError, match="train.not_a_real_field"):
+            RunConfig.from_yaml(path)
+
+    def test_unknown_keys_are_ignored_with_warning_when_lenient(self, tmp_path, caplog):
         path = tmp_path / "cfg.yaml"
         path.write_text(
             yaml.safe_dump({"train": {"total_steps": 10, "not_a_real_field": True}}),
             encoding="utf-8",
         )
         with caplog.at_level("WARNING"):
-            config = RunConfig.from_yaml(path)
+            config = RunConfig.from_yaml(path, strict=False)
         assert config.train.total_steps == 10
         assert "not_a_real_field" in caplog.text
 
@@ -605,3 +615,37 @@ class TestRunConfigDiscovery:
 
         assert loaded.train.run_name == "explicit"
         assert "saved configuration" not in caplog.text
+
+
+class TestStrictConfigKeys:
+    """A misspelt key must fail loudly, not silently fall back to a default."""
+
+    def test_typo_in_a_top_level_section_is_rejected(self):
+        with pytest.raises(ValueError, match="train.total_step"):
+            RunConfig.from_yaml_text("train:\n  total_step: 5000\n")
+
+    def test_typo_in_a_nested_section_is_rejected(self):
+        with pytest.raises(ValueError, match="sac.network.hidden_size"):
+            RunConfig.from_yaml_text("sac:\n  network:\n    hidden_size: [8, 8]\n")
+
+    def test_every_unknown_key_is_listed_at_once(self):
+        with pytest.raises(ValueError) as caught:
+            RunConfig.from_dict({"train": {"a": 1, "b": 2}, "bogus": 3})
+        message = str(caught.value)
+        assert "train.a" in message and "train.b" in message and "bogus" in message
+
+    def test_lenient_loading_ignores_retired_keys_for_saved_runs(self):
+        config = RunConfig.from_yaml_text("train:\n  retired_key: 1\n  total_steps: 777\n", strict=False)
+        assert config.train.total_steps == 777
+
+    def test_shipped_configurations_are_strict_clean(self):
+        from pathlib import Path
+
+        import tmai
+
+        for path in sorted((Path(tmai.__file__).parent / "configs").glob("*.yaml")):
+            RunConfig.from_yaml(path)  # raises if any shipped key is unknown
+
+    def test_saved_configuration_round_trips_strictly(self):
+        config = RunConfig()
+        assert RunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()

@@ -289,6 +289,14 @@ mypy tmai
 pytest --cov=tmai --cov-report=term-missing
 ```
 
+Device-dependent tests:
+
+- `TMAI_TEST_DEVICE=cpu pytest -q` hides CUDA for the whole run, so the suite is genuinely
+  CPU-only. CI does this on every push.
+- The CUDA-only tests (`tests/test_device.py`, `test_fits_on_cuda_with_cpu_inputs`) skip without
+  a GPU. The `gpu` job in `.github/workflows/ci.yml` runs them on a self-hosted runner labelled
+  `gpu`; it is started manually (`workflow_dispatch`).
+
 The tests cover what can be validated without the game, including genuine TMInterface
 `SimStateData` decoding, driver control logic against a scripted tick source, crash/contact
 rules, temporal observation stacking, curriculum, behavior cloning, replay/ghost comparison,

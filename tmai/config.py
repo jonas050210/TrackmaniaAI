@@ -424,23 +424,41 @@ class RunConfig:
         return path
 
     @staticmethod
-    def from_dict(data: dict[str, Any]) -> RunConfig:
-        return _from_dict(RunConfig, data)
+    def from_dict(data: dict[str, Any], *, strict: bool = True) -> RunConfig:
+        """Build a config from a mapping.
+
+        ``strict`` (the default) rejects keys the schema does not know. A typo such as
+        ``total_step`` would otherwise be dropped silently and the run would use the default
+        -- 100,000 steps here -- without anyone noticing. Pass ``strict=False`` only to read a
+        configuration saved by an earlier build (a run's own ``config.yaml``), where a
+        retired key should not stop a resume.
+        """
+        unknown: list[str] = []
+        config = _from_dict(RunConfig, data, unknown=unknown)
+        if unknown:
+            listing = ", ".join(sorted(unknown))
+            if strict:
+                raise ValueError(
+                    f"unknown config key(s): {listing}. Check the spelling against "
+                    "tmai/configs/default.yaml."
+                )
+            logger.warning("ignoring unknown config key(s) from a saved configuration: %s", listing)
+        return config
 
     @staticmethod
-    def from_yaml(path: str | Path) -> RunConfig:
+    def from_yaml(path: str | Path, *, strict: bool = True) -> RunConfig:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"config file not found: {path}")
-        return RunConfig.from_yaml_text(path.read_text(encoding="utf-8"))
+        return RunConfig.from_yaml_text(path.read_text(encoding="utf-8"), strict=strict)
 
     @staticmethod
-    def from_yaml_text(text: str) -> RunConfig:
+    def from_yaml_text(text: str, *, strict: bool = True) -> RunConfig:
         """Parse a config from a YAML document (the GUI's config editor posts text)."""
         data = yaml.safe_load(text) or {}
         if not isinstance(data, dict):
             raise ValueError(f"config root must be a mapping, got {type(data).__name__}")
-        return RunConfig.from_dict(data)
+        return RunConfig.from_dict(data, strict=strict)
 
     def apply_overrides(self, overrides: dict[str, Any]) -> RunConfig:
         """Return a copy with ``{"sac.gamma": 0.98}``-style overrides applied."""
@@ -466,8 +484,14 @@ def _to_dict(obj: Any) -> Any:
     return obj
 
 
-def _from_dict(cls: type[T], data: Any) -> T:
-    """Recursively build ``cls`` from a plain mapping, ignoring unknown keys with a warning."""
+def _from_dict(
+    cls: type[T], data: Any, *, unknown: list[str] | None = None, prefix: str = ""
+) -> T:
+    """Recursively build ``cls`` from a plain mapping.
+
+    Unknown keys are not dropped silently: their dotted paths (``train.total_step``) are
+    appended to ``unknown`` so the caller can decide whether that is an error.
+    """
     if not is_dataclass(cls):
         return data
     if data is None:
@@ -477,19 +501,33 @@ def _from_dict(cls: type[T], data: Any) -> T:
 
     hints = get_type_hints(cls)
     known = {f.name for f in dataclasses.fields(cls)}
+    collector: list[str] = [] if unknown is None else unknown
     for key in data:
         if key not in known:
-            logger.warning("ignoring unknown config key %s.%s", cls.__name__, key)
+            collector.append(f"{prefix}{key}")
 
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         if key not in known:
             continue
-        kwargs[key] = _coerce(hints[key], value, path=f"{cls.__name__}.{key}")
+        kwargs[key] = _coerce(
+            hints[key],
+            value,
+            path=f"{cls.__name__}.{key}",
+            unknown=collector,
+            prefix=f"{prefix}{key}.",
+        )
     return cls(**kwargs)
 
 
-def _coerce(hint: Any, value: Any, *, path: str) -> Any:
+def _coerce(
+    hint: Any,
+    value: Any,
+    *,
+    path: str,
+    unknown: list[str] | None = None,
+    prefix: str = "",
+) -> Any:
     """Convert a YAML value into the type declared by the dataclass field."""
     if value is None:
         return None
@@ -501,12 +539,12 @@ def _coerce(hint: Any, value: Any, *, path: str) -> Any:
     if origin is not None and type(None) in args:
         inner = [a for a in args if a is not type(None)]  # noqa: E721
         if len(inner) == 1:
-            return _coerce(inner[0], value, path=path)
+            return _coerce(inner[0], value, path=path, unknown=unknown, prefix=prefix)
     if hint is type(None):  # noqa: E721
         return None
     if origin is None and hasattr(hint, "__origin__") is False and isinstance(hint, type):
         if is_dataclass(hint):
-            return _from_dict(hint, value)
+            return _from_dict(hint, value, unknown=unknown, prefix=prefix)
         if issubclass(hint, Enum):
             return hint(value)
         if hint in (int, float, str, bool):
@@ -517,7 +555,7 @@ def _coerce(hint: Any, value: Any, *, path: str) -> Any:
             return value
     if origin in (list, tuple):
         item = args[0] if args else Any
-        items = [_coerce(item, v, path=path) for v in value]
+        items = [_coerce(item, v, path=path, unknown=unknown, prefix=prefix) for v in value]
         return tuple(items) if origin is tuple else items
     if origin is dict:
         return dict(value)

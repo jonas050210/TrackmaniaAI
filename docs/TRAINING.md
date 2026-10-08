@@ -5,6 +5,10 @@
 One `RunConfig` describes a whole run. Load it from YAML, override individual fields from the
 command line, and the resolved result is written verbatim into the run manifest.
 
+Unknown keys are an error, and the message lists every one: `train.total_step` fails instead of
+silently training with the default step count. The exception is a run's own saved `config.yaml`,
+which is read leniently so that a resume survives retired keys.
+
 ```bash
 tmai validate-config -c tmai/configs/default.yaml      # check it before committing to a run
 tmai train -c tmai/configs/default.yaml \
@@ -106,7 +110,9 @@ multi-track sampling schedule when present, and the config. A resumed run contin
 counters rather than restarting them, and records `resumed_from` in its manifest.
 
 The replay buffer is **not** restored: it would dominate checkpoint size for a 1 M-transition
-buffer. A resumed run refills it during warm-up. This is a deliberate trade-off, and it means
+buffer. A resumed run starts with an empty buffer and does not repeat random warm-up: warm-up is
+keyed on the global step, so a run resumed past `warmup_steps` collects with the policy at once,
+and gradient updates begin once the buffer holds a batch. This is a deliberate trade-off, and it means
 **a resumed run does not reproduce the uninterrupted trajectory step for step.** It resumes the
 *learning state* exactly; the data it learns from next is freshly collected. Both halves of
 that sentence are pinned by `tests/test_reproducibility.py`.
@@ -164,11 +170,24 @@ chronological holdout with a small purge gap to reduce leakage from adjacent fra
 **warm start**, not an imitation objective: SAC takes over afterwards and can improve on the
 demonstrations.
 
+Devices and reproducibility: the pretraining runs on the learner's device (`train.device`,
+CUDA when available), and the batch order is derived from `seed` alone, so the same seed gives
+the same shuffle on CPU and GPU and is unaffected by other RNG draws. Inference
+(`SACLearner.act`) moves inputs to the learner's device itself, so callers always pass host
+arrays.
+
 Two guards are deliberate: a demonstration whose observation/action dimensions do not match
 the learner is rejected (a demo recorded against a different observation layout is a
 configuration error, not data to truncate), and `record-demo` refuses the simulated driver
 unless `--allow-simulated-driver` is passed, because the toy model just echoes the AI's own
 outputs — a "human" demonstration recorded against it contains nothing a human did.
+
+## Running the tests on a GPU
+
+CI has no GPU, so the CUDA-only tests run on a self-hosted runner. To register one, install the
+GitHub Actions runner on a machine with an NVIDIA GPU and CUDA-enabled PyTorch, and give it the
+label `gpu`. Then start the **CI** workflow manually from the Actions tab (`workflow_dispatch`).
+Locally, `pytest tests/test_bc.py tests/test_device.py -rs` shows which of those tests ran.
 
 ## Replays and ghosts
 

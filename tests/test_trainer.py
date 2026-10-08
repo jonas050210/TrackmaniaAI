@@ -228,6 +228,29 @@ class TestTrainer:
         second = train_from_config(config)
         assert second.gradient_steps >= first.gradient_steps
 
+    def test_resume_keeps_a_zero_best_score(self, tmp_path):
+        """A stored best score of exactly 0.0 is a real score, not a missing one."""
+        from tmai.runlog import RunLogger
+        from tmai.training.checkpoint import save_checkpoint
+
+        config = smoke_config(tmp_path, total_steps=40)
+        env, learner, buffer, _ = build_all(config)
+        checkpoint = save_checkpoint(
+            tmp_path / "ckpt",
+            step=10,
+            learner=learner,
+            best_score=0.0,
+            config=config.to_dict(),
+        )
+        try:
+            with RunLogger(tmp_path / "run", config=config.to_dict()) as logger:
+                trainer = Trainer(config, env, learner, buffer, logger)
+                trainer._resume(str(checkpoint))
+                # Resetting this to -inf would let the next, worse evaluation overwrite best.pt.
+                assert trainer._best_score == 0.0
+        finally:
+            env.close()
+
     def test_resume_missing_checkpoint_raises(self, tmp_path):
         config = smoke_config(tmp_path)
         config.train.resume = str(tmp_path / "does-not-exist")
