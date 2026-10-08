@@ -7,6 +7,7 @@ import json
 import numpy as np
 import pytest
 
+from tmai.agents.base import Learner
 from tmai.agents.bc import pretrain_policy
 from tmai.agents.normalize import NormalizingLearner
 from tmai.agents.sac import SACLearner
@@ -14,7 +15,20 @@ from tmai.config import RunConfig
 from tmai.training.demos import Demonstration
 
 
-def _make_learner(observation_dim: int = 4, action_dim: int = 3, **sac_kwargs) -> SACLearner:
+def _cuda_available() -> bool:
+    import torch
+
+    return torch.cuda.is_available()
+
+
+def _make_learner(
+    observation_dim: int = 4,
+    action_dim: int = 3,
+    *,
+    device: str | None = None,
+    **sac_kwargs,
+) -> SACLearner:
+    """A small SAC learner. ``device=None`` lets the learner pick CUDA when it is available."""
     from tmai.models.networks import NetworkConfig
 
     config = RunConfig().sac
@@ -27,6 +41,7 @@ def _make_learner(observation_dim: int = 4, action_dim: int = 3, **sac_kwargs) -
         config=config,
         action_low=np.array([-1.0, 0.0, 0.0]),
         action_high=np.array([1.0, 1.0, 1.0]),
+        device=device,
         seed=0,
     )
 
@@ -99,9 +114,11 @@ class TestPretrainPolicy:
 
         wrapped = NormalizingLearner(sac, RunningNormalizer(4, warmup_steps=0))
         demos = _demo_from_policy()
-        before = self._policy_mse(sac, demos)
+        before = self._policy_mse(wrapped, demos)
         pretrain_policy(wrapped, demos, epochs=20, batch_size=64, lr=3e-3, seed=0)
-        after = self._policy_mse(sac, demos)
+        # The network was fitted on normalised observations, so the fit is judged through the
+        # wrapper: that is the path a deployed policy takes (raw observation in, action out).
+        after = self._policy_mse(wrapped, demos)
         assert after < before * 0.2
         # Normalization statistics use only the training partition, not held-out frames.
         assert 0.85 * len(demos) < wrapped.normalizer.count < len(demos)
@@ -146,15 +163,42 @@ class TestPretrainPolicy:
 
         assert run() == pytest.approx(run())
 
-    @staticmethod
-    def _policy_mse(learner: SACLearner, demos: Demonstration) -> float:
-        import torch
+    def test_seed_alone_fixes_the_shuffle_order(self):
+        """``seed`` controls the batch order; ambient global RNG state must not change it."""
 
-        with torch.no_grad():
-            action, _ = learner.network.policy.sample(
-                torch.as_tensor(demos.observations), deterministic=True
-            )
-        return float(((action.numpy() - demos.actions) ** 2).mean())
+        def run(global_seed: int) -> float:
+            import torch
+
+            learner = _make_learner()
+            # Perturb the global torch RNG after the learner is built and before pretraining.
+            torch.manual_seed(global_seed)
+            metrics = pretrain_policy(learner, _demo_from_policy(), epochs=3, seed=7)
+            return metrics["bc/final_train_loss"]
+
+        assert run(1) == run(2)  # bit-for-bit on the same device
+
+    @pytest.mark.skipif(not _cuda_available(), reason="requires a CUDA device")
+    def test_fits_on_cuda_with_cpu_inputs(self):
+        """On a CUDA host the learner trains and evaluates on the GPU; callers stay on the CPU."""
+        learner = _make_learner(device="cuda")
+        assert learner.device.type == "cuda"
+        demos = _demo_from_policy()
+        before = self._policy_mse(learner, demos)
+        metrics = pretrain_policy(learner, demos, epochs=30, batch_size=64, lr=3e-3, seed=0)
+        after = self._policy_mse(learner, demos)
+        assert np.isfinite(metrics["bc/final_train_loss"])
+        assert after < before * 0.2
+        assert learner.device.type == "cuda"
+
+    @staticmethod
+    def _policy_mse(learner: Learner, demos: Demonstration) -> float:
+        """Held-out-style fit check through the learner's own inference path.
+
+        ``act`` moves observations to the learner's device and returns host numpy actions, so
+        the check is valid on CPU and CUDA alike.
+        """
+        actions = np.asarray(learner.act(demos.observations, deterministic=True), dtype=np.float64)
+        return float(((actions - demos.actions) ** 2).mean())
 
 
 class TestTrainerIntegration:

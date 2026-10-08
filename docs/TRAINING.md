@@ -164,6 +164,12 @@ chronological holdout with a small purge gap to reduce leakage from adjacent fra
 **warm start**, not an imitation objective: SAC takes over afterwards and can improve on the
 demonstrations.
 
+Devices and reproducibility: the pretraining runs on the learner's device (`train.device`,
+CUDA when available), and the batch order is derived from `seed` alone, so the same seed gives
+the same shuffle on CPU and GPU and is unaffected by other RNG draws. Inference
+(`SACLearner.act`) moves inputs to the learner's device itself, so callers always pass host
+arrays.
+
 Two guards are deliberate: a demonstration whose observation/action dimensions do not match
 the learner is rejected (a demo recorded against a different observation layout is a
 configuration error, not data to truncate), and `record-demo` refuses the simulated driver
